@@ -1,7 +1,8 @@
 const http = require("http");
 const WebSocket = require("ws");
 
-const PORT = 8080;
+const PORT = process.env.PORT || 8080;
+
 
 // username -> ws
 const online = new Map();
@@ -96,5 +97,6 @@ return send(ws, {
 });
 
 server.listen(PORT, () => {
-  console.log(`✅ Signaling server running on ws://localhost:${PORT}`);
+  console.log(`✅ Signaling server running on port ${PORT}`);
+
 });
