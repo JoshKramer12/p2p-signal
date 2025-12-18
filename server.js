@@ -15,12 +15,16 @@ function send(ws, obj) {
 }
 
 wss.on("connection", (ws) => {
+  console.log("🔌 WebSocket client connected");
+
   ws.username = null;
 
   ws.on("message", (msg) => {
     let data;
     try {
       data = JSON.parse(msg.toString());
+      console.log("📩 Message received:", data);
+
     } catch {
       return send(ws, { type: "error", message: "Bad JSON" });
     }
