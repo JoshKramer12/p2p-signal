@@ -14,7 +14,28 @@ function send(ws, obj) {
   ws.send(JSON.stringify(obj));
 }
 
-wss.on("connection", (ws) => {
+function getPublicEndpoint(req) {
+  // Render / proxies use x-forwarded-for
+  const forwarded = req.headers["x-forwarded-for"];
+  const ip = forwarded
+    ? forwarded.split(",")[0].trim()
+    : req.socket.remoteAddress;
+
+  const port = req.socket.remotePort;
+
+  return { ip, port };
+}
+
+
+wss.on("connection", (ws, req) => {
+
+  const endpoint = getPublicEndpoint(req);
+ws.publicIp = endpoint.ip;
+ws.publicPort = endpoint.port;
+
+console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
+
+
   console.log("🔌 WebSocket client connected");
 
   ws.username = null;
@@ -37,14 +58,18 @@ if (data.type === "login") {
   if (online.has(name)) return send(ws, { type: "error", message: "Username already online" });
 
   ws.username = name;
-  ws.ip = data.ip;       // ⬅️ ADD THIS
-  ws.port = data.port;  // ⬅️ ADD THIS
-
   online.set(name, ws);
 
-  send(ws, { type: "login_ok", username: name });
+  send(ws, {
+    type: "login_ok",
+    username: name,
+    publicIp: ws.publicIp,
+    publicPort: ws.publicPort,
+  });
+
   return;
 }
+
 
 
     // Require login for everything else
