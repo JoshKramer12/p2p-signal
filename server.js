@@ -58,6 +58,9 @@ if (data.type === "login") {
   if (online.has(name)) return send(ws, { type: "error", message: "Username already online" });
 
   ws.username = name;
+  ws.tcpPort = Number(data.tcpPort || 0);
+  ws.candidates = Array.isArray(data.candidates) ? data.candidates : [];
+
   online.set(name, ws);
 
   send(ws, {
@@ -69,6 +72,7 @@ if (data.type === "login") {
 
   return;
 }
+
 
 
 
@@ -107,11 +111,22 @@ if (data.type === "login") {
 
       // Confirm to sender
      // Tell sender where to connect
+// Tell receiver to start UDP checks
+send(receiver, {
+  type: "udp_check",
+  from: ws.username,
+  candidates: ws.candidates,
+});
+
+console.log("🧾 receiver.candidates:", receiver.candidates);
+console.log("➡️ sending send_now to", ws.username, "with candidates count:", (receiver.candidates || []).length);
+
+// Tell sender about receiver candidates
 return send(ws, {
   type: "send_now",
-  ip: receiver.ip,
-  port: receiver.port,
+  candidates: receiver.candidates,
 });
+
 
     }
 
