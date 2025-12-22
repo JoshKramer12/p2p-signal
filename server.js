@@ -86,6 +86,39 @@ if (data.type === "login") {
       return send(ws, { type: "online_list", users: Array.from(online.keys()) });
     }
 
+
+    // 3a) send intent only (NO transport)
+    if (data.type === "send_intent") {
+      const to = String(data.to || "").trim();
+      const fileName = String(data.fileName || "").trim();
+      const fileSize = Number(data.fileSize || 0);
+
+      if (!to || !fileName || !fileSize) {
+        return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
+      }
+
+      const receiver = online.get(to);
+      if (!receiver) {
+        return send(ws, { type: "error", message: `${to} is not online` });
+      }
+
+      // 🔔 Notify receiver ONLY (no TCP, no UDP)
+      send(receiver, {
+        type: "incoming_file",
+        from: ws.username,
+        fileName,
+        fileSize,
+      });
+
+      // ✅ Acknowledge sender
+      return send(ws, {
+        type: "intent_ok",
+        to,
+        fileName,
+      });
+    }
+
+
     // 3) send request to someone
     if (data.type === "send_request") {
       const to = String(data.to || "").trim();
