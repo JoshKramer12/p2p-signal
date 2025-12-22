@@ -1,11 +1,15 @@
 const http = require("http");
 const WebSocket = require("ws");
+const { randomUUID } = require("crypto");
 
 const PORT = process.env.PORT || 8080;
 
 
 // username -> ws
 const online = new Map();
+
+// username -> [intent, intent, intent]
+const inboxes = new Map();
 
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
@@ -88,35 +92,47 @@ if (data.type === "login") {
 
 
     // 3a) send intent only (NO transport)
-    if (data.type === "send_intent") {
-      const to = String(data.to || "").trim();
-      const fileName = String(data.fileName || "").trim();
-      const fileSize = Number(data.fileSize || 0);
+    // 3a) send intent only (NO transport)
+if (data.type === "send_intent") {
+  const to = String(data.to || "").trim();
+  const fileName = String(data.fileName || "").trim();
+  const fileSize = Number(data.fileSize || 0);
 
-      if (!to || !fileName || !fileSize) {
-        return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
-      }
+  if (!to || !fileName || !fileSize) {
+    return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
+  }
 
-      const receiver = online.get(to);
-      if (!receiver) {
-        return send(ws, { type: "error", message: `${to} is not online` });
-      }
+  // ✅ Create + store intent even if receiver is offline
+  const intent = {
+    id: randomUUID(),
+    from: ws.username,
+    to,
+    fileName,
+    fileSize,
+    createdAt: Date.now(),
+  };
 
-      // 🔔 Notify receiver ONLY (no TCP, no UDP)
-      send(receiver, {
-        type: "incoming_file",
-        from: ws.username,
-        fileName,
-        fileSize,
-      });
+  if (!inboxes.has(to)) inboxes.set(to, []);
+  inboxes.get(to).push(intent);
 
-      // ✅ Acknowledge sender
-      return send(ws, {
-        type: "intent_ok",
-        to,
-        fileName,
-      });
-    }
+  // 🔔 If receiver is online, notify immediately
+  const receiver = online.get(to);
+  if (receiver) {
+    send(receiver, {
+      type: "incoming_file",
+      intent,
+    });
+  }
+
+  // ✅ Always acknowledge sender
+  return send(ws, {
+    type: "intent_ok",
+    intentId: intent.id,
+    to,
+    fileName,
+  });
+}
+
 
 
     // 3) send request to someone
