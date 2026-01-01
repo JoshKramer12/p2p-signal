@@ -1,6 +1,9 @@
+//p2p-signal/server.js
+
 const http = require("http");
 const WebSocket = require("ws");
 const { randomUUID } = require("crypto");
+const net = require("net");
 
 const PORT = process.env.PORT || 8080;
 
@@ -11,12 +14,69 @@ const online = new Map();
 // username -> [intent, intent, intent]
 const inboxes = new Map();
 
+// intentId -> { tcp: net.Socket, bytesExpected, bytesSent, senderWs, receiverWs }
+const activeTransfers = new Map();
+
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
-function send(ws, obj) {
-  ws.send(JSON.stringify(obj));
+const fs = require("fs");
+const path = require("path");
+
+const STORAGE_DIR = path.join(__dirname, "p2p-storage");
+const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
+const FILES_DIR = path.join(STORAGE_DIR, "files");
+
+function safeBasename(name) {
+  // keep it simple & cross-platform safe
+  return String(name || "file.bin")
+    .replace(/[/\\]/g, "_")
+    .replace(/[^\w.\-() ]+/g, "_")
+    .trim();
 }
+
+
+fs.mkdirSync(INTENTS_DIR, { recursive: true });
+fs.mkdirSync(FILES_DIR, { recursive: true });
+
+function saveIntent(intent) {
+  const file = path.join(INTENTS_DIR, `${intent.id}.json`);
+  fs.writeFileSync(file, JSON.stringify(intent, null, 2));
+}
+
+function loadIntentsForUser(username) {
+  const intents = [];
+  for (const file of fs.readdirSync(INTENTS_DIR)) {
+    const intent = JSON.parse(
+      fs.readFileSync(path.join(INTENTS_DIR, file), "utf8")
+    );
+    if (intent.to === username) {
+  // Only show if:
+  // - stored file is ready, OR
+  // - it's pending/accepted (still valid intent)
+  // (uploading should show, but NOT as downloadable unless stored=true)
+  intents.push(intent);
+}
+
+  }
+  return intents;
+}
+
+
+
+
+function send(ws, obj) {
+  try {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch (e) {
+    console.error("❌ send() failed:", e);
+    return false;
+  }
+}
+
+
 
 function getPublicEndpoint(req) {
   // Render / proxies use x-forwarded-for
@@ -44,24 +104,88 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
 
   ws.username = null;
 
-  ws.on("message", (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg.toString());
-      console.log("📩 Message received:", data);
+  ws.on("message", (msg, isBinary) => {
 
-    } catch {
-      return send(ws, { type: "error", message: "Bad JSON" });
+  // ============================
+  // BINARY FILE CHUNKS (from Alice)
+  // ============================
+    if (isBinary) {
+    const intentId = ws.currentUploadIntentId;
+    if (!intentId) {
+      console.log("⚠️ Binary received but no active upload");
+      return;
     }
 
-    // 1) login
-    // 1) login
+    const t = activeTransfers.get(intentId);
+    if (!t) {
+      console.log("⚠️ No active transfer for intent", intentId);
+      return;
+    }
+
+    // If sender streams more than expected, fail fast.
+    const incomingLen = msg.length;
+    if (t.bytesSent + incomingLen > t.bytesExpected) {
+      console.log("❌ Too many bytes for intent", intentId);
+      try { t.tcp?.destroy(); } catch {}
+      try { t.writeStream?.destroy(); } catch {}
+      activeTransfers.delete(intentId);
+      ws.currentUploadIntentId = null;
+      return send(ws, { type: "error", message: "Upload exceeded expected size" });
+    }
+
+    // OFFLINE MODE: write to disk
+    if (t.mode === "offline") {
+      if (!t.writeStream) {
+        console.log("❌ Offline transfer missing writeStream", intentId);
+        return send(ws, { type: "error", message: "Server not ready for offline upload" });
+      }
+
+      t.writeStream.write(msg);
+      t.bytesSent += incomingLen;
+
+      if (t.bytesSent % (1024 * 1024) < incomingLen) {
+        console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
+      }
+      return;
+    }
+
+    // LIVE MODE: forward to TCP (existing behavior)
+    if (!t.tcp) {
+      console.log("⏳ Binary received but TCP not connected yet");
+      return;
+    }
+
+    t.tcp.write(msg);
+    t.bytesSent += incomingLen;
+
+    if (t.bytesSent % (1024 * 1024) < incomingLen) {
+      console.log(`➡️ Forwarded ${t.bytesSent}/${t.bytesExpected} bytes`);
+    }
+
+    return;
+  }
+
+  
+  let data;
+try {
+  data = JSON.parse(msg.toString());
+  console.log("📩 Message received:", data);
+} catch {
+  return send(ws, { type: "error", message: "Bad JSON" });
+}
+
+
+// 1) login
 if (data.type === "login") {
   const name = String(data.username || "").trim();
   if (!name) return send(ws, { type: "error", message: "Missing username" });
   if (online.has(name)) return send(ws, { type: "error", message: "Username already online" });
 
   ws.username = name;
+
+  // ✅ NEW: identify client type ("web" | "ios")
+  ws.client = String(data.client || "unknown");
+
   ws.tcpPort = Number(data.tcpPort || 0);
   ws.candidates = Array.isArray(data.candidates) ? data.candidates : [];
 
@@ -72,18 +196,531 @@ if (data.type === "login") {
     username: name,
     publicIp: ws.publicIp,
     publicPort: ws.publicPort,
+    client: ws.client,
   });
 
+  const pending = loadIntentsForUser(name);
+  if (pending.length > 0) {
+    send(ws, { type: "inbox", items: pending });
+  }
+
+  return;
+}
+
+// =========================
+// 🌐 WEB DOWNLOAD OVER WEBSOCKET (NEW)
+// =========================
+if (data.type === "download_ws_request") {
+  const intentId = String(data.intentId || "");
+  if (!intentId) return send(ws, { type: "error", message: "Missing intentId" });
+
+  const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+  if (!fs.existsSync(intentFile)) {
+    return send(ws, { type: "error", message: "Intent not found" });
+  }
+
+  const intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+  if (intent.to !== ws.username) {
+    return send(ws, { type: "error", message: "Not authorized for this intent" });
+  }
+  if (!intent.stored || !intent.storedFile) {
+    return send(ws, { type: "error", message: "File not stored on server" });
+  }
+
+  const filePath = path.join(FILES_DIR, intent.storedFile);
+  if (!fs.existsSync(filePath)) {
+    return send(ws, { type: "error", message: "Stored file missing" });
+  }
+
+  // Tell browser what's coming
+  send(ws, {
+    type: "download_ws_begin",
+    intentId,
+    name: intent.fileName,
+    size: intent.fileSize,
+  });
+
+  const rs = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
+
+  rs.on("data", (chunk) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(chunk, { binary: true });
+    }
+  });
+
+  rs.on("end", () => {
+    if (ws.readyState === WebSocket.OPEN) {
+      send(ws, { type: "download_ws_end", intentId });
+    }
+  });
+
+  rs.on("error", (err) => {
+    console.log("❌ download_ws stream error:", err);
+    if (ws.readyState === WebSocket.OPEN) {
+      send(ws, { type: "error", message: "Download failed" });
+    }
+  });
+
+  return;
+}
+
+// =========================
+// 🗑️ DELETE STORED FILE / INTENT (NEW)
+// =========================
+if (data.type === "delete_intent") {
+  const intentId = String(data.intentId || "").trim();
+  if (!intentId) {
+    return send(ws, { type: "error", message: "Missing intentId" });
+  }
+
+  const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+  if (!fs.existsSync(intentFile)) {
+    return send(ws, { type: "error", message: "Intent not found" });
+  }
+
+  let intent;
+  try {
+    intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+  } catch {
+    return send(ws, { type: "error", message: "Intent corrupted" });
+  }
+
+  // 🔒 Authorization: only recipient can delete
+  if (intent.to !== ws.username) {
+    return send(ws, { type: "error", message: "Not authorized" });
+  }
+
+  // 🗑️ Delete stored file if it exists
+  if (intent.stored && intent.storedFile) {
+    const filePath = path.join(FILES_DIR, intent.storedFile);
+    try {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch (err) {
+      console.error("❌ Failed to delete file:", err);
+    }
+  }
+
+  // 🗑️ Delete intent JSON
+  try {
+    fs.unlinkSync(intentFile);
+  } catch (err) {
+    console.error("❌ Failed to delete intent:", err);
+  }
+
+  // 🧠 Remove from in-memory inbox (if loaded)
+  const inbox = inboxes.get(ws.username);
+  if (inbox) {
+    inboxes.set(
+      ws.username,
+      inbox.filter(i => i.id !== intentId)
+    );
+  }
+
+  console.log(`🗑️ Deleted intent ${intentId} for ${ws.username}`);
+
+  // ✅ Ack client
+  send(ws, { type: "delete_ok", intentId });
+  return;
+}
+
+
+// =========================
+// 📥 iOS DOWNLOAD REQUEST (MISSING — ADD THIS)
+// =========================
+if (data.type === "download_request") {
+  const intentId = String(data.intentId || "").trim();
+  if (!intentId) return send(ws, { type: "error", message: "Missing intentId" });
+
+  const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+  if (!fs.existsSync(intentFile)) {
+    return send(ws, { type: "error", message: "Intent not found" });
+  }
+
+  let intent;
+  try {
+    intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+  } catch {
+    return send(ws, { type: "error", message: "Intent corrupted" });
+  }
+
+  // 🔒 Only recipient can request download
+  if (intent.to !== ws.username) {
+    return send(ws, { type: "error", message: "Not authorized" });
+  }
+
+  if (!intent.stored || !intent.storedFile) {
+    return send(ws, { type: "error", message: "File not stored on server" });
+  }
+
+  // Mark intent as waiting for download, then ask iOS to open TCP
+  intent._downloadWaiting = true;
+  saveIntent(intent);
+
+  send(ws, { type: "prepare_transfer", intentId });
   return;
 }
 
 
 
 
+// ✅ iOS tells us which TCP port it is listening on
+if (data.type === "ready") {
+  ws.tcpPort = Number(data.port);
+  const readyIntentId = String(data.intentId || "").trim();
+
+  console.log(`📡 ${ws.username} ready on TCP port ${ws.tcpPort}` + (readyIntentId ? ` for intent ${readyIntentId}` : ""));
+
+  // 🔒 STRICT: ready must be tied to exactly one intent
+  if (!readyIntentId) {
+    console.warn("⚠️ ready received without intentId — ignoring to prevent unintended sends");
+    return;
+  }
+
+  // Load intents from disk (authoritative)
+  const inbox = loadIntentsForUser(ws.username);
+
+  // 🔒 Safety: if this intent is already stored, never auto-send it on ready
+const intentOnDisk = inbox.find(i => i.id === readyIntentId);
+if (intentOnDisk?.stored) {
+  console.warn("⚠️ ready for stored intent — ignoring auto-send", readyIntentId);
+  return;
+}
+
+
+
+
+
+  // =========================
+  // 🔽 DOWNLOAD PATH (NEW)
+  // =========================
+    const downloadIntent = inbox.find(i => i.id === readyIntentId && i._downloadWaiting);
+
+
+  if (downloadIntent) {
+    delete downloadIntent._downloadWaiting;
+    saveIntent(downloadIntent);
+
+    let host = ws.publicIp;
+    if (host.startsWith("::ffff:")) host = host.replace("::ffff:", "");
+
+    const filePath = path.join(FILES_DIR, downloadIntent.storedFile);
+    const stats = fs.statSync(filePath);
+
+    console.log(`🔌 TCP connect for download ${host}:${ws.tcpPort}`);
+
+    const tcp = net.createConnection(
+      { host, port: ws.tcpPort },
+      () => {
+        tcp.write(JSON.stringify({
+          name: downloadIntent.fileName,
+          size: stats.size
+        }) + "\n");
+
+        console.log("📤 Download header sent");
+
+        fs.createReadStream(filePath).pipe(tcp);
+      }
+    );
+
+    tcp.on("close", () => {
+      console.log(`✅ Download complete ${downloadIntent.id}`);
+      downloadIntent.status = "completed";
+      saveIntent(downloadIntent);
+    });
+
+    tcp.on("error", err => {
+      console.error("❌ Download TCP error:", err);
+    });
+
+    return;
+  }
+
+  // =========================
+  // 🔼 LIVE UPLOAD PATH (EXISTING)
+  // =========================
+
+  // Find pending intent waiting for this receiver
+   const intent = inbox.find(i => i.id === readyIntentId && i.status === "pending" && i._waitingForReady && !i.stored);
+
+
+  if (!intent) return;
+
+  const sender = online.get(intent.from);
+  if (!sender) return;
+
+  const transferMsg = {
+    type: "start_transfer",
+    intent,
+    receiver: {
+      host: ws.publicIp,
+      port: ws.tcpPort,
+    },
+  };
+
+  const t = activeTransfers.get(intent.id);
+  if (!t || t.ended) {
+    console.log("⚠️ No active upload for ready intent");
+    return;
+  }
+
+  let host = ws.publicIp;
+  if (host.startsWith("::ffff:")) host = host.replace("::ffff:", "");
+
+  console.log(`🔌 TCP connect to iOS ${host}:${ws.tcpPort}`);
+
+  const tcp = net.createConnection(
+    { host, port: ws.tcpPort },
+    () => {
+      tcp.write(JSON.stringify({
+        name: intent.fileName,
+        size: intent.fileSize
+      }) + "\n");
+
+      console.log("🔌 TCP connected & header sent");
+
+      send(sender, { type: "upload_ok", intentId: intent.id });
+      console.log("✅ upload_ok sent");
+    }
+  );
+
+  t.tcp = tcp;
+
+  tcp.on("error", err => {
+    console.error("❌ TCP error:", err);
+    activeTransfers.delete(intent.id);
+  });
+
+  // 🔥 NOW start transfer (correct timing)
+  send(sender, transferMsg);
+  send(ws, transferMsg);
+
+  // Cleanup flag
+  delete intent._waitingForReady;
+  intent.status = "in_progress";
+
+  return;
+}
+
+
     // Require login for everything else
     if (!ws.username) {
       return send(ws, { type: "error", message: "Not logged in" });
     }
+
+    // ============================
+// FILE UPLOAD BEGIN (Alice → Server)
+// ============================
+if (data.type === "upload_begin") {
+  const intentId = String(data.intentId || "").trim();
+  const name = String(data.name || "").trim();
+  const size = Number(data.size || 0);
+
+  if (!intentId || !name || !size) {
+    return send(ws, { type: "error", message: "Missing upload_begin fields" });
+  }
+
+  const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+if (!fs.existsSync(intentFile)) {
+  ws.currentUploadIntentId = null;
+  return send(ws, { type: "error", message: "Intent not found" });
+}
+
+let intent;
+try {
+  intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+} catch {
+  ws.currentUploadIntentId = null;
+  return send(ws, { type: "error", message: "Intent JSON corrupted" });
+}
+
+if (intent.from !== ws.username) {
+  ws.currentUploadIntentId = null;
+  return send(ws, { type: "error", message: "Not sender" });
+}
+
+
+  // Always set current upload ID first (race-safe for binary frames)
+  ws.currentUploadIntentId = intentId;
+
+  let receiverWs = online.get(intent.to);
+
+// FORCE STORAGE FOR WEBSITE USERS
+if (!receiverWs || receiverWs.client !== "ios") {
+  receiverWs = null;
+}
+
+
+
+
+
+  // =========================
+  // OFFLINE PATH (NEW)
+  // =========================
+  if (!receiverWs) {
+    const safeName = safeBasename(name);
+    const storedFileName = `${intentId}__${safeName}`;
+    const filePath = path.join(FILES_DIR, storedFileName);
+
+    // Create write stream for raw bytes
+    const writeStream = fs.createWriteStream(filePath, { flags: "w" });
+
+    writeStream.on("error", (err) => {
+      console.error("❌ File writeStream error:", err);
+      activeTransfers.delete(intentId);
+      ws.currentUploadIntentId = null;
+      try { fs.unlinkSync(filePath); } catch {}
+      try { send(ws, { type: "error", message: "Server failed writing file" }); } catch {}
+    });
+
+    activeTransfers.set(intentId, {
+      mode: "offline",
+      tcp: null,
+      writeStream,
+      filePath,
+      bytesExpected: size,
+      bytesSent: 0,
+      ended: false,
+    });
+
+// Persist linkage but DO NOT mark stored until upload_end finishes
+intent.stored = false;
+intent.storedFile = storedFileName;
+intent.storedBytes = 0;
+intent.status = "uploading";
+saveIntent(intent);
+
+// ✅ let sender start streaming immediately
+send(ws, { type: "upload_ok", intentId });
+
+
+
+    console.log(`💾 Offline upload_begin: storing to ${storedFileName}`);
+    return;
+  }
+
+  // =========================
+  // LIVE PATH (EXISTING)
+  // =========================
+
+  // Ask receiver to prepare TCP now
+  send(receiverWs, {
+    type: "prepare_transfer",
+    intentId,
+  });
+
+  intent._waitingForReady = true;
+saveIntent(intent);
+
+activeTransfers.set(intentId, {
+  mode: "live",
+  tcp: null,
+  bytesExpected: size,
+  bytesSent: 0,
+  ended: false,
+});
+
+return;
+
+}
+
+
+// ============================
+// FILE UPLOAD END
+// ============================
+if (data.type === "upload_end") {
+  const intentId = String(data.intentId || "").trim();
+  if (!intentId) return send(ws, { type: "error", message: "Missing intentId" });
+
+  const t = activeTransfers.get(intentId);
+  if (!t) {
+    ws.currentUploadIntentId = null;
+    return send(ws, { type: "error", message: "No active transfer for upload_end" });
+  }
+
+  console.log(`✅ upload_end (${t.bytesSent}/${t.bytesExpected})`);
+
+  // Reject incomplete uploads (prevents “downloaded but broken” files)
+  if (t.bytesSent !== t.bytesExpected) {
+    try { t.tcp?.destroy(); } catch {}
+    try { t.writeStream?.destroy(); } catch {}
+    activeTransfers.delete(intentId);
+    ws.currentUploadIntentId = null;
+    return send(ws, { type: "error", message: "Upload incomplete (size mismatch)" });
+  }
+
+  // LIVE MODE: close TCP and HARD RESET upload state
+if (t.mode === "live") {
+  try { t.tcp?.end(); } catch {}
+
+  // 🔥 CRITICAL: clear upload association BEFORE anything else
+  ws.currentUploadIntentId = null;
+
+  activeTransfers.delete(intentId);
+
+  send(ws, { type: "upload_done", intentId });
+  return;
+}
+
+
+  // OFFLINE MODE: close the file stream and only then ack upload_done
+  // OFFLINE MODE: finalize file, update intent, notify receiver
+if (t.mode === "offline") {
+  const done = () => {
+    activeTransfers.delete(intentId);
+    ws.currentUploadIntentId = null;
+
+    let intent;
+    try {
+      const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+      intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+intent.stored = true;
+intent.storedBytes = intent.fileSize;
+intent.status = "stored";
+saveIntent(intent);
+
+    } catch {
+      return;
+    }
+
+    // 🔔 IMPORTANT: notify recipient that file is now ready
+    const receiver = online.get(intent.to);
+    if (receiver) {
+      send(receiver, {
+        type: "incoming_file",
+        intent
+      });
+    }
+
+    // ✅ acknowledge sender (iOS)
+    send(ws, { type: "upload_done", intentId });
+  };
+
+  try {
+  // Prevent any further binary frames from being associated with this intent
+  ws.currentUploadIntentId = null;
+
+  t.writeStream.end(() => done());
+} catch {
+
+    activeTransfers.delete(intentId);
+    ws.currentUploadIntentId = null;
+    return send(ws, { type: "error", message: "Failed to finalize stored file" });
+  }
+
+  return;
+}
+
+
+  // fallback
+  activeTransfers.delete(intentId);
+  ws.currentUploadIntentId = null;
+  return send(ws, { type: "upload_done", intentId });
+}
+
+
+
 
     // 2) who is online?
     if (data.type === "who") {
@@ -104,25 +741,20 @@ if (data.type === "send_intent") {
 
   // ✅ Create + store intent even if receiver is offline
   const intent = {
-    id: randomUUID(),
-    from: ws.username,
-    to,
-    fileName,
-    fileSize,
-    createdAt: Date.now(),
-  };
+  id: randomUUID(),
+  from: ws.username,
+  to,
+  fileName,
+  fileSize,
+  createdAt: Date.now(),
+  status: "pending", // pending | accepted | completed
+};
+
 
   if (!inboxes.has(to)) inboxes.set(to, []);
   inboxes.get(to).push(intent);
+  saveIntent(intent);
 
-  // 🔔 If receiver is online, notify immediately
-  const receiver = online.get(to);
-  if (receiver) {
-    send(receiver, {
-      type: "incoming_file",
-      intent,
-    });
-  }
 
   // ✅ Always acknowledge sender
   return send(ws, {
@@ -133,6 +765,52 @@ if (data.type === "send_intent") {
   });
 }
 
+
+// 3b) accept an inbox intent
+if (data.type === "accept_intent") {
+  const intentId = String(data.intentId || "").trim();
+  if (!intentId) {
+    return send(ws, { type: "error", message: "Missing intentId" });
+  }
+
+  const inbox = inboxes.get(ws.username) || [];
+  const intent = inbox.find(i => i.id === intentId);
+
+  if (!intent) {
+    return send(ws, { type: "error", message: "Intent not found" });
+  }
+
+  if (intent.status !== "pending") {
+    return send(ws, { type: "error", message: "Intent not pending" });
+  }
+
+  // ✅ Mark as accepted
+intent.status = "accepted";
+
+// ✅ Notify receiver
+send(ws, {
+  type: "intent_accepted",
+  intentId: intent.id,
+  from: intent.from,
+  fileName: intent.fileName,
+  fileSize: intent.fileSize,
+});
+
+// ✅ Notify sender if online
+const senderWs = online.get(intent.from);
+if (senderWs) {
+  send(senderWs, {
+    type: "intent_accepted_by_receiver",
+    intentId: intent.id,
+    to: intent.to,
+    fileName: intent.fileName,
+    fileSize: intent.fileSize,
+  });
+}
+
+return;
+
+}
 
 
     // 3) send request to someone

@@ -1,0 +1,10 @@
+{
+  "id": "b71e24f1-3592-48ba-a81c-15ad3bc5a671",
+  "from": "alice",
+  "to": "iphone",
+  "fileName": "Movie on 2025-12-09 at 10.34 PM.mov",
+  "fileSize": 39223607,
+  "createdAt": 1767071261987,
+  "status": "pending",
+  "_waitingForReady": true
+}

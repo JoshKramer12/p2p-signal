@@ -1,0 +1,10 @@
+{
+  "id": "d13e6d2d-7e02-4bee-914d-49c439ba4c6a",
+  "from": "alice",
+  "to": "iphone",
+  "fileName": "hw9.rtf",
+  "fileSize": 8359,
+  "createdAt": 1767065242394,
+  "status": "pending",
+  "_waitingForReady": true
+}

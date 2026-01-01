@@ -1,0 +1,10 @@
+{
+  "id": "02986770-51c9-4650-975f-e1775dab4a1b",
+  "from": "alice",
+  "to": "iphone",
+  "fileName": "e18b3688c362e6bacdea2cfa4028ef72.jpg",
+  "fileSize": 242511,
+  "createdAt": 1767065042616,
+  "status": "pending",
+  "_waitingForReady": true
+}
