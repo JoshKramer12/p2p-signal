@@ -336,24 +336,16 @@ if (data.type === "login") {
   return;
 }
 
+
 // =========================
-// 🔐 PRE-AUTH GUARD (AUTHORITATIVE)
+// 🔐 PRE-AUTH GUARD (FINAL)
 // =========================
-// Allow ONLY auth + ping before ws.username is set.
 if (!ws.username) {
-  if (data.type === "auth_signup") {
-    // let the auth_signup handler above run
-  } else if (data.type === "auth_login") {
-    // let the auth_login handler above run
-  } else if (data.type === "ping") {
-    return; // ok pre-auth
-  } else if (process.env.ALLOW_LEGACY_LOGIN === "1" && data.type === "login") {
-    // legacy login allowed (handler is below in your file)
-  } else {
-    // IMPORTANT: do not silently ignore — tell client why
-    return send(ws, { type: "error", message: "Not logged in" });
-  }
+  return send(ws, { type: "error", message: "Not logged in" });
 }
+
+
+
 
 
 
