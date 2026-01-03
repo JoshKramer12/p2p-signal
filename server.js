@@ -22,10 +22,13 @@ const wss = new WebSocket.Server({ server });
 
 const fs = require("fs");
 const path = require("path");
+const bcrypt = require("bcryptjs");
+
 
 const STORAGE_DIR = path.join(__dirname, "p2p-storage");
 const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
 const FILES_DIR = path.join(STORAGE_DIR, "files");
+const USERS_DIR = path.join(STORAGE_DIR, "users");
 
 function safeBasename(name) {
   // keep it simple & cross-platform safe
@@ -38,6 +41,8 @@ function safeBasename(name) {
 
 fs.mkdirSync(INTENTS_DIR, { recursive: true });
 fs.mkdirSync(FILES_DIR, { recursive: true });
+fs.mkdirSync(USERS_DIR, { recursive: true });
+
 
 function saveIntent(intent) {
   const file = path.join(INTENTS_DIR, `${intent.id}.json`);
@@ -89,6 +94,45 @@ function getPublicEndpoint(req) {
 
   return { ip, port };
 }
+
+
+function userFile(username) {
+  return path.join(USERS_DIR, `${username}.json`);
+}
+
+function loadUser(username) {
+  const file = userFile(username);
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function saveUser(user) {
+  fs.writeFileSync(userFile(user.username), JSON.stringify(user, null, 2));
+}
+
+function ensureUserShape(u) {
+  if (!u.friends) u.friends = [];
+  if (!Array.isArray(u.friends)) u.friends = [];
+  return u;
+}
+
+function addFriendSymmetric(a, b) {
+  const ua = ensureUserShape(loadUser(a));
+  const ub = ensureUserShape(loadUser(b));
+  if (!ua || !ub) return { ok: false, error: "User not found" };
+
+  if (!ua.friends.includes(b)) ua.friends.push(b);
+  if (!ub.friends.includes(a)) ub.friends.push(a);
+
+  saveUser(ua);
+  saveUser(ub);
+  return { ok: true, a: ua, b: ub };
+}
+
 
 
 wss.on("connection", (ws, req) => {
@@ -175,17 +219,104 @@ try {
 }
 
 
-// 1) login
+// =========================
+// 🔐 AUTH: SIGNUP
+// =========================
+if (data.type === "auth_signup") {
+  const username = String(data.username || "").trim();
+  const password = String(data.password || "");
+
+  if (!username) return send(ws, { type: "error", message: "Missing username" });
+  if (!password || password.length < 6) {
+    return send(ws, { type: "error", message: "Password must be at least 6 chars" });
+  }
+
+  if (loadUser(username)) {
+    return send(ws, { type: "error", message: "Username already exists" });
+  }
+
+  const passwordHash = bcrypt.hashSync(password, 12);
+
+  const user = {
+    username,
+    passwordHash,
+    friends: [],
+    createdAt: Date.now(),
+  };
+
+  saveUser(user);
+
+  return send(ws, { type: "signup_ok", username });
+}
+
+// =========================
+// 🔐 AUTH: LOGIN (password)
+// =========================
+if (data.type === "auth_login") {
+  const username = String(data.username || "").trim();
+  const password = String(data.password || "");
+  const client = String(data.client || "unknown");
+
+  if (!username) return send(ws, { type: "error", message: "Missing username" });
+  if (!password) return send(ws, { type: "error", message: "Missing password" });
+
+  const user = loadUser(username);
+  if (!user) return send(ws, { type: "error", message: "Invalid username or password" });
+
+  const ok = bcrypt.compareSync(password, user.passwordHash);
+  if (!ok) return send(ws, { type: "error", message: "Invalid username or password" });
+
+  // Enforce single online session per username (keep your behavior)
+  if (online.has(username)) {
+    return send(ws, { type: "error", message: "Username already online" });
+  }
+
+  ws.username = username;
+  ws.client = client;
+
+  ws.tcpPort = Number(data.tcpPort || 0);
+  ws.candidates = Array.isArray(data.candidates) ? data.candidates : [];
+
+  online.set(username, ws);
+
+  send(ws, {
+    type: "login_ok",
+    username,
+    publicIp: ws.publicIp,
+    publicPort: ws.publicPort,
+    client: ws.client,
+  });
+
+  // Send inbox (existing behavior)
+  const pending = loadIntentsForUser(username);
+  if (pending.length > 0) {
+    send(ws, { type: "inbox", items: pending });
+  } else {
+    send(ws, { type: "inbox", items: [] });
+  }
+
+  // Also send friends list immediately
+  const u2 = ensureUserShape(loadUser(username));
+  send(ws, { type: "friends_list", friends: u2?.friends || [] });
+
+  return;
+}
+
+
+
+// 1) login (LEGACY DEV ONLY)
+// Use auth_login for real accounts.
 if (data.type === "login") {
+  if (process.env.ALLOW_LEGACY_LOGIN !== "1") {
+    return send(ws, { type: "error", message: "Use auth_login (accounts enabled)" });
+  }
+
   const name = String(data.username || "").trim();
   if (!name) return send(ws, { type: "error", message: "Missing username" });
   if (online.has(name)) return send(ws, { type: "error", message: "Username already online" });
 
   ws.username = name;
-
-  // ✅ NEW: identify client type ("web" | "ios")
   ws.client = String(data.client || "unknown");
-
   ws.tcpPort = Number(data.tcpPort || 0);
   ws.candidates = Array.isArray(data.candidates) ? data.candidates : [];
 
@@ -200,12 +331,11 @@ if (data.type === "login") {
   });
 
   const pending = loadIntentsForUser(name);
-  if (pending.length > 0) {
-    send(ws, { type: "inbox", items: pending });
-  }
+  send(ws, { type: "inbox", items: pending });
 
   return;
 }
+
 
 // =========================
 // 🌐 WEB DOWNLOAD OVER WEBSOCKET (NEW)
@@ -509,7 +639,41 @@ if (intentOnDisk?.stored) {
       return send(ws, { type: "error", message: "Not logged in" });
     }
 
-    // ============================
+
+// =========================
+// 👥 FRIENDS: LIST
+// =========================
+if (data.type === "friends_list") {
+  const user = ensureUserShape(loadUser(ws.username));
+  return send(ws, { type: "friends_list", friends: user?.friends || [] });
+}
+
+// =========================
+// 👥 FRIENDS: ADD (symmetric)
+// =========================
+if (data.type === "add_friend") {
+  const friend = String(data.username || "").trim();
+  if (!friend) return send(ws, { type: "error", message: "Missing friend username" });
+  if (friend === ws.username) return send(ws, { type: "error", message: "Cannot friend yourself" });
+
+  const res = addFriendSymmetric(ws.username, friend);
+  if (!res.ok) return send(ws, { type: "error", message: res.error });
+
+  // Push updated friends list to both sides if online
+  const me = ensureUserShape(loadUser(ws.username));
+  send(ws, { type: "friends_list", friends: me.friends });
+
+  const otherWs = online.get(friend);
+  if (otherWs) {
+    const other = ensureUserShape(loadUser(friend));
+    send(otherWs, { type: "friends_list", friends: other.friends });
+  }
+
+  return;
+}
+
+
+// ============================
 // FILE UPLOAD BEGIN (Alice → Server)
 // ============================
 if (data.type === "upload_begin") {
