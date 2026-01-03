@@ -894,6 +894,7 @@ saveIntent(intent);
 
     // 3a) send intent only (NO transport)
     // 3a) send intent only (NO transport)
+// 3a) send intent only (NO transport)
 if (data.type === "send_intent") {
   const to = String(data.to || "").trim();
   const fileName = String(data.fileName || "").trim();
@@ -903,22 +904,33 @@ if (data.type === "send_intent") {
     return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
   }
 
+  // 🔒 Validate recipient exists
+  const sender = ensureUserShape(loadUser(ws.username));
+  const recipient = loadUser(to);
+
+  if (!recipient) {
+    return send(ws, { type: "error", message: "Recipient does not exist" });
+  }
+
+  // 🔒 Validate friendship (WhatsApp-style)
+  if (!sender.friends.includes(to)) {
+    return send(ws, { type: "error", message: "Recipient is not your friend" });
+  }
+
   // ✅ Create + store intent even if receiver is offline
   const intent = {
-  id: randomUUID(),
-  from: ws.username,
-  to,
-  fileName,
-  fileSize,
-  createdAt: Date.now(),
-  status: "pending", // pending | accepted | completed
-};
-
+    id: randomUUID(),
+    from: ws.username,
+    to,
+    fileName,
+    fileSize,
+    createdAt: Date.now(),
+    status: "pending", // pending | accepted | completed
+  };
 
   if (!inboxes.has(to)) inboxes.set(to, []);
   inboxes.get(to).push(intent);
   saveIntent(intent);
-
 
   // ✅ Always acknowledge sender
   return send(ws, {
@@ -928,6 +940,7 @@ if (data.type === "send_intent") {
     fileName,
   });
 }
+
 
 
 // 3b) accept an inbox intent
