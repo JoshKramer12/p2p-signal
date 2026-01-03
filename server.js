@@ -634,10 +634,16 @@ if (intentOnDisk?.stored) {
 }
 
 
-    // Require login for everything else
-    if (!ws.username) {
-      return send(ws, { type: "error", message: "Not logged in" });
-    }
+    // 🔓 Allow ping before login (keepalive / handshake safety)
+if (data.type === "ping") {
+  return; // silently ignore or keepalive ack not needed
+}
+
+// 🔒 Require login for everything else
+if (!ws.username) {
+  return send(ws, { type: "error", message: "Not logged in" });
+}
+
 
 
 // =========================
