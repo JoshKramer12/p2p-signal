@@ -337,14 +337,24 @@ if (data.type === "login") {
 }
 
 // =========================
-// 🔐 PRE-AUTH GUARD
+// 🔐 PRE-AUTH GUARD (AUTHORITATIVE)
 // =========================
-// After signup/login handlers, but before everything else.
-// Ignore any other messages until user is logged in.
+// Allow ONLY auth + ping before ws.username is set.
 if (!ws.username) {
-  console.warn("⚠️ Ignoring pre-auth message:", data.type);
-  return;
+  if (data.type === "auth_signup") {
+    // let the auth_signup handler above run
+  } else if (data.type === "auth_login") {
+    // let the auth_login handler above run
+  } else if (data.type === "ping") {
+    return; // ok pre-auth
+  } else if (process.env.ALLOW_LEGACY_LOGIN === "1" && data.type === "login") {
+    // legacy login allowed (handler is below in your file)
+  } else {
+    // IMPORTANT: do not silently ignore — tell client why
+    return send(ws, { type: "error", message: "Not logged in" });
+  }
 }
+
 
 
 
