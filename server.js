@@ -336,6 +336,17 @@ if (data.type === "login") {
   return;
 }
 
+// =========================
+// 🔐 PRE-AUTH GUARD
+// =========================
+// After signup/login handlers, but before everything else.
+// Ignore any other messages until user is logged in.
+if (!ws.username) {
+  console.warn("⚠️ Ignoring pre-auth message:", data.type);
+  return;
+}
+
+
 
 // =========================
 // 🌐 WEB DOWNLOAD OVER WEBSOCKET (NEW)
@@ -639,10 +650,7 @@ if (data.type === "ping") {
   return; // silently ignore or keepalive ack not needed
 }
 
-// 🔒 Require login for everything else
-if (!ws.username) {
-  return send(ws, { type: "error", message: "Not logged in" });
-}
+
 
 
 
