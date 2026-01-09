@@ -726,10 +726,6 @@ if (!receiverWs || receiverWs.client !== "ios") {
   receiverWs = null;
 }
 
-
-
-
-
   // =========================
   // OFFLINE PATH (NEW)
   // =========================
@@ -757,7 +753,9 @@ if (!receiverWs || receiverWs.client !== "ios") {
       bytesExpected: size,
       bytesSent: 0,
       ended: false,
+      intent, // ✅ ADD THIS
     });
+
 
 // Persist linkage but DO NOT mark stored until upload_end finishes
 intent.stored = false;
@@ -794,7 +792,9 @@ activeTransfers.set(intentId, {
   bytesExpected: size,
   bytesSent: 0,
   ended: false,
+  intent, // ✅ ADD THIS
 });
+
 
 return;
 
@@ -858,15 +858,26 @@ saveIntent(intent);
     } catch {
       return;
     }
+    //test
 
     // 🔔 IMPORTANT: notify recipient that file is now ready
-    const receiver = online.get(intent.to);
-    if (receiver) {
-      send(receiver, {
-        type: "incoming_file",
-        intent
-      });
-    }
+    // 🔔 IMPORTANT: notify recipient that file is now ready
+const receiver = online.get(intent.to);
+if (receiver) {
+  send(receiver, {
+    type: "incoming_file",
+    intent
+  });
+
+  // ✅ FIX 2: if recipient is iOS, immediately trigger TCP download
+  if (receiver.client === "ios") {
+    send(receiver, {
+      type: "prepare_transfer",
+      intentId
+    });
+  }
+}
+
 
     // ✅ acknowledge sender (iOS)
     send(ws, { type: "upload_done", intentId });
