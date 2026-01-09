@@ -25,7 +25,8 @@ const path = require("path");
 const bcrypt = require("bcryptjs");
 
 
-const STORAGE_DIR = path.join(__dirname, "p2p-storage");
+const STORAGE_DIR = process.env.STORAGE_DIR || path.join(__dirname, "p2p-storage");
+
 const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
 const FILES_DIR = path.join(STORAGE_DIR, "files");
 const USERS_DIR = path.join(STORAGE_DIR, "users");
