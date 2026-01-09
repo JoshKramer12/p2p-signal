@@ -741,10 +741,12 @@ if (intent.from !== ws.username) {
 
   let receiverWs = online.get(intent.to);
 
-// FORCE STORAGE FOR WEBSITE USERS
-if (!receiverWs || receiverWs.client !== "ios") {
+// 🔥 ONLY iOS SENDERS CAN DO LIVE TCP
+if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
   receiverWs = null;
 }
+
+
 
   // =========================
   // OFFLINE PATH (NEW)
