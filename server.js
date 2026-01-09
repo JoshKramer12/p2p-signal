@@ -211,12 +211,19 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
 
   
   let data;
-try {
-  data = JSON.parse(msg.toString());
-  console.log("📩 Message received:", data);
-} catch {
-  return send(ws, { type: "error", message: "Bad JSON" });
-}
+    try {
+      data = JSON.parse(msg.toString());
+      console.log("📩 Message received:", data);
+    } catch {
+      return; // Ignore malformed JSON
+    }
+
+    // 🔐 AUTH GUARD: Allow signup/login/ping, block everything else if not logged in
+    const publicTypes = ["auth_signup", "auth_login", "ping"];
+    if (!ws.username && !publicTypes.includes(data.type)) {
+      console.log("🛑 Blocked unauthorized message:", data.type);
+      return send(ws, { type: "error", message: "Not logged in" });
+    }
 
 
 // =========================
@@ -335,19 +342,6 @@ if (data.type === "login") {
 
   return;
 }
-
-
-// =========================
-// 🔐 PRE-AUTH GUARD (FINAL)
-// =========================
-if (!ws.username) {
-  return send(ws, { type: "error", message: "Not logged in" });
-}
-
-
-
-
-
 
 
 // =========================
