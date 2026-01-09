@@ -122,9 +122,12 @@ function ensureUserShape(u) {
 }
 
 function addFriendSymmetric(a, b) {
-  const ua = ensureUserShape(loadUser(a));
-  const ub = ensureUserShape(loadUser(b));
-  if (!ua || !ub) return { ok: false, error: "User not found" };
+  const ua0 = loadUser(a);
+  const ub0 = loadUser(b);
+  if (!ua0 || !ub0) return { ok: false, error: "User not found" };
+
+  const ua = ensureUserShape(ua0);
+  const ub = ensureUserShape(ub0);
 
   if (!ua.friends.includes(b)) ua.friends.push(b);
   if (!ub.friends.includes(a)) ub.friends.push(a);
@@ -133,6 +136,7 @@ function addFriendSymmetric(a, b) {
   saveUser(ub);
   return { ok: true, a: ua, b: ub };
 }
+
 
 
 
@@ -150,6 +154,8 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
   ws.username = null;
 
   ws.on("message", (msg, isBinary) => {
+    try {
+
 
   // ============================
   // BINARY FILE CHUNKS (from Alice)
@@ -242,6 +248,10 @@ if (data.type === "auth_signup") {
   if (loadUser(username)) {
     return send(ws, { type: "error", message: "Username already exists" });
   }
+  if (!/^[a-zA-Z0-9_]{3,32}$/.test(username)) {
+  return send(ws, { type: "error", message: "Invalid username format" });
+}
+
 
   const passwordHash = bcrypt.hashSync(password, 12);
 
@@ -275,9 +285,14 @@ if (data.type === "auth_login") {
   if (!ok) return send(ws, { type: "error", message: "Invalid username or password" });
 
   // Enforce single online session per username (keep your behavior)
-  if (online.has(username)) {
-    return send(ws, { type: "error", message: "Username already online" });
-  }
+  // Enforce single session: kick old one (prevents "password incorrect" UX)
+const prev = online.get(username);
+if (prev && prev.readyState === WebSocket.OPEN) {
+  try { send(prev, { type: "error", message: "Logged in elsewhere" }); } catch {}
+  try { prev.close(4001, "Replaced by new login"); } catch {}
+}
+online.delete(username);
+
 
   ws.username = username;
   ws.client = client;
@@ -655,7 +670,12 @@ if (data.type === "ping") {
 // 👥 FRIENDS: LIST
 // =========================
 if (data.type === "friends_list") {
-  const user = ensureUserShape(loadUser(ws.username));
+  const u0 = loadUser(ws.username);
+if (!u0) return send(ws, { type: "friends_list", friends: [] });
+
+const user = ensureUserShape(u0);
+return send(ws, { type: "friends_list", friends: user.friends });
+
   return send(ws, { type: "friends_list", friends: user?.friends || [] });
 }
 
@@ -1057,6 +1077,11 @@ return send(ws, {
     }
 
     send(ws, { type: "error", message: "Unknown message type" });
+    } catch (err) {
+  console.error("💥 Handler crash:", err);
+  try { send(ws, { type: "error", message: "Server error" }); } catch {}
+}
+
   });
 
   ws.on("close", () => {
