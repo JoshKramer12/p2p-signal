@@ -25,7 +25,16 @@ const path = require("path");
 const bcrypt = require("bcryptjs");
 
 
-const STORAGE_DIR = process.env.STORAGE_DIR || path.join(__dirname, "p2p-storage");
+// ✅ IMPORTANT: persistence across redeploys requires a durable disk.
+// On Fly.io, mount a volume at /data (see fly.toml section below).
+// Locally, this will still work (it will create ./p2p-storage next to server.js).
+const DEFAULT_STORAGE_DIR =
+  process.env.NODE_ENV === "production"
+    ? "/data/p2p-storage"
+    : path.join(__dirname, "p2p-storage");
+
+const STORAGE_DIR = process.env.STORAGE_DIR || DEFAULT_STORAGE_DIR;
+
 
 const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
 const FILES_DIR = path.join(STORAGE_DIR, "files");
