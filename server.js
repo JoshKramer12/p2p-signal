@@ -59,6 +59,11 @@ function saveIntent(intent) {
   fs.writeFileSync(file, JSON.stringify(intent, null, 2));
 }
 
+function generateSessionToken() {
+  return randomUUID() + randomUUID();
+}
+
+
 function loadIntentsForUser(username) {
   const intents = [];
   for (const file of fs.readdirSync(INTENTS_DIR)) {
@@ -265,16 +270,47 @@ if (data.type === "auth_signup") {
   const passwordHash = bcrypt.hashSync(password, 12);
 
   const user = {
-    username,
-    passwordHash,
-    friends: [],
-    createdAt: Date.now(),
-  };
+  username,
+  passwordHash,
+  friends: [],
+  createdAt: Date.now(),
+  sessionTokens: [],
+};
+
 
   saveUser(user);
 
   return send(ws, { type: "signup_ok", username });
 }
+
+if (data.type === "auth_resume") {
+  const username = String(data.username || "").trim();
+  const token = String(data.sessionToken || "");
+
+  const user = loadUser(username);
+  if (!user || !user.sessionTokens?.includes(token)) {
+    return send(ws, { type: "error", message: "Session expired" });
+  }
+
+  ws.username = username;
+  online.set(username, ws);
+
+  send(ws, {
+    type: "login_ok",
+    username,
+    sessionToken: token,
+    resumed: true,
+  });
+
+  const pending = loadIntentsForUser(username);
+  send(ws, { type: "inbox", items: pending });
+
+  const u2 = ensureUserShape(user);
+  send(ws, { type: "friends_list", friends: u2.friends });
+
+  return;
+}
+
 
 // =========================
 // 🔐 AUTH: LOGIN (password)
@@ -284,55 +320,102 @@ if (data.type === "auth_login") {
   const password = String(data.password || "");
   const client = String(data.client || "unknown");
 
-  if (!username) return send(ws, { type: "error", message: "Missing username" });
-  if (!password) return send(ws, { type: "error", message: "Missing password" });
+  // ───────────────────────────
+  // Validate input
+  // ───────────────────────────
+  if (!username) {
+    return send(ws, { type: "error", message: "Missing username" });
+  }
+  if (!password) {
+    return send(ws, { type: "error", message: "Missing password" });
+  }
 
+  // ───────────────────────────
+  // Load user + verify password
+  // ───────────────────────────
   const user = loadUser(username);
-  if (!user) return send(ws, { type: "error", message: "Invalid username or password" });
+  if (!user) {
+    return send(ws, { type: "error", message: "Invalid username or password" });
+  }
 
   const ok = bcrypt.compareSync(password, user.passwordHash);
-  if (!ok) return send(ws, { type: "error", message: "Invalid username or password" });
+  if (!ok) {
+    return send(ws, { type: "error", message: "Invalid username or password" });
+  }
 
-  // Enforce single online session per username (keep your behavior)
-  // Enforce single session: kick old one (prevents "password incorrect" UX)
-const prev = online.get(username);
-if (prev && prev.readyState === WebSocket.OPEN) {
-  try { send(prev, { type: "error", message: "Logged in elsewhere" }); } catch {}
-  try { prev.close(4001, "Replaced by new login"); } catch {}
-}
-online.delete(username);
+  // ───────────────────────────
+  // Enforce single active WS session
+  // ───────────────────────────
+  const prev = online.get(username);
+  if (prev && prev.readyState === WebSocket.OPEN) {
+    try {
+      send(prev, { type: "error", message: "Logged in elsewhere" });
+    } catch {}
+    try {
+      prev.close(4001, "Replaced by new login");
+    } catch {}
+  }
+  online.delete(username);
 
-
+  // ───────────────────────────
+  // Bind user to this socket
+  // ───────────────────────────
   ws.username = username;
   ws.client = client;
-
   ws.tcpPort = Number(data.tcpPort || 0);
   ws.candidates = Array.isArray(data.candidates) ? data.candidates : [];
 
   online.set(username, ws);
 
+  // ───────────────────────────
+  // Issue persistent session token
+  // ───────────────────────────
+  const token = generateSessionToken();
+
+  user.sessionTokens = Array.isArray(user.sessionTokens)
+    ? user.sessionTokens
+    : [];
+
+  user.sessionTokens.push(token);
+
+  // Keep only the last 5 tokens (prevents unbounded growth)
+  user.sessionTokens = user.sessionTokens.slice(-5);
+
+  saveUser(user);
+
+  // ───────────────────────────
+  // Login success
+  // ───────────────────────────
   send(ws, {
     type: "login_ok",
     username,
+    sessionToken: token,
     publicIp: ws.publicIp,
     publicPort: ws.publicPort,
     client: ws.client,
   });
 
-  // Send inbox (existing behavior)
+  // ───────────────────────────
+  // Send inbox
+  // ───────────────────────────
   const pending = loadIntentsForUser(username);
-  if (pending.length > 0) {
-    send(ws, { type: "inbox", items: pending });
-  } else {
-    send(ws, { type: "inbox", items: [] });
-  }
+  send(ws, {
+    type: "inbox",
+    items: pending.length ? pending : [],
+  });
 
-  // Also send friends list immediately
+  // ───────────────────────────
+  // Send friends list
+  // ───────────────────────────
   const u2 = ensureUserShape(loadUser(username));
-  send(ws, { type: "friends_list", friends: u2?.friends || [] });
+  send(ws, {
+    type: "friends_list",
+    friends: u2.friends || [],
+  });
 
   return;
 }
+
 
 
 
