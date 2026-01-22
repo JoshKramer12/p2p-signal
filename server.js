@@ -240,7 +240,8 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
     }
 
     // 🔐 AUTH GUARD: Allow signup/login/ping, block everything else if not logged in
-    const publicTypes = ["auth_signup", "auth_login", "ping"];
+    const publicTypes = ["auth_signup", "auth_login", "auth_resume", "ping"];
+
     if (!ws.username && !publicTypes.includes(data.type)) {
       console.log("🛑 Blocked unauthorized message:", data.type);
       return send(ws, { type: "error", message: "Not logged in" });
