@@ -151,6 +151,50 @@ function addFriendSymmetric(a, b) {
   return { ok: true, a: ua, b: ub };
 }
 
+function deleteUserAccount(username) {
+  // 1️⃣ Remove user file
+  const userPath = userFile(username);
+  if (fs.existsSync(userPath)) {
+    fs.unlinkSync(userPath);
+  }
+
+  // 2️⃣ Remove from online sessions
+  const ws = online.get(username);
+  if (ws) {
+    try { ws.close(4000, "Account deleted"); } catch {}
+    online.delete(username);
+  }
+
+  // 3️⃣ Remove from all friends lists
+  for (const file of fs.readdirSync(USERS_DIR)) {
+    const p = path.join(USERS_DIR, file);
+    const u = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (Array.isArray(u.friends)) {
+      u.friends = u.friends.filter(f => f !== username);
+      saveUser(u);
+    }
+  }
+
+  // 4️⃣ Delete intents + stored files
+  for (const file of fs.readdirSync(INTENTS_DIR)) {
+    const intentPath = path.join(INTENTS_DIR, file);
+    const intent = JSON.parse(fs.readFileSync(intentPath, "utf8"));
+
+    if (intent.from === username || intent.to === username) {
+      if (intent.storedFile) {
+        const storedPath = path.join(FILES_DIR, intent.storedFile);
+        if (fs.existsSync(storedPath)) {
+          fs.unlinkSync(storedPath);
+        }
+      }
+      fs.unlinkSync(intentPath);
+    }
+  }
+
+  console.log(`🗑️ Account deleted: ${username}`);
+}
+
+
 
 
 
@@ -246,6 +290,39 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
       console.log("🛑 Blocked unauthorized message:", data.type);
       return send(ws, { type: "error", message: "Not logged in" });
     }
+
+// =========================
+// 🗑️ DELETE MY ACCOUNT
+// =========================
+if (data.type === "delete_my_account") {
+  const password = String(data.password || "");
+  if (!password) {
+    return send(ws, { type: "error", message: "Password required" });
+  }
+
+  const user = loadUser(ws.username);
+  if (!user) {
+    return send(ws, { type: "error", message: "User not found" });
+  }
+
+  const ok = bcrypt.compareSync(password, user.passwordHash);
+  if (!ok) {
+    return send(ws, { type: "error", message: "Incorrect password" });
+  }
+
+  const username = ws.username;
+
+  // Delete all account data
+  deleteUserAccount(username);
+
+  // Acknowledge before closing
+  try {
+    send(ws, { type: "account_deleted" });
+  } catch {}
+
+  return;
+}
+
 
 
 // =========================
