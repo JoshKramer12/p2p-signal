@@ -273,10 +273,11 @@ if (data.type === "auth_signup") {
   const user = {
   username,
   passwordHash,
-  friends: [],
+  friends: [username], // 👈 add self
   createdAt: Date.now(),
   sessionTokens: [],
 };
+
 
 
   saveUser(user);
@@ -292,6 +293,14 @@ if (data.type === "auth_resume") {
   if (!user || !user.sessionTokens?.includes(token)) {
     return send(ws, { type: "error", message: "Session expired" });
   }
+
+  // ✅ Upgrade old accounts: ensure self is in friends list
+user.friends = Array.isArray(user.friends) ? user.friends : [];
+if (!user.friends.includes(user.username)) {
+  user.friends.push(user.username);
+  saveUser(user);
+}
+
 
   ws.username = username;
   online.set(username, ws);
@@ -311,6 +320,8 @@ if (data.type === "auth_resume") {
 
   return;
 }
+
+
 
 
 // =========================
@@ -335,9 +346,17 @@ if (data.type === "auth_login") {
   // Load user + verify password
   // ───────────────────────────
   const user = loadUser(username);
-  if (!user) {
-    return send(ws, { type: "error", message: "Invalid username or password" });
-  }
+if (!user) {
+  return send(ws, { type: "error", message: "Invalid username or password" });
+}
+
+// ✅ Upgrade old accounts: ensure self is in friends list
+user.friends = Array.isArray(user.friends) ? user.friends : [];
+if (!user.friends.includes(user.username)) {
+  user.friends.push(user.username);
+  saveUser(user);
+}
+
 
   const ok = bcrypt.compareSync(password, user.passwordHash);
   if (!ok) {
@@ -778,8 +797,6 @@ return send(ws, { type: "friends_list", friends: user.friends });
 if (data.type === "add_friend") {
   const friend = String(data.username || "").trim();
   if (!friend) return send(ws, { type: "error", message: "Missing friend username" });
-  if (friend === ws.username) return send(ws, { type: "error", message: "Cannot friend yourself" });
-
   const res = addFriendSymmetric(ws.username, friend);
   if (!res.ok) return send(ws, { type: "error", message: res.error });
 
