@@ -250,7 +250,23 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
       }
 
       t.writeStream.write(msg);
-      t.bytesSent += incomingLen;
+t.bytesSent += incomingLen;
+
+// 🔔 PROGRESS UPDATE (UPLOAD → SERVER)
+const pct = Math.floor((t.bytesSent / t.bytesExpected) * 100);
+
+const senderWs = online.get(t.intent.from);
+if (senderWs) {
+  send(senderWs, {
+    type: "transfer_progress",
+    phase: "uploading",
+    intentId,
+    sent: t.bytesSent,
+    total: t.bytesExpected,
+    percent: pct,
+  });
+}
+
 
       if (t.bytesSent % (1024 * 1024) < incomingLen) {
         console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
@@ -584,11 +600,41 @@ if (data.type === "download_ws_request") {
 
   const rs = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
 
-  rs.on("data", (chunk) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(chunk, { binary: true });
-    }
+  let sentBytes = 0;
+
+rs.on("data", (chunk) => {
+  sentBytes += chunk.length;
+
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(chunk, { binary: true });
+  }
+
+  const pct = Math.floor((sentBytes / intent.fileSize) * 100);
+
+  // 🔔 Notify RECEIVER
+  send(ws, {
+    type: "transfer_progress",
+    phase: "downloading",
+    intentId,
+    received: sentBytes,
+    total: intent.fileSize,
+    percent: pct,
   });
+
+  // 🔔 Notify SENDER
+  const senderWs = online.get(intent.from);
+  if (senderWs) {
+    send(senderWs, {
+      type: "transfer_progress",
+      phase: "delivering",
+      intentId,
+      received: sentBytes,
+      total: intent.fileSize,
+      percent: pct,
+    });
+  }
+});
+
 
   rs.on("end", () => {
     if (ws.readyState === WebSocket.OPEN) {
