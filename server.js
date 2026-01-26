@@ -767,10 +767,21 @@ if (intentOnDisk?.stored) {
     );
 
     tcp.on("close", () => {
-      console.log(`✅ Download complete ${downloadIntent.id}`);
-      downloadIntent.status = "completed";
-      saveIntent(downloadIntent);
+  console.log(`✅ Download complete ${downloadIntent.id}`);
+  downloadIntent.status = "completed";
+  saveIntent(downloadIntent);
+
+  // 🔔 Notify sender that file was received
+  const senderWs = online.get(downloadIntent.from);
+  if (senderWs) {
+    send(senderWs, {
+      type: "file_received",
+      intentId: downloadIntent.id,
+      fileName: downloadIntent.fileName
     });
+  }
+});
+
 
     tcp.on("error", err => {
       console.error("❌ Download TCP error:", err);
