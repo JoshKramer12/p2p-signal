@@ -581,9 +581,13 @@ if (data.type === "download_ws_request") {
   if (intent.to !== ws.username) {
     return send(ws, { type: "error", message: "Not authorized for this intent" });
   }
-  if (!intent.stored || !intent.storedFile) {
-    return send(ws, { type: "error", message: "File not stored on server" });
-  }
+ if (!intent.stored || !intent.storedFile) {
+  return send(ws, {
+    type: "error",
+    message: "File is not ready yet"
+  });
+}
+
 
   const filePath = path.join(FILES_DIR, intent.storedFile);
   if (!fs.existsSync(filePath)) {
@@ -598,7 +602,7 @@ if (data.type === "download_ws_request") {
     size: intent.fileSize,
   });
 
-  const rs = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
+  const rs = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 * 2 });
 
   let sentBytes = 0;
 
@@ -1106,7 +1110,7 @@ if (t.mode === "live") {
 
 
   // OFFLINE MODE: close the file stream and only then ack upload_done
-  // OFFLINE MODE: finalize file, update intent, notify receiver
+// OFFLINE MODE: finalize file, update intent, notify receiver
 if (t.mode === "offline") {
   const done = () => {
     activeTransfers.delete(intentId);
@@ -1116,14 +1120,38 @@ if (t.mode === "offline") {
     try {
       const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
       intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
-intent.stored = true;
-intent.storedBytes = intent.fileSize;
-intent.status = "stored";
-saveIntent(intent);
 
-    } catch {
+      // ✅ VERIFY FILE ACTUALLY FINISHED WRITING
+      const stats = fs.statSync(t.filePath);
+      if (stats.size !== intent.fileSize) {
+        console.error("❌ Stored file size mismatch", {
+          expected: intent.fileSize,
+          actual: stats.size,
+        });
+
+        try { fs.unlinkSync(t.filePath); } catch {}
+
+        intent.stored = false;
+        intent.status = "failed";
+        saveIntent(intent);
+
+        return send(ws, {
+          type: "error",
+          message: "Upload failed (file corrupted)",
+        });
+      }
+
+      // ✅ SAFE: file is complete
+      intent.stored = true;
+      intent.storedBytes = stats.size;
+      intent.status = "stored";
+      saveIntent(intent);
+
+    } catch (err) {
+      console.error("❌ Finalize offline upload failed:", err);
       return;
     }
+
     //test
 
     // 🔔 IMPORTANT: notify recipient that file is now ready
