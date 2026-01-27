@@ -49,16 +49,35 @@ function safeBasename(name) {
 }
 
 
-fs.mkdirSync(INTENTS_DIR, { recursive: true });
-fs.mkdirSync(FILES_DIR, { recursive: true });
-fs.mkdirSync(USERS_DIR, { recursive: true });
+// FIX: Safer ID generator
+const { randomUUID } = require("crypto");
+const generateId = () => {
+  if (typeof randomUUID === "function") return randomUUID();
+  return Date.now().toString(36) + Math.random().toString(36).substr(2);
+};
 
-
-function saveIntent(intent) {
-  const file = path.join(INTENTS_DIR, `${intent.id}.json`);
-  fs.writeFileSync(file, JSON.stringify(intent, null, 2));
+// FIX: Ensure directories exist recursively
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
 }
 
+// Initialize directories
+ensureDir(INTENTS_DIR);
+ensureDir(FILES_DIR);
+ensureDir(USERS_DIR);
+
+function saveIntent(intent) {
+  try {
+    ensureDir(INTENTS_DIR); // Double-check directory exists
+    const file = path.join(INTENTS_DIR, `${intent.id}.json`);
+    fs.writeFileSync(file, JSON.stringify(intent, null, 2));
+  } catch (err) {
+    console.error("CRITICAL SAVE ERROR:", err.message);
+    throw err; 
+  }
+}
 function generateSessionToken() {
   return randomUUID() + randomUUID();
 }
@@ -1128,6 +1147,7 @@ if (receiver) {
     // 3a) send intent only (NO transport)
 // 3a) send intent only (NO transport)
 // 3a) send intent only (NO transport)
+    // 3a) send intent only (NO transport)
     if (data.type === "send_intent") {
       const to = String(data.to || "").trim();
       const fileName = String(data.fileName || "").trim();
@@ -1137,7 +1157,7 @@ if (receiver) {
         return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
       }
 
-      // 1. Validate Sender (Crash Fix)
+      // 1. Validate Sender
       const senderRaw = loadUser(ws.username);
       if (!senderRaw) {
          return send(ws, { type: "error", message: "Sender profile missing. Please re-login." });
@@ -1155,9 +1175,9 @@ if (receiver) {
         return send(ws, { type: "error", message: "Recipient is not your friend" });
       }
 
-      // 4. Create Intent
+      // 4. Create Intent (using safer generateId)
       const intent = {
-        id: randomUUID(),
+        id: generateId(), 
         from: ws.username,
         to,
         fileName,
@@ -1172,8 +1192,8 @@ if (receiver) {
       try {
         saveIntent(intent);
       } catch (e) {
-        console.error("Failed to save intent:", e);
-        return send(ws, { type: "error", message: "Server storage error" });
+        // Send the EXACT error to the client so you can see it in the log
+        return send(ws, { type: "error", message: "Storage: " + e.message });
       }
 
       // 5. Acknowledge Sender
