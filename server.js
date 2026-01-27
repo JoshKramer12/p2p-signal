@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8080;
 const online = new Map();
 
 // username -> [intent, intent, intent]
-
+const inboxes = new Map();
 
 // intentId -> { tcp: net.Socket, bytesExpected, bytesSent, senderWs, receiverWs }
 const activeTransfers = new Map();
@@ -67,21 +67,18 @@ function generateSessionToken() {
 function loadIntentsForUser(username) {
   const intents = [];
   for (const file of fs.readdirSync(INTENTS_DIR)) {
-  const p = path.join(INTENTS_DIR, file);
-  let intent;
-  try {
-    intent = JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch (err) {
-    console.error("❌ Corrupt intent file, deleting:", file);
-    try { fs.unlinkSync(p); } catch {}
-    continue;
-  }
-
-  if (intent.to === username) {
-    intents.push(intent);
-  }
+    const intent = JSON.parse(
+      fs.readFileSync(path.join(INTENTS_DIR, file), "utf8")
+    );
+    if (intent.to === username) {
+  // Only show if:
+  // - stored file is ready, OR
+  // - it's pending/accepted (still valid intent)
+  // (uploading should show, but NOT as downloadable unless stored=true)
+  intents.push(intent);
 }
 
+  }
   return intents;
 }
 
@@ -153,50 +150,6 @@ function addFriendSymmetric(a, b) {
   saveUser(ub);
   return { ok: true, a: ua, b: ub };
 }
-
-function deleteUserAccount(username) {
-  // 1️⃣ Remove user file
-  const userPath = userFile(username);
-  if (fs.existsSync(userPath)) {
-    fs.unlinkSync(userPath);
-  }
-
-  // 2️⃣ Remove from online sessions
-  const ws = online.get(username);
-  if (ws) {
-    try { ws.close(4000, "Account deleted"); } catch {}
-    online.delete(username);
-  }
-
-  // 3️⃣ Remove from all friends lists
-  for (const file of fs.readdirSync(USERS_DIR)) {
-    const p = path.join(USERS_DIR, file);
-    const u = JSON.parse(fs.readFileSync(p, "utf8"));
-    if (Array.isArray(u.friends)) {
-      u.friends = u.friends.filter(f => f !== username);
-      saveUser(u);
-    }
-  }
-
-  // 4️⃣ Delete intents + stored files
-  for (const file of fs.readdirSync(INTENTS_DIR)) {
-    const intentPath = path.join(INTENTS_DIR, file);
-    const intent = JSON.parse(fs.readFileSync(intentPath, "utf8"));
-
-    if (intent.from === username || intent.to === username) {
-      if (intent.storedFile) {
-        const storedPath = path.join(FILES_DIR, intent.storedFile);
-        if (fs.existsSync(storedPath)) {
-          fs.unlinkSync(storedPath);
-        }
-      }
-      fs.unlinkSync(intentPath);
-    }
-  }
-
-  console.log(`🗑️ Account deleted: ${username}`);
-}
-
 
 
 
@@ -293,39 +246,6 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
       console.log("🛑 Blocked unauthorized message:", data.type);
       return send(ws, { type: "error", message: "Not logged in" });
     }
-
-// =========================
-// 🗑️ DELETE MY ACCOUNT
-// =========================
-if (data.type === "delete_my_account") {
-  const password = String(data.password || "");
-  if (!password) {
-    return send(ws, { type: "error", message: "Password required" });
-  }
-
-  const user = loadUser(ws.username);
-  if (!user) {
-    return send(ws, { type: "error", message: "User not found" });
-  }
-
-  const ok = bcrypt.compareSync(password, user.passwordHash);
-  if (!ok) {
-    return send(ws, { type: "error", message: "Incorrect password" });
-  }
-
-  const username = ws.username;
-
-  // Delete all account data
-  deleteUserAccount(username);
-
-  // Acknowledge before closing
-  try {
-    send(ws, { type: "account_deleted" });
-  } catch {}
-
-  return;
-}
-
 
 
 // =========================
@@ -654,8 +574,15 @@ if (data.type === "delete_intent") {
     console.error("❌ Failed to delete intent:", err);
   }
 
+  // 🧠 Remove from in-memory inbox (if loaded)
+  const inbox = inboxes.get(ws.username);
+  if (inbox) {
+    inboxes.set(
+      ws.username,
+      inbox.filter(i => i.id !== intentId)
+    );
+  }
 
-  
   console.log(`🗑️ Deleted intent ${intentId} for ${ws.username}`);
 
   // ✅ Ack client
@@ -837,8 +764,6 @@ if (intentOnDisk?.stored) {
   // Cleanup flag
   delete intent._waitingForReady;
   intent.status = "in_progress";
-  saveIntent(intent);
-
 
   return;
 }
@@ -862,6 +787,8 @@ if (!u0) return send(ws, { type: "friends_list", friends: [] });
 
 const user = ensureUserShape(u0);
 return send(ws, { type: "friends_list", friends: user.friends });
+
+  return send(ws, { type: "friends_list", friends: user?.friends || [] });
 }
 
 // =========================
@@ -918,15 +845,6 @@ if (intent.from !== ws.username) {
   return send(ws, { type: "error", message: "Not sender" });
 }
 
-if (intent.status !== "accepted") {
-  ws.currentUploadIntentId = null;
-  return send(ws, {
-    type: "error",
-    message: "Receiver has not accepted this transfer yet",
-  });
-}
-
-
 
   // Always set current upload ID first (race-safe for binary frames)
   ws.currentUploadIntentId = intentId;
@@ -948,15 +866,6 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
     const storedFileName = `${intentId}__${safeName}`;
     const filePath = path.join(FILES_DIR, storedFileName);
 
-   const { free } = fs.statSync(FILES_DIR, { bigint: false });
-if (free < size) {
-  return send(ws, {
-    type: "error",
-    message: "Server storage full. Cannot accept upload.",
-  });
-}
-
-   
     // Create write stream for raw bytes
     const writeStream = fs.createWriteStream(filePath, { flags: "w" });
 
@@ -1149,15 +1058,9 @@ if (data.type === "send_intent") {
     return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
   }
 
-  // 🔒 Validate sender + recipient exist
-const senderRaw = loadUser(ws.username);
-if (!senderRaw) {
-  return send(ws, { type: "error", message: "Sender account missing on server (storage reset?)" });
-}
-const sender = ensureUserShape(senderRaw);
-
-const recipient = loadUser(to);
-
+  // 🔒 Validate recipient exists
+  const sender = ensureUserShape(loadUser(ws.username));
+  const recipient = loadUser(to);
 
   if (!recipient) {
     return send(ws, { type: "error", message: "Recipient does not exist" });
@@ -1179,8 +1082,9 @@ const recipient = loadUser(to);
     status: "pending", // pending | accepted | completed
   };
 
- saveIntent(intent);
-
+  if (!inboxes.has(to)) inboxes.set(to, []);
+  inboxes.get(to).push(intent);
+  saveIntent(intent);
 
   // ✅ Always acknowledge sender
   return send(ws, {
@@ -1194,53 +1098,50 @@ const recipient = loadUser(to);
 
 
 // 3b) accept an inbox intent
-// 3b) accept an inbox intent
 if (data.type === "accept_intent") {
   const intentId = String(data.intentId || "").trim();
   if (!intentId) {
     return send(ws, { type: "error", message: "Missing intentId" });
   }
 
-  const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
-  if (!fs.existsSync(intentFile)) {
+  const inbox = inboxes.get(ws.username) || [];
+  const intent = inbox.find(i => i.id === intentId);
+
+  if (!intent) {
     return send(ws, { type: "error", message: "Intent not found" });
-  }
-
-  const intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
-
-  if (intent.to !== ws.username) {
-    return send(ws, { type: "error", message: "Not authorized" });
   }
 
   if (intent.status !== "pending") {
     return send(ws, { type: "error", message: "Intent not pending" });
   }
 
-  intent.status = "accepted";
-  saveIntent(intent);
+  // ✅ Mark as accepted
+intent.status = "accepted";
 
-  send(ws, {
-    type: "intent_accepted",
+// ✅ Notify receiver
+send(ws, {
+  type: "intent_accepted",
+  intentId: intent.id,
+  from: intent.from,
+  fileName: intent.fileName,
+  fileSize: intent.fileSize,
+});
+
+// ✅ Notify sender if online
+const senderWs = online.get(intent.from);
+if (senderWs) {
+  send(senderWs, {
+    type: "intent_accepted_by_receiver",
     intentId: intent.id,
-    from: intent.from,
+    to: intent.to,
     fileName: intent.fileName,
     fileSize: intent.fileSize,
   });
-
-  const senderWs = online.get(intent.from);
-  if (senderWs) {
-    send(senderWs, {
-      type: "intent_accepted_by_receiver",
-      intentId: intent.id,
-      to: intent.to,
-      fileName: intent.fileName,
-      fileSize: intent.fileSize,
-    });
-  }
-
-  return;
 }
 
+return;
+
+}
 
 
     // 3) send request to someone
@@ -1289,15 +1190,9 @@ return send(ws, {
 
     send(ws, { type: "error", message: "Unknown message type" });
     } catch (err) {
-  console.error("💥 Handler crash:", err && err.stack ? err.stack : err);
-  try {
-    send(ws, {
-      type: "error",
-      message: "Server crashed: " + (err?.message || String(err)),
-    });
-  } catch {}
+  console.error("💥 Handler crash:", err);
+  try { send(ws, { type: "error", message: "Server error" }); } catch {}
 }
-
 
   });
 
