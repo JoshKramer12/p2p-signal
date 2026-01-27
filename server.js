@@ -49,35 +49,16 @@ function safeBasename(name) {
 }
 
 
-// FIX: Safer ID generator
-const { randomUUID } = require("crypto");
-const generateId = () => {
-  if (typeof randomUUID === "function") return randomUUID();
-  return Date.now().toString(36) + Math.random().toString(36).substr(2);
-};
+fs.mkdirSync(INTENTS_DIR, { recursive: true });
+fs.mkdirSync(FILES_DIR, { recursive: true });
+fs.mkdirSync(USERS_DIR, { recursive: true });
 
-// FIX: Ensure directories exist recursively
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-}
-
-// Initialize directories
-ensureDir(INTENTS_DIR);
-ensureDir(FILES_DIR);
-ensureDir(USERS_DIR);
 
 function saveIntent(intent) {
-  try {
-    ensureDir(INTENTS_DIR); // Double-check directory exists
-    const file = path.join(INTENTS_DIR, `${intent.id}.json`);
-    fs.writeFileSync(file, JSON.stringify(intent, null, 2));
-  } catch (err) {
-    console.error("CRITICAL SAVE ERROR:", err.message);
-    throw err; 
-  }
+  const file = path.join(INTENTS_DIR, `${intent.id}.json`);
+  fs.writeFileSync(file, JSON.stringify(intent, null, 2));
 }
+
 function generateSessionToken() {
   return randomUUID() + randomUUID();
 }
@@ -149,7 +130,6 @@ function saveUser(user) {
 }
 
 function ensureUserShape(u) {
-  if (!u) return { friends: [] }; // FIX: Safety check for null user
   if (!u.friends) u.friends = [];
   if (!Array.isArray(u.friends)) u.friends = [];
   return u;
@@ -170,50 +150,6 @@ function addFriendSymmetric(a, b) {
   saveUser(ub);
   return { ok: true, a: ua, b: ub };
 }
-
-function deleteUserAccount(username) {
-  // 1️⃣ Remove user file
-  const userPath = userFile(username);
-  if (fs.existsSync(userPath)) {
-    fs.unlinkSync(userPath);
-  }
-
-  // 2️⃣ Remove from online sessions
-  const ws = online.get(username);
-  if (ws) {
-    try { ws.close(4000, "Account deleted"); } catch {}
-    online.delete(username);
-  }
-
-  // 3️⃣ Remove from all friends lists
-  for (const file of fs.readdirSync(USERS_DIR)) {
-    const p = path.join(USERS_DIR, file);
-    const u = JSON.parse(fs.readFileSync(p, "utf8"));
-    if (Array.isArray(u.friends)) {
-      u.friends = u.friends.filter(f => f !== username);
-      saveUser(u);
-    }
-  }
-
-  // 4️⃣ Delete intents + stored files
-  for (const file of fs.readdirSync(INTENTS_DIR)) {
-    const intentPath = path.join(INTENTS_DIR, file);
-    const intent = JSON.parse(fs.readFileSync(intentPath, "utf8"));
-
-    if (intent.from === username || intent.to === username) {
-      if (intent.storedFile) {
-        const storedPath = path.join(FILES_DIR, intent.storedFile);
-        if (fs.existsSync(storedPath)) {
-          fs.unlinkSync(storedPath);
-        }
-      }
-      fs.unlinkSync(intentPath);
-    }
-  }
-
-  console.log(`🗑️ Account deleted: ${username}`);
-}
-
 
 
 
@@ -310,39 +246,6 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
       console.log("🛑 Blocked unauthorized message:", data.type);
       return send(ws, { type: "error", message: "Not logged in" });
     }
-
-// =========================
-// 🗑️ DELETE MY ACCOUNT
-// =========================
-if (data.type === "delete_my_account") {
-  const password = String(data.password || "");
-  if (!password) {
-    return send(ws, { type: "error", message: "Password required" });
-  }
-
-  const user = loadUser(ws.username);
-  if (!user) {
-    return send(ws, { type: "error", message: "User not found" });
-  }
-
-  const ok = bcrypt.compareSync(password, user.passwordHash);
-  if (!ok) {
-    return send(ws, { type: "error", message: "Incorrect password" });
-  }
-
-  const username = ws.username;
-
-  // Delete all account data
-  deleteUserAccount(username);
-
-  // Acknowledge before closing
-  try {
-    send(ws, { type: "account_deleted" });
-  } catch {}
-
-  return;
-}
-
 
 
 // =========================
@@ -1146,64 +1049,51 @@ if (receiver) {
     // 3a) send intent only (NO transport)
     // 3a) send intent only (NO transport)
 // 3a) send intent only (NO transport)
-// 3a) send intent only (NO transport)
-    // 3a) send intent only (NO transport)
-    if (data.type === "send_intent") {
-      const to = String(data.to || "").trim();
-      const fileName = String(data.fileName || "").trim();
-      const fileSize = Number(data.fileSize || 0);
+if (data.type === "send_intent") {
+  const to = String(data.to || "").trim();
+  const fileName = String(data.fileName || "").trim();
+  const fileSize = Number(data.fileSize || 0);
 
-      if (!to || !fileName || !fileSize) {
-        return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
-      }
+  if (!to || !fileName || !fileSize) {
+    return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
+  }
 
-      // 1. Validate Sender
-      const senderRaw = loadUser(ws.username);
-      if (!senderRaw) {
-         return send(ws, { type: "error", message: "Sender profile missing. Please re-login." });
-      }
-      const sender = ensureUserShape(senderRaw);
+  // 🔒 Validate recipient exists
+  const sender = ensureUserShape(loadUser(ws.username));
+  const recipient = loadUser(to);
 
-      // 2. Validate Recipient
-      const recipientRaw = loadUser(to);
-      if (!recipientRaw) {
-        return send(ws, { type: "error", message: "Recipient does not exist" });
-      }
-      
-      // 3. Validate Friendship
-      if (!sender.friends.includes(to)) {
-        return send(ws, { type: "error", message: "Recipient is not your friend" });
-      }
+  if (!recipient) {
+    return send(ws, { type: "error", message: "Recipient does not exist" });
+  }
 
-      // 4. Create Intent (using safer generateId)
-      const intent = {
-        id: generateId(), 
-        from: ws.username,
-        to,
-        fileName,
-        fileSize,
-        createdAt: Date.now(),
-        status: "pending"
-      };
+  // 🔒 Validate friendship (WhatsApp-style)
+  if (!sender.friends.includes(to)) {
+    return send(ws, { type: "error", message: "Recipient is not your friend" });
+  }
 
-      if (!inboxes.has(to)) inboxes.set(to, []);
-      inboxes.get(to).push(intent);
-      
-      try {
-        saveIntent(intent);
-      } catch (e) {
-        // Send the EXACT error to the client so you can see it in the log
-        return send(ws, { type: "error", message: "Storage: " + e.message });
-      }
+  // ✅ Create + store intent even if receiver is offline
+  const intent = {
+    id: randomUUID(),
+    from: ws.username,
+    to,
+    fileName,
+    fileSize,
+    createdAt: Date.now(),
+    status: "pending", // pending | accepted | completed
+  };
 
-      // 5. Acknowledge Sender
-      return send(ws, {
-        type: "intent_ok",
-        intentId: intent.id,
-        to,
-        fileName,
-      });
-    }
+  if (!inboxes.has(to)) inboxes.set(to, []);
+  inboxes.get(to).push(intent);
+  saveIntent(intent);
+
+  // ✅ Always acknowledge sender
+  return send(ws, {
+    type: "intent_ok",
+    intentId: intent.id,
+    to,
+    fileName,
+  });
+}
 
 
 
