@@ -130,6 +130,7 @@ function saveUser(user) {
 }
 
 function ensureUserShape(u) {
+  if (!u) return { friends: [] }; // FIX: Safety check for null user
   if (!u.friends) u.friends = [];
   if (!Array.isArray(u.friends)) u.friends = [];
   return u;
@@ -1126,51 +1127,63 @@ if (receiver) {
     // 3a) send intent only (NO transport)
     // 3a) send intent only (NO transport)
 // 3a) send intent only (NO transport)
-if (data.type === "send_intent") {
-  const to = String(data.to || "").trim();
-  const fileName = String(data.fileName || "").trim();
-  const fileSize = Number(data.fileSize || 0);
+// 3a) send intent only (NO transport)
+    if (data.type === "send_intent") {
+      const to = String(data.to || "").trim();
+      const fileName = String(data.fileName || "").trim();
+      const fileSize = Number(data.fileSize || 0);
 
-  if (!to || !fileName || !fileSize) {
-    return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
-  }
+      if (!to || !fileName || !fileSize) {
+        return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
+      }
 
-  // 🔒 Validate recipient exists
-  const sender = ensureUserShape(loadUser(ws.username));
-  const recipient = loadUser(to);
+      // 1. Validate Sender (Crash Fix)
+      const senderRaw = loadUser(ws.username);
+      if (!senderRaw) {
+         return send(ws, { type: "error", message: "Sender profile missing. Please re-login." });
+      }
+      const sender = ensureUserShape(senderRaw);
 
-  if (!recipient) {
-    return send(ws, { type: "error", message: "Recipient does not exist" });
-  }
+      // 2. Validate Recipient
+      const recipientRaw = loadUser(to);
+      if (!recipientRaw) {
+        return send(ws, { type: "error", message: "Recipient does not exist" });
+      }
+      
+      // 3. Validate Friendship
+      if (!sender.friends.includes(to)) {
+        return send(ws, { type: "error", message: "Recipient is not your friend" });
+      }
 
-  // 🔒 Validate friendship (WhatsApp-style)
-  if (!sender.friends.includes(to)) {
-    return send(ws, { type: "error", message: "Recipient is not your friend" });
-  }
+      // 4. Create Intent
+      const intent = {
+        id: randomUUID(),
+        from: ws.username,
+        to,
+        fileName,
+        fileSize,
+        createdAt: Date.now(),
+        status: "pending"
+      };
 
-  // ✅ Create + store intent even if receiver is offline
-  const intent = {
-    id: randomUUID(),
-    from: ws.username,
-    to,
-    fileName,
-    fileSize,
-    createdAt: Date.now(),
-    status: "pending", // pending | accepted | completed
-  };
+      if (!inboxes.has(to)) inboxes.set(to, []);
+      inboxes.get(to).push(intent);
+      
+      try {
+        saveIntent(intent);
+      } catch (e) {
+        console.error("Failed to save intent:", e);
+        return send(ws, { type: "error", message: "Server storage error" });
+      }
 
-  if (!inboxes.has(to)) inboxes.set(to, []);
-  inboxes.get(to).push(intent);
-  saveIntent(intent);
-
-  // ✅ Always acknowledge sender
-  return send(ws, {
-    type: "intent_ok",
-    intentId: intent.id,
-    to,
-    fileName,
-  });
-}
+      // 5. Acknowledge Sender
+      return send(ws, {
+        type: "intent_ok",
+        intentId: intent.id,
+        to,
+        fileName,
+      });
+    }
 
 
 
