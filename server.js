@@ -18,7 +18,12 @@ const inboxes = new Map();
 const activeTransfers = new Map();
 
 const server = http.createServer();
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({
+  server,
+  perMessageDeflate: false,
+  maxPayload: 1024 * 1024 * 1024, // 1 GB
+});
+
 
 const fs = require("fs");
 const path = require("path");
@@ -205,8 +210,14 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
         return send(ws, { type: "error", message: "Server not ready for offline upload" });
       }
 
-      t.writeStream.write(msg);
-      t.bytesSent += incomingLen;
+      const ok = t.writeStream.write(msg);
+t.bytesSent += incomingLen;
+
+if (!ok) {
+  ws.pause();
+  t.writeStream.once("drain", () => ws.resume());
+}
+
 
       if (t.bytesSent % (1024 * 1024) < incomingLen) {
         console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
@@ -220,8 +231,14 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
       return;
     }
 
-    t.tcp.write(msg);
-    t.bytesSent += incomingLen;
+    const ok = t.tcp.write(msg);
+t.bytesSent += incomingLen;
+
+if (!ok) {
+  ws.pause();
+  t.tcp.once("drain", () => ws.resume());
+}
+
 
     if (t.bytesSent % (1024 * 1024) < incomingLen) {
       console.log(`➡️ Forwarded ${t.bytesSent}/${t.bytesExpected} bytes`);
@@ -505,7 +522,7 @@ if (data.type === "download_ws_request") {
     size: intent.fileSize,
   });
 
-  const rs = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
+  const rs = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
 
   rs.on("data", (chunk) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -867,7 +884,11 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
     const filePath = path.join(FILES_DIR, storedFileName);
 
     // Create write stream for raw bytes
-    const writeStream = fs.createWriteStream(filePath, { flags: "w" });
+    const writeStream = fs.createWriteStream(filePath, {
+  flags: "w",
+  highWaterMark: 1024 * 1024, // 1 MB buffer
+});
+
 
     writeStream.on("error", (err) => {
       console.error("❌ File writeStream error:", err);
@@ -1197,10 +1218,20 @@ return send(ws, {
   });
 
   ws.on("close", () => {
-    if (ws.username && online.get(ws.username) === ws) {
-      online.delete(ws.username);
+  if (ws.username && online.get(ws.username) === ws) {
+    online.delete(ws.username);
+  }
+
+  if (ws.currentUploadIntentId) {
+    const t = activeTransfers.get(ws.currentUploadIntentId);
+    if (t) {
+      try { t.tcp?.destroy(); } catch {}
+      try { t.writeStream?.destroy(); } catch {}
+      activeTransfers.delete(ws.currentUploadIntentId);
     }
-  });
+  }
+});
+
 });
 
 server.listen(PORT, () => {
