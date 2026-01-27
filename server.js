@@ -250,30 +250,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
       }
 
       t.writeStream.write(msg);
-t.bytesSent += incomingLen;
-
-// 🔔 PROGRESS UPDATE (UPLOAD → SERVER)
-// 🔔 PROGRESS UPDATE (UPLOAD → SERVER) — throttled
-const now = Date.now();
-if (!t.lastProgressTs || now - t.lastProgressTs > 100) {
-  t.lastProgressTs = now;
-
-  const pct = Math.floor((t.bytesSent / t.bytesExpected) * 100);
-  const senderWs = online.get(t.intent.from);
-
-  if (senderWs) {
-    send(senderWs, {
-      type: "transfer_progress",
-      phase: "uploading",
-      intentId,
-      sent: t.bytesSent,
-      total: t.bytesExpected,
-      percent: pct,
-    });
-  }
-}
-
-
+      t.bytesSent += incomingLen;
 
       if (t.bytesSent % (1024 * 1024) < incomingLen) {
         console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
@@ -588,13 +565,9 @@ if (data.type === "download_ws_request") {
   if (intent.to !== ws.username) {
     return send(ws, { type: "error", message: "Not authorized for this intent" });
   }
- if (!intent.stored || !intent.storedFile) {
-  return send(ws, {
-    type: "error",
-    message: "File is not ready yet"
-  });
-}
-
+  if (!intent.stored || !intent.storedFile) {
+    return send(ws, { type: "error", message: "File not stored on server" });
+  }
 
   const filePath = path.join(FILES_DIR, intent.storedFile);
   if (!fs.existsSync(filePath)) {
@@ -609,43 +582,13 @@ if (data.type === "download_ws_request") {
     size: intent.fileSize,
   });
 
-  const rs = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 * 2 });
+  const rs = fs.createReadStream(filePath, { highWaterMark: 256 * 1024 });
 
-  let sentBytes = 0;
-
-rs.on("data", (chunk) => {
-  sentBytes += chunk.length;
-
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(chunk, { binary: true });
-  }
-
-  const pct = Math.floor((sentBytes / intent.fileSize) * 100);
-
-  // 🔔 Notify RECEIVER
-  send(ws, {
-    type: "transfer_progress",
-    phase: "downloading",
-    intentId,
-    received: sentBytes,
-    total: intent.fileSize,
-    percent: pct,
+  rs.on("data", (chunk) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(chunk, { binary: true });
+    }
   });
-
-  // 🔔 Notify SENDER
-  const senderWs = online.get(intent.from);
-  if (senderWs) {
-    send(senderWs, {
-      type: "transfer_progress",
-      phase: "delivering",
-      intentId,
-      received: sentBytes,
-      total: intent.fileSize,
-      percent: pct,
-    });
-  }
-});
-
 
   rs.on("end", () => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -824,21 +767,10 @@ if (intentOnDisk?.stored) {
     );
 
     tcp.on("close", () => {
-  console.log(`✅ Download complete ${downloadIntent.id}`);
-  downloadIntent.status = "completed";
-  saveIntent(downloadIntent);
-
-  // 🔔 Notify sender that file was received
-  const senderWs = online.get(downloadIntent.from);
-  if (senderWs) {
-    send(senderWs, {
-      type: "file_received",
-      intentId: downloadIntent.id,
-      fileName: downloadIntent.fileName
+      console.log(`✅ Download complete ${downloadIntent.id}`);
+      downloadIntent.status = "completed";
+      saveIntent(downloadIntent);
     });
-  }
-});
-
 
     tcp.on("error", err => {
       console.error("❌ Download TCP error:", err);
@@ -1117,7 +1049,7 @@ if (t.mode === "live") {
 
 
   // OFFLINE MODE: close the file stream and only then ack upload_done
-// OFFLINE MODE: finalize file, update intent, notify receiver
+  // OFFLINE MODE: finalize file, update intent, notify receiver
 if (t.mode === "offline") {
   const done = () => {
     activeTransfers.delete(intentId);
@@ -1127,38 +1059,14 @@ if (t.mode === "offline") {
     try {
       const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
       intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+intent.stored = true;
+intent.storedBytes = intent.fileSize;
+intent.status = "stored";
+saveIntent(intent);
 
-      // ✅ VERIFY FILE ACTUALLY FINISHED WRITING
-      const stats = fs.statSync(t.filePath);
-      if (stats.size !== intent.fileSize) {
-        console.error("❌ Stored file size mismatch", {
-          expected: intent.fileSize,
-          actual: stats.size,
-        });
-
-        try { fs.unlinkSync(t.filePath); } catch {}
-
-        intent.stored = false;
-        intent.status = "failed";
-        saveIntent(intent);
-
-        return send(ws, {
-          type: "error",
-          message: "Upload failed (file corrupted)",
-        });
-      }
-
-      // ✅ SAFE: file is complete
-      intent.stored = true;
-      intent.storedBytes = stats.size;
-      intent.status = "stored";
-      saveIntent(intent);
-
-    } catch (err) {
-      console.error("❌ Finalize offline upload failed:", err);
+    } catch {
       return;
     }
-
     //test
 
     // 🔔 IMPORTANT: notify recipient that file is now ready
