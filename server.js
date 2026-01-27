@@ -253,19 +253,26 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
 t.bytesSent += incomingLen;
 
 // 🔔 PROGRESS UPDATE (UPLOAD → SERVER)
-const pct = Math.floor((t.bytesSent / t.bytesExpected) * 100);
+// 🔔 PROGRESS UPDATE (UPLOAD → SERVER) — throttled
+const now = Date.now();
+if (!t.lastProgressTs || now - t.lastProgressTs > 100) {
+  t.lastProgressTs = now;
 
-const senderWs = online.get(t.intent.from);
-if (senderWs) {
-  send(senderWs, {
-    type: "transfer_progress",
-    phase: "uploading",
-    intentId,
-    sent: t.bytesSent,
-    total: t.bytesExpected,
-    percent: pct,
-  });
+  const pct = Math.floor((t.bytesSent / t.bytesExpected) * 100);
+  const senderWs = online.get(t.intent.from);
+
+  if (senderWs) {
+    send(senderWs, {
+      type: "transfer_progress",
+      phase: "uploading",
+      intentId,
+      sent: t.bytesSent,
+      total: t.bytesExpected,
+      percent: pct,
+    });
+  }
 }
+
 
 
       if (t.bytesSent % (1024 * 1024) < incomingLen) {
