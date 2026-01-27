@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 8080;
 const online = new Map();
 
 // username -> [intent, intent, intent]
-const inboxes = new Map();
+
 
 // intentId -> { tcp: net.Socket, bytesExpected, bytesSent, senderWs, receiverWs }
 const activeTransfers = new Map();
@@ -651,15 +651,8 @@ if (data.type === "delete_intent") {
     console.error("❌ Failed to delete intent:", err);
   }
 
-  // 🧠 Remove from in-memory inbox (if loaded)
-  const inbox = inboxes.get(ws.username);
-  if (inbox) {
-    inboxes.set(
-      ws.username,
-      inbox.filter(i => i.id !== intentId)
-    );
-  }
 
+  
   console.log(`🗑️ Deleted intent ${intentId} for ${ws.username}`);
 
   // ✅ Ack client
@@ -841,6 +834,8 @@ if (intentOnDisk?.stored) {
   // Cleanup flag
   delete intent._waitingForReady;
   intent.status = "in_progress";
+  saveIntent(intent);
+
 
   return;
 }
@@ -921,6 +916,15 @@ if (intent.from !== ws.username) {
   ws.currentUploadIntentId = null;
   return send(ws, { type: "error", message: "Not sender" });
 }
+
+if (intent.status !== "accepted") {
+  ws.currentUploadIntentId = null;
+  return send(ws, {
+    type: "error",
+    message: "Receiver has not accepted this transfer yet",
+  });
+}
+
 
 
   // Always set current upload ID first (race-safe for binary frames)
@@ -1135,9 +1139,15 @@ if (data.type === "send_intent") {
     return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
   }
 
-  // 🔒 Validate recipient exists
-  const sender = ensureUserShape(loadUser(ws.username));
-  const recipient = loadUser(to);
+  // 🔒 Validate sender + recipient exist
+const senderRaw = loadUser(ws.username);
+if (!senderRaw) {
+  return send(ws, { type: "error", message: "Sender account missing on server (storage reset?)" });
+}
+const sender = ensureUserShape(senderRaw);
+
+const recipient = loadUser(to);
+
 
   if (!recipient) {
     return send(ws, { type: "error", message: "Recipient does not exist" });
@@ -1159,9 +1169,8 @@ if (data.type === "send_intent") {
     status: "pending", // pending | accepted | completed
   };
 
-  if (!inboxes.has(to)) inboxes.set(to, []);
-  inboxes.get(to).push(intent);
-  saveIntent(intent);
+ saveIntent(intent);
+
 
   // ✅ Always acknowledge sender
   return send(ws, {
@@ -1175,50 +1184,53 @@ if (data.type === "send_intent") {
 
 
 // 3b) accept an inbox intent
+// 3b) accept an inbox intent
 if (data.type === "accept_intent") {
   const intentId = String(data.intentId || "").trim();
   if (!intentId) {
     return send(ws, { type: "error", message: "Missing intentId" });
   }
 
-  const inbox = inboxes.get(ws.username) || [];
-  const intent = inbox.find(i => i.id === intentId);
-
-  if (!intent) {
+  const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+  if (!fs.existsSync(intentFile)) {
     return send(ws, { type: "error", message: "Intent not found" });
+  }
+
+  const intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+
+  if (intent.to !== ws.username) {
+    return send(ws, { type: "error", message: "Not authorized" });
   }
 
   if (intent.status !== "pending") {
     return send(ws, { type: "error", message: "Intent not pending" });
   }
 
-  // ✅ Mark as accepted
-intent.status = "accepted";
+  intent.status = "accepted";
+  saveIntent(intent);
 
-// ✅ Notify receiver
-send(ws, {
-  type: "intent_accepted",
-  intentId: intent.id,
-  from: intent.from,
-  fileName: intent.fileName,
-  fileSize: intent.fileSize,
-});
-
-// ✅ Notify sender if online
-const senderWs = online.get(intent.from);
-if (senderWs) {
-  send(senderWs, {
-    type: "intent_accepted_by_receiver",
+  send(ws, {
+    type: "intent_accepted",
     intentId: intent.id,
-    to: intent.to,
+    from: intent.from,
     fileName: intent.fileName,
     fileSize: intent.fileSize,
   });
+
+  const senderWs = online.get(intent.from);
+  if (senderWs) {
+    send(senderWs, {
+      type: "intent_accepted_by_receiver",
+      intentId: intent.id,
+      to: intent.to,
+      fileName: intent.fileName,
+      fileSize: intent.fileSize,
+    });
+  }
+
+  return;
 }
 
-return;
-
-}
 
 
     // 3) send request to someone
@@ -1267,9 +1279,15 @@ return send(ws, {
 
     send(ws, { type: "error", message: "Unknown message type" });
     } catch (err) {
-  console.error("💥 Handler crash:", err);
-  try { send(ws, { type: "error", message: "Server error" }); } catch {}
+  console.error("💥 Handler crash:", err && err.stack ? err.stack : err);
+  try {
+    send(ws, {
+      type: "error",
+      message: "Server crashed: " + (err?.message || String(err)),
+    });
+  } catch {}
 }
+
 
   });
 
