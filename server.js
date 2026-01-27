@@ -67,18 +67,21 @@ function generateSessionToken() {
 function loadIntentsForUser(username) {
   const intents = [];
   for (const file of fs.readdirSync(INTENTS_DIR)) {
-    const intent = JSON.parse(
-      fs.readFileSync(path.join(INTENTS_DIR, file), "utf8")
-    );
-    if (intent.to === username) {
-  // Only show if:
-  // - stored file is ready, OR
-  // - it's pending/accepted (still valid intent)
-  // (uploading should show, but NOT as downloadable unless stored=true)
-  intents.push(intent);
+  const p = path.join(INTENTS_DIR, file);
+  let intent;
+  try {
+    intent = JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch (err) {
+    console.error("❌ Corrupt intent file, deleting:", file);
+    try { fs.unlinkSync(p); } catch {}
+    continue;
+  }
+
+  if (intent.to === username) {
+    intents.push(intent);
+  }
 }
 
-  }
   return intents;
 }
 
@@ -859,8 +862,6 @@ if (!u0) return send(ws, { type: "friends_list", friends: [] });
 
 const user = ensureUserShape(u0);
 return send(ws, { type: "friends_list", friends: user.friends });
-
-  return send(ws, { type: "friends_list", friends: user?.friends || [] });
 }
 
 // =========================
@@ -947,6 +948,15 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
     const storedFileName = `${intentId}__${safeName}`;
     const filePath = path.join(FILES_DIR, storedFileName);
 
+   const { free } = fs.statSync(FILES_DIR, { bigint: false });
+if (free < size) {
+  return send(ws, {
+    type: "error",
+    message: "Server storage full. Cannot accept upload.",
+  });
+}
+
+   
     // Create write stream for raw bytes
     const writeStream = fs.createWriteStream(filePath, { flags: "w" });
 
