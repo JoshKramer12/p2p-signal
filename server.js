@@ -265,6 +265,36 @@ if (!ok) {
     }
 
 
+    // =========================
+// 🗑️ DELETE ACCOUNT
+// =========================
+if (data.type === "delete_account") {
+  const username = ws.username;
+  if (!username) {
+    return send(ws, { type: "error", message: "Not logged in" });
+  }
+
+  // Delete user file
+  const userPath = path.join(USERS_DIR, `${username}.json`);
+  try {
+    if (fs.existsSync(userPath)) fs.unlinkSync(userPath);
+  } catch (err) {
+    console.error("❌ Failed to delete user file:", err);
+  }
+
+  // Remove from online users
+  online.delete(username);
+
+  // Acknowledge + disconnect
+  send(ws, { type: "account_deleted" });
+  ws.close();
+
+  console.log(`🗑️ Account deleted: ${username}`);
+  return;
+}
+
+
+
 // =========================
 // 🔐 AUTH: SIGNUP
 // =========================
