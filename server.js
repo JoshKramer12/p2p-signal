@@ -101,6 +101,33 @@ function send(ws, obj) {
   }
 }
 
+function maybeSendUploadProgress(t) {
+  if (!t || !t.intent || !t.intent.to) return;
+  const now = Date.now();
+  if (!t.lastProgressTs) t.lastProgressTs = 0;
+  if (!t.lastProgressBytes) t.lastProgressBytes = 0;
+
+  const shouldSend =
+    now - t.lastProgressTs > 300 ||
+    t.bytesSent === t.bytesExpected ||
+    t.bytesSent - t.lastProgressBytes > 8 * 1024 * 1024;
+
+  if (!shouldSend) return;
+
+  t.lastProgressTs = now;
+  t.lastProgressBytes = t.bytesSent;
+
+  const receiverWs = online.get(t.intent.to);
+  if (!receiverWs) return;
+
+  send(receiverWs, {
+    type: "incoming_progress",
+    intentId: t.intent.id,
+    bytesSent: t.bytesSent,
+    bytesExpected: t.bytesExpected
+  });
+}
+
 
 
 function getPublicEndpoint(req) {
@@ -235,6 +262,7 @@ if (!ok) {
   t.writeStream.once("drain", () => ws.resume());
 }
 
+      maybeSendUploadProgress(t);
 
       if (t.bytesSent % (1024 * 1024) < incomingLen) {
         console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
@@ -256,6 +284,7 @@ if (!ok) {
   t.tcp.once("drain", () => ws.resume());
 }
 
+    maybeSendUploadProgress(t);
 
     if (t.bytesSent % (1024 * 1024) < incomingLen) {
       console.log(`➡️ Forwarded ${t.bytesSent}/${t.bytesExpected} bytes`);
@@ -1047,7 +1076,7 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
     // Create write stream for raw bytes
     const writeStream = fs.createWriteStream(filePath, {
   flags: "w",
-  highWaterMark: 1024 * 1024, // 1 MB buffer
+  highWaterMark: 4 * 1024 * 1024, // 4 MB buffer
 });
 
 
@@ -1267,6 +1296,11 @@ if (data.type === "send_intent") {
   if (!inboxes.has(to)) inboxes.set(to, []);
   inboxes.get(to).push(intent);
   saveIntent(intent);
+
+  const receiverWs = online.get(to);
+  if (receiverWs) {
+    send(receiverWs, { type: "incoming_intent", intent });
+  }
 
   // ✅ Always acknowledge sender
   return send(ws, {
