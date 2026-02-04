@@ -137,7 +137,24 @@ function saveUser(user) {
 function ensureUserShape(u) {
   if (!u.friends) u.friends = [];
   if (!Array.isArray(u.friends)) u.friends = [];
+  if (!u.incomingRequests) u.incomingRequests = [];
+  if (!Array.isArray(u.incomingRequests)) u.incomingRequests = [];
+  if (!u.outgoingRequests) u.outgoingRequests = [];
+  if (!Array.isArray(u.outgoingRequests)) u.outgoingRequests = [];
   return u;
+}
+
+function sendFriendRequestsUpdate(username) {
+  const u0 = loadUser(username);
+  if (!u0) return;
+  const ws = online.get(username);
+  if (!ws) return;
+  const u = ensureUserShape(u0);
+  send(ws, {
+    type: "friend_requests",
+    incoming: u.incomingRequests || [],
+    outgoing: u.outgoingRequests || []
+  });
 }
 
 function addFriendSymmetric(a, b) {
@@ -321,6 +338,8 @@ if (data.type === "auth_signup") {
   username,
   passwordHash,
   friends: [username], // 👈 add self
+  incomingRequests: [],
+  outgoingRequests: [],
   createdAt: Date.now(),
   sessionTokens: [],
 };
@@ -363,7 +382,9 @@ if (!user.friends.includes(user.username)) {
   send(ws, { type: "inbox", items: pending });
 
   const u2 = ensureUserShape(user);
+  saveUser(u2);
   send(ws, { type: "friends_list", friends: u2.friends });
+  send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests });
 
   return;
 }
@@ -475,9 +496,15 @@ if (!user.friends.includes(user.username)) {
   // Send friends list
   // ───────────────────────────
   const u2 = ensureUserShape(loadUser(username));
+  saveUser(u2);
   send(ws, {
     type: "friends_list",
     friends: u2.friends || [],
+  });
+  send(ws, {
+    type: "friend_requests",
+    incoming: u2.incomingRequests || [],
+    outgoing: u2.outgoingRequests || [],
   });
 
   return;
@@ -823,6 +850,110 @@ if (data.type === "ping") {
 
 
 
+
+
+// =========================
+// 👥 FRIEND REQUESTS: SEND
+// =========================
+if (data.type === "friend_request_send") {
+  const target = String(data.username || "").trim();
+  if (!target) return send(ws, { type: "error", message: "Missing username" });
+  if (target === ws.username) return send(ws, { type: "error", message: "You cannot add yourself" });
+
+  const me0 = loadUser(ws.username);
+  const other0 = loadUser(target);
+  if (!me0 || !other0) return send(ws, { type: "error", message: "User not found" });
+
+  const me = ensureUserShape(me0);
+  const other = ensureUserShape(other0);
+
+  if (me.friends.includes(target)) {
+    return send(ws, { type: "error", message: "Already friends" });
+  }
+
+  if (me.incomingRequests.includes(target)) {
+    return send(ws, { type: "error", message: "You already have a request from this user" });
+  }
+
+  if (!other.incomingRequests.includes(ws.username)) {
+    other.incomingRequests.push(ws.username);
+  }
+  if (!me.outgoingRequests.includes(target)) {
+    me.outgoingRequests.push(target);
+  }
+
+  saveUser(me);
+  saveUser(other);
+
+  sendFriendRequestsUpdate(ws.username);
+  sendFriendRequestsUpdate(target);
+  return;
+}
+
+// =========================
+// 👥 FRIEND REQUESTS: ACCEPT
+// =========================
+if (data.type === "friend_request_accept") {
+  const requester = String(data.username || "").trim();
+  if (!requester) return send(ws, { type: "error", message: "Missing username" });
+
+  const me0 = loadUser(ws.username);
+  const other0 = loadUser(requester);
+  if (!me0 || !other0) return send(ws, { type: "error", message: "User not found" });
+
+  const me = ensureUserShape(me0);
+  const other = ensureUserShape(other0);
+
+  if (!me.incomingRequests.includes(requester)) {
+    return send(ws, { type: "error", message: "Request not found" });
+  }
+
+  me.incomingRequests = me.incomingRequests.filter(n => n !== requester);
+  other.outgoingRequests = other.outgoingRequests.filter(n => n !== ws.username);
+  saveUser(me);
+  saveUser(other);
+
+  const res = addFriendSymmetric(ws.username, requester);
+  if (!res.ok) return send(ws, { type: "error", message: res.error });
+
+  // Push updated friends list to both sides if online
+  const meUpdated = ensureUserShape(loadUser(ws.username));
+  send(ws, { type: "friends_list", friends: meUpdated.friends });
+
+  const otherWs = online.get(requester);
+  if (otherWs) {
+    const otherUpdated = ensureUserShape(loadUser(requester));
+    send(otherWs, { type: "friends_list", friends: otherUpdated.friends });
+  }
+
+  sendFriendRequestsUpdate(ws.username);
+  sendFriendRequestsUpdate(requester);
+  return;
+}
+
+// =========================
+// 👥 FRIEND REQUESTS: DENY
+// =========================
+if (data.type === "friend_request_deny") {
+  const requester = String(data.username || "").trim();
+  if (!requester) return send(ws, { type: "error", message: "Missing username" });
+
+  const me0 = loadUser(ws.username);
+  const other0 = loadUser(requester);
+  if (!me0 || !other0) return send(ws, { type: "error", message: "User not found" });
+
+  const me = ensureUserShape(me0);
+  const other = ensureUserShape(other0);
+
+  me.incomingRequests = me.incomingRequests.filter(n => n !== requester);
+  other.outgoingRequests = other.outgoingRequests.filter(n => n !== ws.username);
+  saveUser(me);
+  saveUser(other);
+
+  sendFriendRequestsUpdate(ws.username);
+  sendFriendRequestsUpdate(requester);
+  return;
+}
 
 
 // =========================
