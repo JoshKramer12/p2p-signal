@@ -197,6 +197,8 @@ function ensureUserShape(u) {
   if (!Array.isArray(u.outgoingRequests)) u.outgoingRequests = [];
   if (!u.declinedRequests) u.declinedRequests = [];
   if (!Array.isArray(u.declinedRequests)) u.declinedRequests = [];
+  if (!u.deletedFriends) u.deletedFriends = [];
+  if (!Array.isArray(u.deletedFriends)) u.deletedFriends = [];
   return u;
 }
 
@@ -350,6 +352,32 @@ if (data.type === "delete_account") {
     return send(ws, { type: "error", message: "Not logged in" });
   }
 
+  // Mark as deleted in other users' lists
+  try {
+    const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith(".json"));
+    for (const file of files) {
+      const p = path.join(USERS_DIR, file);
+      const u = ensureUserShape(JSON.parse(fs.readFileSync(p, "utf8")));
+      if (u.username === username) continue;
+
+      if (u.friends.includes(username) && !u.deletedFriends.includes(username)) {
+        u.deletedFriends.push(username);
+      }
+      u.incomingRequests = u.incomingRequests.filter(n => n !== username);
+      u.outgoingRequests = u.outgoingRequests.filter(n => n !== username);
+      u.declinedRequests = u.declinedRequests.filter(n => n !== username);
+      saveUser(u);
+
+      const w = online.get(u.username);
+      if (w) {
+        send(w, { type: "friends_list", friends: u.friends, deletedFriends: u.deletedFriends });
+        sendFriendRequestsUpdate(u.username);
+      }
+    }
+  } catch (err) {
+    console.error("❌ Failed to mark deleted in other users:", err);
+  }
+
   // Delete user file
   const userPath = path.join(USERS_DIR, `${username}.json`);
   try {
@@ -443,7 +471,7 @@ if (!user.friends.includes(user.username)) {
 
   const u2 = ensureUserShape(user);
   saveUser(u2);
-  send(ws, { type: "friends_list", friends: u2.friends });
+  send(ws, { type: "friends_list", friends: u2.friends, deletedFriends: u2.deletedFriends });
   send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests, declined: u2.declinedRequests });
 
   return;
@@ -560,6 +588,7 @@ if (!user.friends.includes(user.username)) {
   send(ws, {
     type: "friends_list",
     friends: u2.friends || [],
+    deletedFriends: u2.deletedFriends || [],
   });
   send(ws, {
     type: "friend_requests",
@@ -980,12 +1009,12 @@ if (data.type === "friend_request_accept") {
 
   // Push updated friends list to both sides if online
   const meUpdated = ensureUserShape(loadUser(ws.username));
-  send(ws, { type: "friends_list", friends: meUpdated.friends });
+  send(ws, { type: "friends_list", friends: meUpdated.friends, deletedFriends: meUpdated.deletedFriends });
 
   const otherWs = online.get(requester);
   if (otherWs) {
     const otherUpdated = ensureUserShape(loadUser(requester));
-    send(otherWs, { type: "friends_list", friends: otherUpdated.friends });
+    send(otherWs, { type: "friends_list", friends: otherUpdated.friends, deletedFriends: otherUpdated.deletedFriends });
   }
 
   sendFriendRequestsUpdate(ws.username);
@@ -1054,6 +1083,30 @@ if (data.type === "stats") {
   });
 }
 
+
+// =========================
+// 👥 FRIENDS: REMOVE
+// =========================
+if (data.type === "remove_friend") {
+  const target = String(data.username || "").trim();
+  if (!target) return send(ws, { type: "error", message: "Missing username" });
+
+  const me0 = loadUser(ws.username);
+  if (!me0) return send(ws, { type: "error", message: "User not found" });
+
+  const me = ensureUserShape(me0);
+  me.friends = (me.friends || []).filter(n => n !== target);
+  me.deletedFriends = (me.deletedFriends || []).filter(n => n !== target);
+  me.incomingRequests = (me.incomingRequests || []).filter(n => n !== target);
+  me.outgoingRequests = (me.outgoingRequests || []).filter(n => n !== target);
+  me.declinedRequests = (me.declinedRequests || []).filter(n => n !== target);
+  saveUser(me);
+
+  send(ws, { type: "friends_list", friends: me.friends, deletedFriends: me.deletedFriends });
+  sendFriendRequestsUpdate(ws.username);
+  return;
+}
+
 // =========================
 // 👥 FRIENDS: LIST
 // =========================
@@ -1062,7 +1115,7 @@ if (data.type === "friends_list") {
 if (!u0) return send(ws, { type: "friends_list", friends: [] });
 
 const user = ensureUserShape(u0);
-return send(ws, { type: "friends_list", friends: user.friends });
+return send(ws, { type: "friends_list", friends: user.friends, deletedFriends: user.deletedFriends });
 
   return send(ws, { type: "friends_list", friends: user?.friends || [] });
 }
