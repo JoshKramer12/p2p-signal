@@ -45,6 +45,33 @@ const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
 const FILES_DIR = path.join(STORAGE_DIR, "files");
 const USERS_DIR = path.join(STORAGE_DIR, "users");
 
+function countUsers() {
+  try {
+    return fs.readdirSync(USERS_DIR).filter(f => f.endsWith(".json")).length;
+  } catch {
+    return 0;
+  }
+}
+
+function countStoredFiles() {
+  try {
+    return fs.readdirSync(FILES_DIR).length;
+  } catch {
+    return 0;
+  }
+}
+
+function countPendingRequestsForUser(username) {
+  try {
+    const u0 = loadUser(username);
+    if (!u0) return 0;
+    const u = ensureUserShape(u0);
+    return (u.incomingRequests || []).length;
+  } catch {
+    return 0;
+  }
+}
+
 function safeBasename(name) {
   // keep it simple & cross-platform safe
   return String(name || "file.bin")
@@ -1011,6 +1038,20 @@ if (data.type === "friend_request_clear_declined") {
 
   sendFriendRequestsUpdate(ws.username);
   return;
+}
+
+
+// =========================
+// 📊 STATS
+// =========================
+if (data.type === "stats") {
+  return send(ws, {
+    type: "stats",
+    totalUsers: countUsers(),
+    onlineUsers: online.size,
+    pendingRequests: countPendingRequestsForUser(ws.username),
+    storedFiles: countStoredFiles(),
+  });
 }
 
 // =========================
