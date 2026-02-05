@@ -1435,6 +1435,7 @@ if (data.type === "send_intent") {
   const to = String(data.to || "").trim();
   const fileName = String(data.fileName || "").trim();
   const fileSize = Number(data.fileSize || 0);
+  const note = typeof data.note === "string" ? data.note.trim().slice(0, 500) : "";
 
   if (!to || !fileName || !fileSize) {
     return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
@@ -1460,6 +1461,7 @@ if (data.type === "send_intent") {
     to,
     fileName,
     fileSize,
+    note,
     createdAt: Date.now(),
     status: "pending", // pending | accepted | completed
   };
