@@ -61,6 +61,34 @@ function countStoredFiles() {
   }
 }
 
+function storageBytesUsed() {
+  try {
+    return fs.readdirSync(FILES_DIR).reduce((sum, name) => {
+      try {
+        return sum + fs.statSync(path.join(FILES_DIR, name)).size;
+      } catch {
+        return sum;
+      }
+    }, 0);
+  } catch {
+    return 0;
+  }
+}
+
+function largestStoredFiles(limit = 50) {
+  try {
+    const files = fs.readdirSync(FILES_DIR).map((name) => {
+      const full = path.join(FILES_DIR, name);
+      const size = fs.statSync(full).size;
+      return { storedFile: name, name, size };
+    });
+    files.sort((a, b) => b.size - a.size);
+    return files.slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
 function countPendingRequestsForUser(username) {
   try {
     const u0 = loadUser(username);
@@ -1080,6 +1108,8 @@ if (data.type === "stats") {
     onlineUsers: online.size,
     pendingRequests: countPendingRequestsForUser(ws.username),
     storedFiles: countStoredFiles(),
+    storageBytes: storageBytesUsed(),
+    largestFiles: largestStoredFiles(100),
   });
 }
 
@@ -1105,6 +1135,25 @@ if (data.type === "remove_friend") {
   send(ws, { type: "friends_list", friends: me.friends, deletedFriends: me.deletedFriends });
   sendFriendRequestsUpdate(ws.username);
   return;
+}
+
+
+// =========================
+// 🗑️ DELETE STORED FILE (ADMIN)
+// =========================
+if (data.type === "delete_file") {
+  const storedFile = String(data.storedFile || "").trim();
+  if (!storedFile) return send(ws, { type: "error", message: "Missing storedFile" });
+
+  const filePath = path.join(FILES_DIR, storedFile);
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (err) {
+    console.error("❌ Failed to delete stored file:", err);
+    return send(ws, { type: "error", message: "Failed to delete file" });
+  }
+
+  return send(ws, { type: "stats", storageBytes: storageBytesUsed(), storedFiles: countStoredFiles(), largestFiles: largestStoredFiles(100) });
 }
 
 // =========================
