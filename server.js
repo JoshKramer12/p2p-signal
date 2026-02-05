@@ -677,7 +677,7 @@ if (data.type === "download_ws_request") {
   }
 
   const intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
-  if (intent.to !== ws.username) {
+  if (intent.to !== ws.username && intent.from !== ws.username) {
     return send(ws, { type: "error", message: "Not authorized for this intent" });
   }
   if (!intent.stored || !intent.storedFile) {
