@@ -168,6 +168,8 @@ function ensureUserShape(u) {
   if (!Array.isArray(u.incomingRequests)) u.incomingRequests = [];
   if (!u.outgoingRequests) u.outgoingRequests = [];
   if (!Array.isArray(u.outgoingRequests)) u.outgoingRequests = [];
+  if (!u.declinedRequests) u.declinedRequests = [];
+  if (!Array.isArray(u.declinedRequests)) u.declinedRequests = [];
   return u;
 }
 
@@ -180,7 +182,8 @@ function sendFriendRequestsUpdate(username) {
   send(ws, {
     type: "friend_requests",
     incoming: u.incomingRequests || [],
-    outgoing: u.outgoingRequests || []
+    outgoing: u.outgoingRequests || [],
+    declined: u.declinedRequests || []
   });
 }
 
@@ -369,6 +372,7 @@ if (data.type === "auth_signup") {
   friends: [username], // 👈 add self
   incomingRequests: [],
   outgoingRequests: [],
+  declinedRequests: [],
   createdAt: Date.now(),
   sessionTokens: [],
 };
@@ -413,7 +417,7 @@ if (!user.friends.includes(user.username)) {
   const u2 = ensureUserShape(user);
   saveUser(u2);
   send(ws, { type: "friends_list", friends: u2.friends });
-  send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests });
+  send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests, declined: u2.declinedRequests });
 
   return;
 }
@@ -534,6 +538,7 @@ if (!user.friends.includes(user.username)) {
     type: "friend_requests",
     incoming: u2.incomingRequests || [],
     outgoing: u2.outgoingRequests || [],
+    declined: u2.declinedRequests || [],
   });
 
   return;
@@ -910,6 +915,7 @@ if (data.type === "friend_request_send") {
   if (!me.outgoingRequests.includes(target)) {
     me.outgoingRequests.push(target);
   }
+  me.declinedRequests = me.declinedRequests.filter(n => n !== target);
 
   saveUser(me);
   saveUser(other);
@@ -976,6 +982,9 @@ if (data.type === "friend_request_deny") {
 
   me.incomingRequests = me.incomingRequests.filter(n => n !== requester);
   other.outgoingRequests = other.outgoingRequests.filter(n => n !== ws.username);
+  if (!other.declinedRequests.includes(ws.username)) {
+    other.declinedRequests.push(ws.username);
+  }
   saveUser(me);
   saveUser(other);
 
@@ -984,6 +993,25 @@ if (data.type === "friend_request_deny") {
   return;
 }
 
+
+
+// =========================
+// 👥 FRIEND REQUESTS: CLEAR DECLINED
+// =========================
+if (data.type === "friend_request_clear_declined") {
+  const target = String(data.username || "").trim();
+  if (!target) return send(ws, { type: "error", message: "Missing username" });
+
+  const me0 = loadUser(ws.username);
+  if (!me0) return send(ws, { type: "error", message: "User not found" });
+
+  const me = ensureUserShape(me0);
+  me.declinedRequests = me.declinedRequests.filter(n => n !== target);
+  saveUser(me);
+
+  sendFriendRequestsUpdate(ws.username);
+  return;
+}
 
 // =========================
 // 👥 FRIENDS: LIST
