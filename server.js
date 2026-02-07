@@ -21,7 +21,7 @@ const server = http.createServer();
 const wss = new WebSocket.Server({
   server,
   perMessageDeflate: false,
-  maxPayload: 1024 * 1024 * 1024, // 1 GB
+  maxPayload: 1024 * 1024 * 1024 * 10, // 10 GB
 });
 
 
@@ -697,7 +697,7 @@ if (data.type === "download_ws_request") {
     size: intent.fileSize,
   });
 
-  const rs = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
+  const rs = fs.createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024 });
 
   rs.on("data", (chunk) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -1439,6 +1439,10 @@ if (data.type === "send_intent") {
 
   if (!to || !fileName || !fileSize) {
     return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
+  }
+
+  if (to === ws.username) {
+    return send(ws, { type: "error", message: "Cannot send files to yourself" });
   }
 
   // 🔒 Validate recipient exists
