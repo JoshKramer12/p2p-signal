@@ -304,7 +304,17 @@ function ensureUserShape(u) {
   if (!Array.isArray(u.declinedRequests)) u.declinedRequests = [];
   if (!u.deletedFriends) u.deletedFriends = [];
   if (!Array.isArray(u.deletedFriends)) u.deletedFriends = [];
+  if (!u.profile) u.profile = {};
   return u;
+}
+
+function loadProfiles(usernames = []) {
+  const profiles = {};
+  usernames.forEach((name) => {
+    const u = loadUser(name);
+    if (u?.profile) profiles[name] = u.profile;
+  });
+  return profiles;
 }
 
 function sendFriendRequestsUpdate(username) {
@@ -577,6 +587,7 @@ if (!user.friends.includes(user.username)) {
   const u2 = ensureUserShape(user);
   saveUser(u2);
   send(ws, { type: "friends_list", friends: u2.friends, deletedFriends: u2.deletedFriends });
+  send(ws, { type: "profiles", profiles: loadProfiles(u2.friends || []) });
   send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests, declined: u2.declinedRequests });
 
   return;
@@ -694,6 +705,10 @@ if (!user.friends.includes(user.username)) {
     type: "friends_list",
     friends: u2.friends || [],
     deletedFriends: u2.deletedFriends || [],
+  });
+  send(ws, {
+    type: "profiles",
+    profiles: loadProfiles(u2.friends || [])
   });
   send(ws, {
     type: "friend_requests",
@@ -1290,9 +1305,43 @@ if (data.type === "friends_list") {
 if (!u0) return send(ws, { type: "friends_list", friends: [] });
 
 const user = ensureUserShape(u0);
-return send(ws, { type: "friends_list", friends: user.friends, deletedFriends: user.deletedFriends });
+send(ws, { type: "friends_list", friends: user.friends, deletedFriends: user.deletedFriends });
+send(ws, { type: "profiles", profiles: loadProfiles(user.friends || []) });
+return;
 
   return send(ws, { type: "friends_list", friends: user?.friends || [] });
+}
+
+// =========================
+// 👤 PROFILE UPDATE
+// =========================
+if (data.type === "update_profile") {
+  const u0 = loadUser(ws.username);
+  if (!u0) return send(ws, { type: "error", message: "User not found" });
+
+  const user = ensureUserShape(u0);
+  const profile = user.profile || {};
+
+  const updates = data.profile || {};
+  if (typeof updates.firstName === "string") profile.firstName = updates.firstName;
+  if (typeof updates.lastName === "string") profile.lastName = updates.lastName;
+  if (typeof updates.email === "string") profile.email = updates.email;
+  if (typeof updates.phone === "string") profile.phone = updates.phone;
+  if (typeof updates.avatarDataUrl === "string") profile.avatarDataUrl = updates.avatarDataUrl;
+
+  user.profile = profile;
+  saveUser(user);
+
+  // notify self + friends
+  send(ws, { type: "profile_update", username: ws.username, profile });
+  const friends = user.friends || [];
+  friends.forEach((f) => {
+    const w = online.get(f);
+    if (w && w !== ws) {
+      send(w, { type: "profile_update", username: ws.username, profile });
+    }
+  });
+  return;
 }
 
 // =========================
