@@ -53,6 +53,41 @@ function countUsers() {
   }
 }
 
+
+
+function mapStoredFilesToIntents() {
+  const map = new Map();
+  try {
+    const files = fs.readdirSync(INTENTS_DIR).filter(f => f.endsWith(".json"));
+    for (const file of files) {
+      try {
+        const intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
+        if (intent?.stored && intent?.storedFile) {
+          map.set(intent.storedFile, intent);
+        }
+      } catch {}
+    }
+  } catch {}
+  return map;
+}
+
+function deleteIntentAndNotify(intent) {
+  if (!intent) return;
+  const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
+  try { if (fs.existsSync(intentFile)) fs.unlinkSync(intentFile); } catch {}
+
+  const receiver = online.get(intent.to);
+  const sender = online.get(intent.from);
+  const payload = {
+    type: "intent_deleted",
+    intentId: intent.id,
+    storedFile: intent.storedFile || null,
+    from: intent.from,
+    to: intent.to
+  };
+  if (receiver) send(receiver, payload);
+  if (sender && sender !== receiver) send(sender, payload);
+}
 function countStoredFiles() {
   try {
     return fs.readdirSync(FILES_DIR).length;
@@ -77,10 +112,20 @@ function storageBytesUsed() {
 
 function largestStoredFiles(limit = 50) {
   try {
+    const intentMap = mapStoredFilesToIntents();
     const files = fs.readdirSync(FILES_DIR).map((name) => {
       const full = path.join(FILES_DIR, name);
       const size = fs.statSync(full).size;
-      return { storedFile: name, name, size };
+      const intent = intentMap.get(name);
+      return {
+        storedFile: name,
+        name: intent?.fileName || name,
+        size,
+        intentId: intent?.id || null,
+        from: intent?.from || null,
+        to: intent?.to || null,
+        createdAt: intent?.createdAt || null
+      };
     });
     files.sort((a, b) => b.size - a.size);
     return files.slice(0, limit);
@@ -1152,6 +1197,10 @@ if (data.type === "delete_file") {
     console.error("❌ Failed to delete stored file:", err);
     return send(ws, { type: "error", message: "Failed to delete file" });
   }
+
+  const intentMap = mapStoredFilesToIntents();
+  const intent = intentMap.get(storedFile);
+  if (intent) deleteIntentAndNotify(intent);
 
   return send(ws, { type: "stats", storageBytes: storageBytesUsed(), storedFiles: countStoredFiles(), largestFiles: largestStoredFiles(100) });
 }
