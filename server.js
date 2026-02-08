@@ -812,6 +812,8 @@ if (data.type === "delete_intent") {
     console.error("❌ Failed to delete intent:", err);
   }
 
+  deleteIntentAndNotify(intent);
+
   // 🧠 Remove from in-memory inbox (if loaded)
   const inbox = inboxes.get(ws.username);
   if (inbox) {
@@ -1202,6 +1204,49 @@ if (data.type === "delete_file") {
   const intentMap = mapStoredFilesToIntents();
   const intent = intentMap.get(storedFile);
   if (intent) deleteIntentAndNotify(intent);
+
+  return send(ws, { type: "stats", storageBytes: storageBytesUsed(), storedFiles: countStoredFiles(), largestFiles: largestStoredFiles(100) });
+}
+
+if (data.type === "delete_files") {
+  const storedFiles = Array.isArray(data.storedFiles) ? data.storedFiles : [];
+  if (!storedFiles.length) return send(ws, { type: "error", message: "No files specified" });
+
+  const intentMap = mapStoredFilesToIntents();
+  for (const storedFile of storedFiles) {
+    const filePath = path.join(FILES_DIR, storedFile);
+    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+    const intent = intentMap.get(storedFile);
+    if (intent) deleteIntentAndNotify(intent);
+  }
+
+  return send(ws, { type: "stats", storageBytes: storageBytesUsed(), storedFiles: countStoredFiles(), largestFiles: largestStoredFiles(100) });
+}
+
+if (data.type === "delete_message_everyone") {
+  const intentId = String(data.intentId || "").trim();
+  if (!intentId) return send(ws, { type: "error", message: "Missing intentId" });
+
+  const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+  if (!fs.existsSync(intentFile)) {
+    return send(ws, { type: "error", message: "Intent not found" });
+  }
+
+  let intent;
+  try { intent = JSON.parse(fs.readFileSync(intentFile, "utf8")); } catch {
+    return send(ws, { type: "error", message: "Intent corrupted" });
+  }
+
+  if (intent.from !== ws.username && intent.to !== ws.username) {
+    return send(ws, { type: "error", message: "Not authorized" });
+  }
+
+  if (intent.stored && intent.storedFile) {
+    const filePath = path.join(FILES_DIR, intent.storedFile);
+    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  }
+
+  deleteIntentAndNotify(intent);
 
   return send(ws, { type: "stats", storageBytes: storageBytesUsed(), storedFiles: countStoredFiles(), largestFiles: largestStoredFiles(100) });
 }
