@@ -1,0 +1,2169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Merm</title>
+
+    <link rel="icon" type="image/png" href="/images/WebsiteLogo.png" />
+    <link rel="icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/images/WebsiteLogo.png" />
+
+    <style>
+      :root{
+        --bg:#ffffff;
+        --panel:#f7f7f8;
+        --panel2:#ffffff;
+        --border:#e7e7ea;
+        --muted:#7a7a86;
+        --text:#111118;
+        --shadow: 0 8px 24px rgba(0,0,0,.06);
+        --radius:16px;
+
+        --primary:#111118;            /* matches the screenshot dark button */
+        --primaryText:#ffffff;
+
+        --accent:#007AFF;             /* keep your old blue for focus states if needed */
+        --online:#2ecc71;
+      }
+
+      *{ box-sizing:border-box; }
+      html, body { height:100%; }
+      body{
+        margin:0;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+            /* ====== AUTH (match mock) ====== */
+      #authSection{
+        max-width: 540px;
+        margin: 80px auto;
+        padding: 26px 28px 30px;
+        border: 1px solid var(--border);
+        border-radius: 26px;
+        background: #fff;
+        box-shadow: 0 14px 28px rgba(0,0,0,.10);
+        text-align: left;
+      }
+
+      #authSection h1,
+      #authSection p{
+        display:none;
+      }
+
+      /* ===== AUTH TOGGLE ===== */
+      #authToggle{
+        position: relative;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        align-items: center;
+        background: #f1f1f3;
+        border-radius: 18px;
+        padding: 6px;
+        margin-bottom: 22px;
+        height: 56px;
+        overflow: hidden;
+      }
+
+      .authToggleBtn{
+        position: relative;
+        z-index: 2;
+        border: none;
+        background: transparent;
+        font-weight: 700;
+        font-size: 16px;
+        color: #6a6f7b;
+        cursor: pointer;
+        height: 44px;
+      }
+
+      .authToggleBtn.active{
+        color: #fff;
+      }
+
+      #authToggleIndicator{
+        position: absolute;
+        top: 6px;
+        left: 6px;
+        width: calc(50% - 6px);
+        height: calc(100% - 12px);
+        background: #000;
+        border-radius: 16px;
+        transition: transform 0.35s cubic-bezier(.4,0,.2,1);
+        box-shadow: 0 8px 18px rgba(0,0,0,.25);
+        z-index: 1;
+      }
+
+      .authForm{
+        display: grid;
+        gap: 14px;
+      }
+
+      .authRow{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+
+      .authField label{
+        display:block;
+        font-weight: 650;
+        color: #2f3542;
+        margin-bottom: 6px;
+        font-size: 14px;
+      }
+
+      .authField input{
+        width: 100%;
+        padding: 13px 16px;
+        border: none;
+        background: #f3f3f5;
+        border-radius: 14px;
+        outline: none;
+        font-size: 16px;
+        color: #232730;
+      }
+
+      .authField input::placeholder{
+        color: #8b8f9b;
+      }
+
+      .authField input:focus{
+        box-shadow: 0 0 0 4px rgba(0,0,0,.06);
+      }
+
+      #authActions{
+        margin-top: 12px;
+      }
+
+      #authActions button{
+        width: 100%;
+        padding: 14px 18px;
+        border-radius: 14px;
+        border: none;
+        font-weight: 700;
+        font-size: 16px;
+        cursor: pointer;
+        color: #fff;
+        background: linear-gradient(180deg, #0b0b12 0%, #111118 100%);
+        box-shadow: 0 10px 18px rgba(0,0,0,.20);
+      }
+
+      #authState{
+        margin-top: 14px;
+        min-height: 20px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .hidden { display:none !important; }
+
+      @media (max-width: 560px){
+        #authSection{ margin: 40px 14px; }
+        .authRow{ grid-template-columns: 1fr; }
+      }
+
+
+      /* ====== APP LAYOUT (screenshot-style) ====== */
+      #authedApp{
+        display:none;
+        height: 100vh;
+        width: 100%;
+        overflow: hidden;
+      }
+
+      .appShell{
+      height: 100%;
+      display: grid;
+      grid-template-columns: 64px 360px 1fr;
+    }
+
+
+      /* Sidebar */
+      .sidebar{
+        border-right: 1px solid var(--border);
+        background: #fafafb;
+        display:flex;
+        flex-direction:column;
+        min-width: 280px;
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      .sidebarHeader{
+        padding: 22px 18px 14px;
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap:12px;
+      }
+      .sidebarTitle{
+        font-size: 22px;
+        font-weight: 750;
+        letter-spacing: -0.02em;
+      }
+      .sidebarIconBtn{
+        width: 36px;
+        height: 36px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background:#fff;
+        cursor:pointer;
+        display:grid;
+        place-items:center;
+      }
+      .sidebarIconBtn svg{ opacity:.8; }
+
+      .searchWrap{
+        padding: 0 18px 14px;
+      }
+      .search{
+        width: 100%;
+        padding: 12px 12px 12px 40px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        outline:none;
+        font-size: 14px;
+        background:#fff;
+      }
+      .searchWrap{
+        position:relative;
+      }
+      .searchIcon{
+        position:absolute;
+        left: 30px;
+        top: 50%;
+        transform: translateY(-50%);
+        opacity:.55;
+        pointer-events:none;
+      }
+
+      .contactList{
+        overflow:auto;
+        padding: 0;
+        margin: 0;
+        list-style:none;
+        border-top: 1px solid var(--border);
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+
+      .contactItem{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--border);
+        background: transparent;
+        cursor: pointer;
+        transition: background-color 0.15s ease;
+      }
+
+      .contactItem:hover{
+        background: #e6e8ec; /* darker on hover */
+      }
+
+      .contactItem.active{
+        background: #dfe3e8; /* darker than hover */
+      }
+      .contactLeft{
+        display:flex;
+        gap: 12px;
+        align-items:center;
+        min-width:0;
+      }
+
+      .unreadBadge{
+        min-width: 20px;
+        height: 20px;
+        padding: 0 6px;
+        border-radius: 999px;
+        background: #e53935;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .avatar{
+        width: 40px;
+        height: 40px;
+        border-radius: 999px;
+        background: #ddd;
+        flex: 0 0 auto;
+        position:relative;
+        overflow:hidden;
+      }
+      .avatar img{ width:100%; height:100%; object-fit:cover; display:block; }
+      .statusDot{
+        position:absolute;
+        bottom: 1px;
+        left: 1px;
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+        background: var(--online);
+        border: 2px solid #fff;
+      }
+      .contactText{
+        min-width:0;
+      }
+      .contactName{
+        font-weight: 750;
+        font-size: 15px;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+      }
+      .contactSub{
+        color: var(--muted);
+        font-weight: 550;
+        font-size: 13px;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        margin-top: 2px;
+      }
+      .contactRight{
+        color: var(--muted);
+        font-size: 13px;
+        font-weight: 600;
+        flex: 0 0 auto;
+        margin-left: 10px;
+      }
+
+      .contactSub{
+        font-size: 12px;
+        color: #6b7280;
+        margin-top: 2px;
+        font-weight: 600;
+      }
+
+      .removeContactBtn{
+        border:none;
+        background:#f3f4f6;
+        color:#6b7280;
+        border-radius: 10px;
+        padding: 6px 8px;
+        cursor:pointer;
+        font-weight: 700;
+      }
+
+      /* Sidebar bottom tools (your existing features) */
+      .sidebarTools{
+        margin-top:auto;
+        padding: 14px 18px;
+        border-top: 1px solid var(--border);
+        background:#fafafb;
+      }
+
+      .toolRow{
+        display:flex;
+        gap:10px;
+        align-items:flex-end;
+        margin-bottom: 12px;
+      }
+      .toolRow input, .toolRow select{
+        width: 100%;
+        padding: 10px 10px;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        outline:none;
+        background:#fff;
+      }
+      .toolRow button{
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background:#fff;
+        cursor:pointer;
+        font-weight: 650;
+        white-space:nowrap;
+      }
+      .toolRow button.primary{
+        background: var(--primary);
+        color: var(--primaryText);
+        border-color: transparent;
+      }
+
+      .dangerRow{
+        display:flex;
+        justify-content:space-between;
+        gap:10px;
+        align-items:center;
+        margin-top: 10px;
+      }
+      .dangerRow button{
+        padding: 9px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background:#fff;
+        cursor:pointer;
+        font-weight: 650;
+      }
+      #deleteAccountBtn{
+        border-color: #b00020 !important;
+        color: #b00020 !important;
+        background:#fff !important;
+      }
+
+      /* Main */
+      .main{
+        background:#fff;
+        display:flex;
+        flex-direction:column;
+        min-width: 0;
+      }
+
+      .mainHeader{
+        padding: 18px 22px;
+        border-bottom: 1px solid var(--border);
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap: 14px;
+      }
+
+      .headerLeft{ display:flex; align-items:center; gap: 10px; }
+      .headerRight{ display:flex; align-items:center; gap: 12px; }
+
+      .iconCircle{
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        border: 1px solid var(--border);
+        background:#fff;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        cursor:pointer;
+      }
+
+      .headerAvatar{
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background:#f3f4f6;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        font-weight: 800;
+        color:#6b7280;
+        position:relative;
+        overflow:hidden;
+      }
+      .headerAvatar img{
+        position:absolute;
+        inset:0;
+        width:100%;
+        height:100%;
+        object-fit:cover;
+        display:none;
+      }
+
+      .chatSearchBar{
+        margin: 12px 22px 0;
+        position: relative;
+      }
+      .chatSearchBar input{
+        width: 100%;
+        padding: 12px 12px 12px 40px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        outline:none;
+        background:#fff;
+        font-size: 14px;
+      }
+      .chatSearchBar .searchIcon{
+        position:absolute;
+        left: 14px;
+        top: 50%;
+        transform: translateY(-50%);
+        opacity:.55;
+      }
+
+      .composerWrap{
+        display:flex;
+        align-items:center;
+        gap: 10px;
+        background:#f3f4f6;
+        border-radius: 999px;
+        padding: 10px 12px;
+        margin: 10px auto 12px;
+        width: calc(100% - 44px);
+        max-width: 760px;
+        position: relative;
+      }
+
+      .composerInput{
+        flex:1;
+        border:none;
+        outline:none;
+        background: transparent;
+        font-size: 14px;
+      }
+
+      .uploadBtn,
+      .sendBtn{
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        border:none;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        background:#fff;
+        cursor:pointer;
+      }
+
+      .sendBtn{ background:#111118; color:#fff; }
+      .sendBtn:disabled{ opacity:.5; cursor:not-allowed; }
+
+      .uploadMenu{
+        position:absolute;
+        left: 0;
+        bottom: 56px;
+        background:#fff;
+        border:1px solid var(--border);
+        border-radius: 14px;
+        padding: 10px;
+        display:flex;
+        flex-direction:column;
+        gap: 8px;
+        box-shadow: 0 8px 24px rgba(0,0,0,.12);
+        z-index: 5;
+      }
+      .uploadMenu.hidden{ display:none; }
+      .uploadMenu button{
+        border: none;
+        background:#f3f4f6;
+        padding: 8px 10px;
+        border-radius: 10px;
+        font-weight: 650;
+        cursor:pointer;
+        text-align:left;
+      }
+
+      .activeUser{
+        display:flex;
+        align-items:center;
+        gap: 12px;
+        min-width:0;
+      }
+      .activeMeta{
+        min-width:0;
+      }
+      .activeName{
+        font-weight: 800;
+        font-size: 18px;
+        line-height: 1.1;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+      }
+      .activeStatus{
+        font-size: 13px;
+        font-weight: 650;
+        color: var(--muted);
+        margin-top: 3px;
+      }
+
+      .headerActions{
+        display:flex;
+        gap:10px;
+        align-items:center;
+      }
+      .headerActions button{
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background:#fff;
+        cursor:pointer;
+        font-weight: 650;
+      }
+      .headerActions button.primary{
+        background: var(--primary);
+        color: var(--primaryText);
+        border-color: transparent;
+      }
+
+      .mainBody{
+  padding: 0;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+
+      /* Drop zone big centered area like screenshot */
+      .dropWrap{
+      border: 2px dashed var(--border);
+      border-radius: 22px;
+      min-height: 220px;              /* 🔽 much shorter */
+      background: #fcfcfd;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      text-align:center;
+      position:relative;
+    }
+
+      .dropInner{
+        width: min(520px, 92%);
+        padding: 30px 18px;
+      }
+      .uploadIcon{
+        width: 90px;
+        height: 90px;
+        margin: 0 auto 10px;
+        opacity:.65;
+      }
+      .dropTitle{
+        font-weight: 800;
+        font-size: 20px;
+        margin: 8px 0 6px;
+      }
+      .dropSub{
+        color: var(--muted);
+        font-weight: 600;
+        margin: 0 0 16px;
+      }
+
+      /* Keep your existing dropZone ID for logic */
+      #dropZone{
+        /* This element is the big drop area now */
+        width: 100%;
+        height: 100%;
+        padding: 0; /* handled by .dropInner */
+        border: none;
+        background: transparent;
+        color: inherit;
+      }
+      #dropZone.dragover .dropWrap{
+        outline: 4px solid rgba(0,0,0,.06);
+        border-color: rgba(0,0,0,.35);
+        background: #f3f4f6;
+      }
+
+      /* Buttons under drop area */
+      .dropActions{
+        display:flex;
+        gap: 12px;
+        justify-content:center;
+        flex-wrap:wrap;
+        margin-top: 12px;
+      }
+      .dropActions button{
+        padding: 12px 16px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background:#fff;
+        cursor:pointer;
+        font-weight: 750;
+      }
+      .packageToggle{
+        display:flex;
+        align-items:center;
+        gap:8px;
+        padding: 10px 12px;
+        border-radius: 14px;
+        border: 1px solid var(--border);
+        background:#fff;
+        font-weight: 700;
+        cursor:pointer;
+      }
+      .packageToggle input{
+        accent-color:#111118;
+      }
+      .packageToggle span{
+        font-size:14px;
+      }
+
+      #savePhotosBtn:disabled{
+        opacity:.5;
+        cursor:not-allowed;
+      }
+      #send{
+        background: var(--primary) !important;
+        color: var(--primaryText) !important;
+        border-color: transparent !important;
+      }
+      #send:disabled{
+        opacity:.5;
+        cursor:not-allowed;
+      }
+
+      /* Progress + lists + log (keep IDs intact; make them fit the new design) */
+      .belowGrid{
+        margin-top: 18px;
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+      }
+      .card{
+        background:#fff;
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 14px;
+      }
+      .cardTitle{
+        font-weight: 850;
+        margin: 0 0 10px;
+        font-size: 14px;
+      }
+
+      progress{
+        width:100%;
+        height: 10px;
+        border-radius: 999px;
+        overflow:hidden;
+      }
+      progress::-webkit-progress-bar{
+        background: #eef0f3;
+      }
+      progress::-webkit-progress-value{
+        background: #111118;
+      }
+
+      #toSend, #inbox{
+        padding: 0;
+        margin: 0;
+        list-style:none;
+        display:flex;
+        flex-direction:column;
+        gap: 8px;
+      }
+      #toSend li, #inbox li{
+        display:flex;
+        align-items:center;
+        gap:10px;
+        padding: 10px 10px;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        background:#fff;
+      }
+      .fileLabel{
+        flex:1;
+        min-width:0;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+        font-weight: 650;
+      }
+      #toSendEmpty, #inboxEmpty{
+        color: var(--muted);
+        font-style: italic;
+        font-size: 13px;
+        margin-top: 6px;
+      }
+
+      .logCard{
+        margin-top: 14px;
+      }
+      #log{
+        white-space: pre-wrap;
+        background: #0f0f12;
+        color: #e7e7ea;
+        padding: 14px;
+        border-radius: 16px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 12.5px;
+        line-height: 1.35;
+        max-height: 220px;
+        overflow:auto;
+        border: 1px solid rgba(255,255,255,.08);
+      }
+
+      .avatarLetter{
+        width:100%;
+        height:100%;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        font-weight:800;
+        font-size:18px;
+        text-transform:uppercase;
+        background:#e5e7eb;
+        color:#333;
+      }
+
+
+      /* ===== Messaging Stream ===== */
+      .messageStream{
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 120px; /* space reserved for input area */
+
+  overflow-y: auto;
+  padding: 18px 22px 140px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+
+
+      /* Message bubble (new design) */
+      .msgRow{
+        display:flex;
+        flex-direction:column;
+        gap:6px;
+        max-width: 640px;
+      }
+      .msgRow.sent{ align-self:flex-end; }
+      .msgRow.received{ align-self:flex-start; }
+      .msgRow.self{ align-self:center; }
+      .msgRow.pending .msgBubble{ opacity: .6; }
+
+      .msgMetaTop{
+        font-size: 12px;
+        color: var(--muted);
+        font-weight: 650;
+        display:flex;
+        gap: 8px;
+        align-items:center;
+      }
+      .msgRow.sent .msgMetaTop{ align-self:flex-end; }
+      .msgRow.received .msgMetaTop{ align-self:flex-start; }
+      .msgRow.self .msgMetaTop{ align-self:center; }
+
+      .msgBubble{
+        position:relative;
+        display:flex;
+        align-items:center;
+        gap: 12px;
+        padding: 16px 18px;
+        border-radius: 22px;
+        background: #ffffff;
+        border: 1px solid #e3e6ee;
+        box-shadow: none;
+        transition: background .2s ease;
+      }
+
+      .msgBubble:hover{ background:#f5f7fb; }
+
+      .msgIcon{
+        width: 56px;
+        height: 56px;
+        border-radius: 16px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        background: var(--icon-bg, #f3f4f6);
+        color: var(--icon-color, #6b7280);
+        border: 1.5px solid var(--icon-border, #e5e7eb);
+        flex: 0 0 auto;
+      }
+
+      .icon-pdf{ --icon-bg:#ffe5e5; --icon-color:#e11d48; --icon-border:#fca5a5; }
+      .icon-archive{ --icon-bg:#ffe9d5; --icon-color:#f97316; --icon-border:#fdba74; }
+      .icon-excel{ --icon-bg:#e7fce9; --icon-color:#16a34a; --icon-border:#86efac; }
+      .icon-ppt{ --icon-bg:#ffe4ea; --icon-color:#fb7185; --icon-border:#fda4af; }
+      .icon-image{ --icon-bg:#efe7ff; --icon-color:#a855f7; --icon-border:#d8b4fe; }
+      .icon-video{ --icon-bg:#e6f0ff; --icon-color:#2563eb; --icon-border:#93c5fd; }
+      .icon-doc{ --icon-bg:#e6f0ff; --icon-color:#2563eb; --icon-border:#93c5fd; }
+      .icon-audio{ --icon-bg:#ffe3f0; --icon-color:#ec4899; --icon-border:#f9a8d4; }
+      .icon-code{ --icon-bg:#fff7d6; --icon-color:#f59e0b; --icon-border:#fde047; }
+      .icon-markup{ --icon-bg:#e6fffb; --icon-color:#14b8a6; --icon-border:#5eead4; }
+      .icon-db{ --icon-bg:#e7ecff; --icon-color:#6366f1; --icon-border:#a5b4fc; }
+      .icon-default{ --icon-bg:#f3f4f6; --icon-color:#6b7280; --icon-border:#e5e7eb; }
+
+      .msgContent{ display:flex; flex-direction:column; gap:4px; min-width:0; }
+      .msgName{ font-weight: 800; font-size: 18px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#0f172a; }
+      .msgSize{ font-size: 15px; color: #6b7280; font-weight: 700; }
+      .msgNote{ font-size: 12px; color:#f97316; font-weight: 700; }
+
+      .msgActions{
+        position:absolute;
+        top: 8px;
+        right: 8px;
+        display:flex;
+        gap:6px;
+        opacity:0;
+        transition: opacity .2s ease;
+      }
+      .msgBubble:hover .msgActions{ opacity:1; }
+
+      .msgActionBtn{
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+        border:none;
+        background:#fff;
+        color:#6b7280;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        cursor:pointer;
+        box-shadow: 0 2px 6px rgba(0,0,0,.08);
+      }
+
+      .messageProgressWrap{
+        display:flex;
+        flex-direction:column;
+        gap:6px;
+        margin-top: 6px;
+      }
+
+      .messageProgressBar{
+        height: 6px;
+        border-radius: 999px;
+        background: rgba(0,0,0,0.1);
+        overflow:hidden;
+      }
+
+      .messageProgressBar span{
+        display:block;
+        height: 100%;
+        width: 0%;
+        background: #111118;
+        border-radius: 999px;
+        transition: width 0.1s linear;
+      }
+
+      .messageProgressText{
+        font-size: 12px;
+        color: rgba(17,17,24,0.7);
+        font-weight: 600;
+      }
+
+      .messageTime{
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 600;
+      }
+      .msgRow.sent .messageTime{ align-self:flex-end; }
+      .msgRow.received .messageTime{ align-self:flex-start; }
+      .msgRow.self .messageTime{ align-self:center; }
+
+      body.hasMessages .dropWrap{
+        min-height: 140px;
+      }
+
+      /* ===== Selected Files Tray ===== */
+      .selectedFilesTray{
+        display:flex;
+        gap:10px;
+        padding: 10px 22px;
+        border-top: 1px solid var(--border);
+        background:#fff;
+        overflow-x:auto;
+      }
+
+      .selectedFile{
+        display:flex;
+        align-items:center;
+        gap:8px;
+        padding: 8px 10px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background:#f9fafb;
+        font-size: 13px;
+        font-weight: 650;
+        white-space:nowrap;
+      }
+
+      .selectedFile button{
+        border:none;
+        background:transparent;
+        cursor:pointer;
+        font-size:14px;
+        color:#b00020;
+      }
+
+
+      .chatInput{
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+
+  border-top: 1px solid var(--border);
+  background: #fff;
+  padding-bottom: 8px;
+}
+
+
+      #dropZone{
+        height:auto;
+      }
+
+      .dropWrap{
+        min-height: unset;
+        height: auto;
+        border-radius: 18px;
+        margin: 10px 22px;
+        padding: 12px;
+      }
+
+      .dropInner{
+        padding: 0;
+      }
+
+      .uploadIcon,
+      .dropTitle,
+      .dropSub{
+        display:none; /* hide big drag visuals */
+      }
+
+      /* ===== Left Icon Bar ===== */
+      .iconBar{
+        width: 64px;
+        background: #1f1f1f;
+        border-right: 1px solid #2a2a2a;
+        display:flex;
+        flex-direction:column;
+        align-items:center;
+        padding: 12px 0;
+        gap: 12px;
+        position: sticky;
+        top: 0;
+        height: 100vh;
+      }
+
+      .iconBtn{
+        position: relative;
+        width: 44px;
+        height: 44px;
+        border-radius: 12px;
+        border:none;
+        background: transparent;
+        color: #aaa;
+        font-size: 20px;
+        cursor:pointer;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+      }
+
+      .iconBadge{
+        position:absolute;
+        top:6px;
+        right:6px;
+        min-width: 16px;
+        height: 16px;
+        padding: 0 4px;
+        border-radius: 999px;
+        background:#22c55e;
+        color:#fff;
+        font-size: 10px;
+        font-weight: 800;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        box-shadow: 0 0 0 2px #1f1f1f;
+      }
+
+      .iconBtn.active{
+        background:#2f2f2f;
+        color:#fff;
+      }
+
+      .page{
+        display:none;
+        height:100%;
+      }
+
+      .page.active{
+        display:flex;
+        flex-direction:column;
+      }
+
+      .pageContent{
+        padding: 24px;
+      }
+
+      body.page-friends .sidebar{
+        display:none;
+      }
+      body.page-friends .appShell{
+        grid-template-columns: 64px 1fr;
+      }
+      body.page-friends .mainHeader{
+        display:none;
+      }
+
+      body.page-friends .main{
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      .friendsPage{
+        padding: 8px 6px 24px;
+        height: 100vh;
+        overflow: auto;
+      }
+
+      body.page-account .sidebar{
+        display:none;
+      }
+      body.page-account .appShell{
+        grid-template-columns: 64px 1fr;
+      }
+      body.page-account .mainHeader{
+        display:none;
+      }
+      body.page-account .main{
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      .accountPage{
+        padding: 8px 6px 32px;
+        height: 100vh;
+        overflow: auto;
+      }
+
+      body.page-logs .sidebar{
+        display:none;
+      }
+      body.page-logs .appShell{
+        grid-template-columns: 64px 1fr;
+      }
+      body.page-logs .mainHeader{
+        display:none;
+      }
+      body.page-logs .main{
+        height: 100vh;
+        overflow: hidden;
+      }
+
+      .logsPage{
+        padding: 8px 6px 32px;
+        height: 100vh;
+        overflow: auto;
+      }
+
+      .logsHeader h2{
+        margin: 0 0 6px;
+        font-size: 26px;
+        letter-spacing: -0.01em;
+      }
+      .logsHeader p{
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      .logsStatsGrid{
+        display:grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .logsSplit{
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 14px;
+        margin-top: 16px;
+      }
+
+      .logsCard{
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background:#fff;
+        padding: 14px;
+      }
+
+      .logsCardTitle{
+        font-weight: 800;
+        font-size: 14px;
+        margin-bottom: 6px;
+      }
+
+      .statValue{
+        font-size: 26px;
+        font-weight: 800;
+      }
+
+      .statLabel{
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 600;
+        margin-top: 4px;
+      }
+
+      .logPanel{
+        max-height: 420px;
+        overflow: auto;
+        background:#0f172a;
+        color:#e2e8f0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        padding: 12px;
+        border-radius: 12px;
+        font-size: 12px;
+        white-space: pre-wrap;
+      }
+
+      .filesList{
+        max-height: 420px;
+        overflow: auto;
+        display:flex;
+        flex-direction:column;
+        gap: 10px;
+      }
+
+      .fileRow{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap: 12px;
+        padding: 8px 6px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .fileMeta{
+        display:flex;
+        flex-direction:column;
+        gap: 4px;
+        min-width:0;
+      }
+
+      .fileName{
+        font-weight: 700;
+        font-size: 13px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 260px;
+      }
+
+      .fileSize{
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .fileDeleteBtn{
+        border:none;
+        background:#fee2e2;
+        color:#b91c1c;
+        border-radius: 10px;
+        padding: 6px 10px;
+        cursor:pointer;
+        font-weight: 700;
+      }
+
+      @media (max-width: 1024px){
+        .logsStatsGrid{ grid-template-columns: 1fr 1fr; }
+        .logsSplit{ grid-template-columns: 1fr; }
+      }
+
+      @media (max-width: 720px){
+        body.page-logs .main{ height: auto; }
+        .logsPage{ height: auto; }
+        .logsStatsGrid{ grid-template-columns: 1fr; }
+      }
+
+      .accountHeader h2{
+        margin: 0 0 6px;
+        font-size: 26px;
+        letter-spacing: -0.01em;
+      }
+      .accountHeader p{
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      .accountCard{
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background:#fff;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+
+      .accountCardTitle{
+        font-weight: 800;
+        font-size: 18px;
+        margin-bottom: 12px;
+      }
+
+      .profileRow{
+        display:flex;
+        gap: 18px;
+        align-items:center;
+        flex-wrap:wrap;
+      }
+
+      .profileAvatar{
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        border: 2px solid #d1d5db;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        font-weight: 800;
+        color:#6b7280;
+        background:#f3f4f6;
+        position: relative;
+        overflow:hidden;
+      }
+
+      .profileAvatar img{
+        position:absolute;
+        inset:0;
+        width:100%;
+        height:100%;
+        object-fit: cover;
+        display:none;
+      }
+
+      .profileUpload .primary{
+        background: var(--primary);
+        color: var(--primaryText);
+        border: none;
+        padding: 10px 16px;
+        border-radius: 12px;
+        font-weight: 700;
+        cursor:pointer;
+      }
+
+      .profileButtons{
+        display:flex;
+        gap: 10px;
+        flex-wrap:wrap;
+      }
+
+      .profileHint{
+        color: var(--muted);
+        font-size: 13px;
+        margin-top: 6px;
+        font-weight: 600;
+      }
+
+      .accountGrid{
+        display:grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+
+      .accountField{
+        display:flex;
+        flex-direction:column;
+        gap: 6px;
+        margin-bottom: 12px;
+      }
+
+      .accountField label{
+        font-weight: 700;
+        color:#111118;
+      }
+
+      .accountField input{
+        padding: 12px 14px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background:#f3f4f6;
+        outline:none;
+        font-size: 14px;
+      }
+
+      .accountActionsRow{
+        display:flex;
+        justify-content: flex-end;
+        margin: 8px 0 18px;
+      }
+
+      .accountActionsRow .primary{
+        background: var(--primary);
+        color: var(--primaryText);
+        border: none;
+        padding: 12px 18px;
+        border-radius: 12px;
+        font-weight: 700;
+        cursor:pointer;
+      }
+
+      .accountDivider{
+        height: 1px;
+        background: var(--border);
+        margin: 6px 0 18px;
+      }
+
+      .accountActions{
+        display:flex;
+        gap: 12px;
+        flex-wrap:wrap;
+      }
+
+      .btnDanger{
+        background:#e11d48;
+        color:#fff;
+        border:none;
+        padding: 10px 16px;
+        border-radius: 12px;
+        font-weight: 700;
+        cursor:pointer;
+      }
+
+      @media (max-width: 720px){
+        .accountGrid{ grid-template-columns: 1fr; }
+        body.page-account .main{ height: auto; }
+        .accountPage{ height: auto; }
+      }
+
+      .friendsHeader h2{
+        margin: 0 0 6px;
+        font-size: 26px;
+        letter-spacing: -0.01em;
+      }
+      .friendsHeader p{
+        margin: 0 0 18px;
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      .friendsGrid{
+        display:grid;
+        grid-template-columns: 1.1fr 1fr;
+        gap: 18px;
+      }
+
+      .friendsCard{
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        background:#fff;
+        padding: 16px;
+      }
+
+      .friendsCard + .friendsCard{
+        margin-top: 16px;
+      }
+
+      .friendsCardTitle{
+        font-weight: 800;
+        font-size: 18px;
+        margin-bottom: 12px;
+      }
+
+      .friendSearch{
+        position: relative;
+      }
+      .friendSearch input{
+        width: 100%;
+        padding: 12px 12px 12px 40px;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        outline:none;
+        background:#fff;
+        font-size: 14px;
+      }
+      .friendSearch .searchIcon{
+        position:absolute;
+        left: 14px;
+        top: 50%;
+        transform: translateY(-50%);
+        opacity:.55;
+        pointer-events:none;
+      }
+
+      .friendList{
+        display:flex;
+        flex-direction:column;
+        gap: 12px;
+      }
+
+      .friendRow{
+        display:flex;
+        align-items:center;
+        justify-content:space-between;
+        gap: 12px;
+        padding: 8px 6px;
+      }
+
+      .friendMeta{
+        display:flex;
+        align-items:center;
+        gap: 12px;
+        min-width:0;
+      }
+
+      .friendAvatar{
+        width: 38px;
+        height: 38px;
+        border-radius: 50%;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        font-weight: 800;
+        color:#fff;
+        flex: 0 0 auto;
+      }
+
+      .friendName{
+        font-weight: 700;
+        white-space:nowrap;
+        overflow:hidden;
+        text-overflow:ellipsis;
+      }
+
+      .friendActions{
+        display:flex;
+        gap: 8px;
+        flex-wrap:wrap;
+      }
+
+      .btnAccept,
+      .btnDeny,
+      .btnRequest,
+      .btnGhost{
+        border:none;
+        border-radius: 12px;
+        padding: 8px 12px;
+        font-weight: 700;
+        cursor:pointer;
+      }
+
+      .btnAccept{
+        background:#16a34a;
+        color:#fff;
+      }
+
+      .btnDeny{
+        background:#e5e7eb;
+        color:#374151;
+      }
+
+      .btnRequest{
+        background:#111118;
+        color:#fff;
+      }
+
+      .btnGhost{
+        background: transparent;
+        color:#6b7280;
+      }
+      .btnGhost:disabled{
+        opacity:.6;
+        cursor:not-allowed;
+      }
+
+      .emptyText{
+        color: var(--muted);
+        font-size: 14px;
+        padding: 6px 0;
+      }
+
+      @media (max-width: 980px){
+        .friendsGrid{ grid-template-columns: 1fr; }
+      }
+
+      .page:not(.active) .page-chat-only {
+        display: none !important;
+      }
+
+      .downloadBtn{
+        margin-top: 6px;
+        align-self: flex-start;
+        background: rgba(255,255,255,.15);
+        border: none;
+        border-radius: 8px;
+        padding: 6px 10px;
+        color: inherit;
+        cursor: pointer;
+        font-weight: 700;
+        font-size: 12px;
+      }
+
+      #page-chat{
+        position: relative;
+        flex: 1;
+        overflow: hidden;
+      }
+
+      .unreadBadge{
+        min-width: 20px;
+        height: 20px;
+        padding: 0 6px;
+        border-radius: 999px;
+        background: #e11d48; /* red */
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .messageTimestamp{
+        font-size: 11px;
+        opacity: 0.7;
+        margin-top: 4px;
+        align-self: flex-end;
+      }
+
+      .dateSeparator{
+        text-align: center;
+        margin: 16px 0;
+        font-size: 12px;
+        font-weight: 700;
+        color: #6b7280;
+      }
+
+      .messageMeta{
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        justify-content: flex-end;
+        font-size: 11px;
+        opacity: 0.75;
+        margin-top: 4px;
+      }
+
+      .readReceipt{
+        font-weight: 800;
+      }
+
+      .readReceipt.read{
+        color: #2563eb;
+      }
+
+
+      /* Mobile */
+      @media (max-width: 920px){
+        .appShell{ grid-template-columns: 1fr; }
+        .sidebar{ height: 320px; border-right:none; border-bottom: 1px solid var(--border); }
+        .dropWrap{ min-height: 420px; }
+        .belowGrid{ grid-template-columns: 1fr; }
+      }
+
+      @media (max-width: 720px){
+        .iconBar{
+          position: fixed;
+          bottom: 0;
+          top: auto;
+          height: 64px;
+          width: 100%;
+          flex-direction: row;
+          justify-content: space-around;
+          gap: 10px;
+          padding: 10px;
+          z-index: 20;
+        }
+        .appShell{ grid-template-columns: 1fr !important; height: calc(100vh - 64px); }
+        .sidebar{ height: calc(100vh - 64px); width: 100%; min-width: 0; }
+        .main{ height: calc(100vh - 64px); width: 100%; }
+        .pageContent{ width: 100%; max-width: none; }
+        .mainHeader{ padding: 12px 16px; }
+        .messageStream{
+          padding: 14px 14px 170px;
+          bottom: 140px;
+        }
+        .dropWrap{ margin: 8px 12px; }
+        .selectedFilesTray{ padding: 8px 12px; }
+        .chatInput{
+          position: fixed;
+          left: 0;
+          right: 0;
+          bottom: 64px;
+          background:#fff;
+          padding-bottom: env(safe-area-inset-bottom);
+          z-index: 15;
+        }
+
+        body.page-chat .sidebarHeader,
+        body.page-chat .searchWrap{
+          display:none;
+        }
+
+        body.page-chat:not(.mobile-chat-active) .main{
+          display:none !important;
+        }
+        body.page-chat:not(.mobile-chat-active) .chatInput{
+          display:none;
+        }
+        body.page-chat:not(.mobile-chat-active) .sidebar{
+          display:flex;
+        }
+        body.page-chat.mobile-chat-active .sidebar{
+          display:none;
+        }
+        body.page-chat.mobile-chat-active .main{
+          display:flex;
+        }
+
+        .dropWrap{
+          min-height: unset;
+          height: auto;
+          padding: 10px;
+        }
+
+        .dropActions button{
+          padding: 10px 12px;
+        }
+
+        .mobileBack{
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          border:none;
+          background:#f3f4f6;
+          color:#111;
+          width: 32px;
+          height: 32px;
+          border-radius: 10px;
+          margin-right: 10px;
+          font-weight: 800;
+          cursor:pointer;
+        }
+
+        body.page-friends .main{ height: auto; }
+        body.page-friends .friendsPage{ height: auto; }
+        body.page-account .main{ height: auto; }
+        body.page-account .accountPage{ height: auto; padding-bottom: calc(120px + env(safe-area-inset-bottom)); }
+        body.page-logs .main{ height: auto; }
+        body.page-logs .logsPage{ height: auto; }
+
+        .pageContent{ padding: 16px; }
+        .friendsPage, .logsPage, .accountPage{ padding: 16px; }
+        .friendsGrid{ grid-template-columns: 1fr; }
+        .logsSplit{ grid-template-columns: 1fr; }
+        .composerWrap{ width: calc(100% - 24px); }
+      }
+
+      @media (max-width: 900px) and (orientation: landscape){
+        .appShell{ grid-template-columns: 1fr !important; }
+        .sidebar, .main{ width: 100%; min-width: 0; }
+        .pageContent{ width: 100%; max-width: none; padding: 16px; }
+        .friendsGrid, .logsSplit, .accountGrid{ grid-template-columns: 1fr; }
+      }
+
+      .mobileBack{ display:none; }
+    
+
+.progressEta.waiting::before{
+  content:"";
+  display:inline-block;
+  width:10px;
+  height:10px;
+  margin-right:6px;
+  border:2px solid #cbd5f5;
+  border-top-color:#4f73ff;
+  border-radius:50%;
+  animation:spin 0.9s linear infinite;
+  vertical-align:middle;
+}
+
+@keyframes spin{
+  to{ transform: rotate(360deg); }
+}
+
+    
+.filesToolbar{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin:8px 0 10px;
+}
+.filesSelectAll{display:flex;align-items:center;gap:8px;font-size:13px;color:#4b5563;}
+.btnDanger{background:#ef4444;color:#fff;border:none;border-radius:10px;padding:8px 12px;font-weight:600;cursor:pointer;}
+.btnDanger[disabled]{opacity:.5;cursor:not-allowed;}
+.filesInfo{margin-bottom:10px;}
+.fileRow{cursor:pointer;}
+.fileRow.selected{outline:2px solid #c7d2fe;background:#f5f7ff;}
+.fileRow .fileMeta{flex:1;}
+.fileRow .fileCheckbox{margin-right:10px;}
+
+    </style>
+  </head>
+
+  <body>
+    <!-- AUTH -->
+   <div id="authSection">
+
+  <!-- TOGGLE BAR -->
+  <div id="authToggle">
+    <div id="authToggleIndicator"></div>
+    <button class="authToggleBtn active" data-mode="login">Login</button>
+    <button class="authToggleBtn" data-mode="signup">Sign up</button>
+  </div>
+
+  <!-- LOGIN FORM -->
+  <div id="loginForm" class="authForm">
+    <div class="authField">
+      <label for="authUser">Username</label>
+      <input id="authUser" placeholder="Enter your username" />
+    </div>
+
+    <div class="authField">
+      <label for="authPass">Password</label>
+      <input id="authPass" type="password" placeholder="Enter your password" />
+    </div>
+
+    <div id="authActions">
+      <button id="loginBtn">Log in</button>
+    </div>
+  </div>
+
+  <!-- SIGNUP FORM -->
+  <div id="signupForm" class="authForm hidden">
+    <div class="authRow">
+      <div class="authField">
+        <label for="signupFirst">First name</label>
+        <input id="signupFirst" placeholder="First name" />
+      </div>
+      <div class="authField">
+        <label for="signupLast">Last name</label>
+        <input id="signupLast" placeholder="Last name" />
+      </div>
+    </div>
+
+    <div class="authField">
+      <label for="signupEmail">Email address</label>
+      <input id="signupEmail" placeholder="Enter your email" />
+    </div>
+
+    <div class="authField">
+      <label for="signupUser">User name</label>
+      <input id="signupUser" placeholder="Choose a username" />
+    </div>
+
+    <div class="authField">
+      <label for="signupPass">Password</label>
+      <input id="signupPass" type="password" placeholder="Create a password" />
+    </div>
+
+    <div id="authActions">
+      <button id="signupBtn">Create account</button>
+    </div>
+  </div>
+
+  <div id="authState"></div>
+</div>
+
+
+
+    <!-- APP -->
+    <div id="authedApp">
+      <div class="appShell">
+
+        <!-- LEFT ICON BAR (WhatsApp-style) -->
+          <nav class="iconBar">
+            <button class="iconBtn active" data-page="chat" title="Chats">
+              📁
+            </button>
+            <button class="iconBtn" data-page="friends" title="Friends">
+              👥
+              <span id="friendsRequestBadge" class="iconBadge hidden"></span>
+            </button>
+            <button class="iconBtn" data-page="logs" title="Logs">
+              🧾
+            </button>
+
+            <div style="margin-top:auto"></div>
+
+            <button class="iconBtn" data-page="account" title="Account">
+              👤
+            </button>
+
+          </nav>
+
+        <!-- SIDEBAR -->
+        <aside class="sidebar page-chat-only">
+
+          <div class="sidebarHeader">
+            <div class="sidebarTitle">Contacts</div>
+
+            <!-- purely visual like screenshot -->
+            <button id="openAddFriendBtn" class="sidebarIconBtn" title="Add friend">
+              <!-- user-plus icon -->
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M15 19c0-2.8-2.2-5-5-5s-5 2.2-5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M10 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" stroke="currentColor" stroke-width="2"/>
+                <path d="M19 8v6M16 11h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </button>
+
+          </div>
+
+          <div class="searchWrap">
+            <span class="searchIcon">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M21 21l-4.3-4.3m1.3-5.2a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <!-- Visual only; your app.js doesn't use it -->
+            <input class="search" placeholder="Search contacts..." />
+          </div>
+
+          <!-- Visual contacts list (your real send target is friendSelect below) -->
+         <ul class="contactList" id="friendList">
+          <!-- populated dynamically from friends[] -->
+        </ul>
+
+
+          <!-- Your existing "Friends" logic lives here -->
+          
+        </aside>
+
+        
+          <!-- MAIN -->
+<main class="main">
+  <div class="mainHeader">
+    <div class="headerLeft">
+      <button id="mobileBackBtn" class="mobileBack" aria-label="Back">←</button>
+      <div class="activeUser" id="activeUser" style="display:none;">
+        <div class="headerAvatar" id="headerAvatar">
+          <span id="headerAvatarLetter"></span>
+          <img id="headerAvatarImg" alt="Avatar" />
+        </div>
+        <div class="activeMeta">
+          <div class="activeName" id="activeName"></div>
+          <div class="activeStatus" id="activeStatus">Active now</div>
+        </div>
+      </div>
+    </div>
+    <div class="headerRight">
+      <button id="chatSearchToggle" class="iconCircle" title="Search">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M21 21l-4.3-4.3m1.3-5.2a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <div id="chatSearchBar" class="chatSearchBar hidden">
+    <span class="searchIcon">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M21 21l-4.3-4.3m1.3-5.2a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </span>
+    <input id="chatSearchInput" placeholder="Search files..." />
+  </div>
+
+  <!-- ================= CHAT PAGE ================= -->
+  <section id="page-chat" class="page active">
+
+    <!-- Message stream (this is the MAIN content) -->
+    <div id="messageStream" class="messageStream"></div>
+
+    <!-- Chat input footer -->
+    <div class="chatInput">
+
+      <!-- Selected files tray -->
+      <div id="selectedFilesTray" class="selectedFilesTray hidden"></div>
+
+      <!-- Composer -->
+      <div id="dropZone" class="composerWrap">
+        <input id="filePhotos" type="file" multiple hidden />
+        <input id="fileFiles" type="file" multiple hidden />
+        <input id="folderInput" type="file" webkitdirectory hidden />
+
+        <button id="uploadMenuBtn" class="uploadBtn" title="Attach">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 5v10m0 0l-4-4m4 4l4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M4 19h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+
+        <div id="uploadMenu" class="uploadMenu hidden">
+          <button id="choosePhotos">Choose Photos</button>
+          <button id="chooseFiles">Choose Files</button>
+          <button id="chooseFolder">Choose Folder</button>
+          <label class="packageToggle">
+            <input id="packageToggle" type="checkbox" />
+            <span>Send as package</span>
+          </label>
+        </div>
+
+        <input id="chatNoteInput" class="composerInput" placeholder="Type a message or drag and drop files..." />
+
+        <button id="send" class="sendBtn" disabled>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M3 12l18-9-5 18-4-6-9-3Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ================= FRIENDS PAGE ================= -->
+  <section id="page-friends" class="page hidden">
+    <div class="pageContent friendsPage">
+      <div class="friendsHeader">
+        <h2>Friends</h2>
+        <p>Manage your connections</p>
+      </div>
+
+      <div class="friendsGrid">
+        <div class="friendsCol">
+          <div class="friendsCard">
+            <div class="friendsCardTitle">Add Friends</div>
+            <div class="friendSearch">
+              <span class="searchIcon">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M21 21l-4.3-4.3m1.3-5.2a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+              </span>
+              <input id="friendSearchInput" placeholder="Search for friends..." />
+            </div>
+            <div id="friendSearchResults" class="friendList" style="margin-top:12px;"></div>
+            <div id="friendSearchMsg" class="emptyText" style="margin-top:8px;"></div>
+          </div>
+        </div>
+
+        <div class="friendsCol">
+          <div class="friendsCard">
+            <div class="friendsCardTitle">Pending Requests</div>
+            <div id="pendingRequestsList" class="friendList"></div>
+            <div id="pendingEmpty" class="emptyText">No pending requests</div>
+          </div>
+
+          <div class="friendsCard">
+            <div class="friendsCardTitle">Your Friends (<span id="friendsCount">0</span>)</div>
+            <div id="friendsListFull" class="friendList"></div>
+            <div id="friendsEmpty" class="emptyText">No friends yet</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= LOGS PAGE ================= -->
+  <section id="page-logs" class="page hidden">
+    <div class="pageContent logsPage">
+      <div class="logsHeader">
+        <h2>Developer Logs</h2>
+        <p>System health and activity summary</p>
+      </div>
+
+      <div class="logsStatsGrid">
+        <div class="logsCard">
+          <div class="logsCardTitle">Total Users</div>
+          <div id="statTotalUsers" class="statValue">—</div>
+          <div class="statLabel">Registered accounts</div>
+        </div>
+        <div class="logsCard">
+          <div class="logsCardTitle">Online Users</div>
+          <div id="statOnlineUsers" class="statValue">—</div>
+          <div class="statLabel">Currently connected</div>
+        </div>
+        <div class="logsCard">
+          <div class="logsCardTitle">Stored Files</div>
+          <div id="statStoredFiles" class="statValue">—</div>
+          <div class="statLabel">Files in server storage</div>
+        </div>
+        <div class="logsCard">
+          <div class="logsCardTitle">Storage Used</div>
+          <div id="statStorageUsed" class="statValue">—</div>
+          <div class="statLabel">Total GB on disk</div>
+        </div>
+      </div>
+
+      <div class="logsSplit">
+        <div class="logsCard">
+          <div class="logsCardTitle">Live Log</div>
+          <div id="log" class="logPanel"></div>
+        </div>
+        <div class="logsCard">
+          <div class="logsCardTitle">Largest Files</div>
+
+<div id="filesToolbar" class="filesToolbar">
+  <label class="filesSelectAll">
+    <input type="checkbox" id="filesSelectAll" />
+    Select all
+  </label>
+  <button id="filesDeleteSelected" class="btnDanger" disabled>Delete selected</button>
+</div>
+<div id="filesInfo" class="filesInfo emptyText">Select a file to view details.</div>
+          <div id="filesList" class="filesList"></div>
+          <div id="filesEmpty" class="emptyText">No files found</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="page-account" class="page hidden">
+    <div class="pageContent accountPage">
+      <div class="accountHeader">
+        <h2>Account Settings</h2>
+        <p>Manage your profile and account preferences</p>
+      </div>
+
+      <div class="accountCard">
+        <div class="accountCardTitle">Profile Picture</div>
+        <div class="profileRow">
+          <div class="profileAvatar" id="profileAvatarPreview">
+            <span id="profileAvatarLetter"></span>
+            <img id="profileAvatarImg" alt="Profile" />
+          </div>
+          <div class="profileUpload">
+            <input id="profileImageInput" type="file" accept="image/png,image/jpeg,image/gif" hidden />
+            <div class="profileButtons">
+              <button id="profileImageBtn" class="primary">Upload Photo</button>
+              <button id="profileImageRemoveBtn" class="btnGhost">Remove Photo</button>
+            </div>
+            <div class="profileHint">JPG, PNG or GIF. Max size 5MB.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="accountCard">
+        <div class="accountCardTitle">Personal Information</div>
+        <div class="accountGrid">
+          <div class="accountField">
+            <label>First Name</label>
+            <input id="accountFirstName" placeholder="First name" />
+          </div>
+          <div class="accountField">
+            <label>Last Name</label>
+            <input id="accountLastName" placeholder="Last name" />
+          </div>
+        </div>
+        <div class="accountField">
+          <label>Username</label>
+          <input id="accountUsername" placeholder="@username" disabled />
+        </div>
+      </div>
+
+      <div class="accountCard">
+        <div class="accountCardTitle">Contact Information</div>
+        <div class="accountField">
+          <label>Email Address</label>
+          <input id="accountEmail" placeholder="you@example.com" />
+        </div>
+        <div class="accountField">
+          <label>Phone Number</label>
+          <input id="accountPhone" placeholder="+1 (555) 123-4567" />
+        </div>
+      </div>
+
+      <div class="accountActionsRow">
+        <div></div>
+        <button id="accountSaveBtn" class="primary">Save Changes</button>
+      </div>
+
+      <div class="accountDivider"></div>
+
+      <div class="accountCard">
+        <div class="accountCardTitle">Account Actions</div>
+        <div class="accountActions">
+          <button id="logoutBtn" class="btnGhost">Log Out</button>
+          <button id="deleteAccountBtn" class="btnDanger">Delete Account</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+
+</main>
+
+      </div>
+    </div>
+
+    <select id="friendSelect" hidden></select>
+
+
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="app.js"></script>
+  </body>
+</html>
