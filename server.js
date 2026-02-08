@@ -8,6 +8,8 @@ const net = require("net");
 
 const PORT = process.env.PORT || 8080;
 
+const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 30);
+const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 // username -> ws
 const online = new Map();
@@ -89,6 +91,35 @@ function deleteIntentAndNotify(intent) {
   if (receiver) send(receiver, payload);
   if (sender && sender !== receiver) send(sender, payload);
 }
+
+function cleanupExpiredIntents() {
+  const now = Date.now();
+  try {
+    const files = fs.readdirSync(INTENTS_DIR).filter(f => f.endsWith(".json"));
+    for (const file of files) {
+      let intent;
+      try {
+        intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
+      } catch {
+        continue;
+      }
+      if (!intent?.expiresAt) continue;
+      if (now < intent.expiresAt) continue;
+
+      if (intent.stored && intent.storedFile) {
+        const filePath = path.join(FILES_DIR, intent.storedFile);
+        try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+      }
+
+      deleteIntentAndNotify(intent);
+      try {
+        const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
+        if (fs.existsSync(intentFile)) fs.unlinkSync(intentFile);
+      } catch {}
+    }
+  } catch {}
+}
+
 function countStoredFiles() {
   try {
     return fs.readdirSync(FILES_DIR).length;
@@ -1562,6 +1593,7 @@ if (data.type === "send_intent") {
     fileSize,
     note,
     createdAt: Date.now(),
+    expiresAt: Date.now() + RETENTION_MS,
     status: "pending", // pending | accepted | completed
   };
 
@@ -1580,6 +1612,8 @@ if (data.type === "send_intent") {
     intentId: intent.id,
     to,
     fileName,
+    expiresAt: intent.expiresAt,
+    createdAt: intent.createdAt
   });
 }
 
@@ -1700,6 +1734,9 @@ return send(ws, {
 });
 
 });
+
+cleanupExpiredIntents();
+setInterval(cleanupExpiredIntents, 60 * 60 * 1000);
 
 server.listen(PORT, () => {
   console.log(`✅ Signaling server running on port ${PORT}`);
