@@ -1177,7 +1177,8 @@ if (intentOnDisk?.stored) {
 
     // 🔓 Allow ping before login (keepalive / handshake safety)
 if (data.type === "ping") {
-  return; // silently ignore or keepalive ack not needed
+  send(ws, { type: "pong" });
+  return;
 }
 
 // =========================
