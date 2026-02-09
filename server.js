@@ -778,20 +778,20 @@ if (data.type === "download_ws_request") {
 
   const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
   if (!fs.existsSync(intentFile)) {
-    return send(ws, { type: "error", message: "Intent not found" });
+    return send(ws, { type: "error", message: "Intent not found", intentId });
   }
 
   const intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
   if (intent.to !== ws.username && intent.from !== ws.username) {
-    return send(ws, { type: "error", message: "Not authorized for this intent" });
+    return send(ws, { type: "error", message: "Not authorized for this intent", intentId });
   }
   if (!intent.stored || !intent.storedFile) {
-    return send(ws, { type: "error", message: "File not stored on server" });
+    return send(ws, { type: "error", message: "File not stored on server", intentId });
   }
 
   const filePath = path.join(FILES_DIR, intent.storedFile);
   if (!fs.existsSync(filePath)) {
-    return send(ws, { type: "error", message: "Stored file missing" });
+    return send(ws, { type: "error", message: "Stored file missing", intentId });
   }
 
   // Tell browser what's coming
@@ -1598,7 +1598,26 @@ if (data.type === "upload_end") {
     try { t.writeStream?.destroy(); } catch {}
     activeTransfers.delete(intentId);
     ws.currentUploadIntentId = null;
-    return send(ws, { type: "error", message: "Upload incomplete (size mismatch)" });
+    const intent = loadIntent(intentId);
+    if (intent?.storedFile) {
+      try {
+        const filePath = path.join(FILES_DIR, intent.storedFile);
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch {}
+    }
+    if (intent) {
+      const receiver = online.get(intent.to);
+      const sender = online.get(intent.from);
+      const payload = {
+        type: "upload_failed",
+        intentId,
+        message: "Upload incomplete (size mismatch)"
+      };
+      if (receiver) send(receiver, payload);
+      if (sender) send(sender, payload);
+      deleteIntentAndNotify(intent);
+    }
+    return send(ws, { type: "error", message: "Upload incomplete (size mismatch)", intentId });
   }
 
   // LIVE MODE: close TCP and HARD RESET upload state
