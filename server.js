@@ -20,7 +20,87 @@ const inboxes = new Map();
 // intentId -> { tcp: net.Socket, bytesExpected, bytesSent, senderWs, receiverWs }
 const activeTransfers = new Map();
 
-const server = http.createServer();
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition");
+}
+
+function generateDownloadToken() {
+  return randomUUID() + randomUUID();
+}
+
+const server = http.createServer((req, res) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+
+    if (req.method === "OPTIONS") {
+      setCors(res);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (url.pathname === "/" || url.pathname === "/health") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+
+    if (url.pathname.startsWith("/download/")) {
+      setCors(res);
+      const intentId = url.pathname.split("/")[2] || "";
+      const token = url.searchParams.get("token") || "";
+      if (!intentId || !token) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Missing intentId or token");
+        return;
+      }
+
+      const intent = loadIntent(intentId);
+      if (!intent || !intent.stored || !intent.storedFile) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("File not found");
+        return;
+      }
+
+      if (intent.downloadToken !== token) {
+        res.writeHead(403, { "content-type": "text/plain" });
+        res.end("Forbidden");
+        return;
+      }
+
+      const filePath = path.join(FILES_DIR, intent.storedFile);
+      if (!fs.existsSync(filePath)) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("File missing");
+        return;
+      }
+
+      const stat = fs.statSync(filePath);
+      const safeName = safeBasename(intent.fileName || "file");
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-length": stat.size,
+        "content-disposition": `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
+      });
+
+      const rs = fs.createReadStream(filePath);
+      rs.on("error", () => {
+        try { res.end(); } catch {}
+      });
+      rs.pipe(res);
+      return;
+    }
+
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("Not found");
+  } catch {
+    res.writeHead(500, { "content-type": "text/plain" });
+    res.end("Server error");
+  }
+});
 const wss = new WebSocket.Server({
   server,
   perMessageDeflate: false,
@@ -200,7 +280,12 @@ function loadIntent(intentId) {
   try {
     const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
     if (!fs.existsSync(intentFile)) return null;
-    return JSON.parse(fs.readFileSync(intentFile, "utf8"));
+    const intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+    if (intent && !intent.downloadToken) {
+      intent.downloadToken = generateDownloadToken();
+      saveIntent(intent);
+    }
+    return intent;
   } catch {
     return null;
   }
@@ -218,6 +303,10 @@ function loadIntentsForUser(username) {
       fs.readFileSync(path.join(INTENTS_DIR, file), "utf8")
     );
     if (intent.to === username) {
+  if (!intent.downloadToken) {
+    intent.downloadToken = generateDownloadToken();
+    saveIntent(intent);
+  }
   // Only show if:
   // - stored file is ready, OR
   // - it's pending/accepted (still valid intent)
@@ -1734,7 +1823,8 @@ if (data.type === "send_intent") {
   }
 
   if (to === ws.username) {
-    return send(ws, { type: "error", message: "Cannot send files to yourself" });
+    // allow self-send (personal storage)
+    // continue
   }
 
   // 🔒 Validate recipient exists
@@ -1760,7 +1850,8 @@ if (data.type === "send_intent") {
     note,
     createdAt: Date.now(),
     expiresAt: Date.now() + RETENTION_MS,
-    status: "pending", // pending | accepted | completed
+    status: "pending", // pending | uploading | stored | completed
+    downloadToken: generateDownloadToken()
   };
 
   if (!inboxes.has(to)) inboxes.set(to, []);
