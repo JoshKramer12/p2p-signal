@@ -314,6 +314,22 @@ function loadIntentsForUser(username) {
   intents.push(intent);
 }
 
+function findIntentByClientId(sender, clientIntentId) {
+  if (!clientIntentId) return null;
+  try {
+    const files = fs.readdirSync(INTENTS_DIR).filter(f => f.endsWith(".json"));
+    for (const file of files) {
+      try {
+        const intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
+        if (intent?.from === sender && intent?.clientIntentId === clientIntentId) {
+          return intent;
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
   }
   return intents;
 }
@@ -1817,6 +1833,7 @@ if (data.type === "send_intent") {
   const fileName = String(data.fileName || "").trim();
   const fileSize = Number(data.fileSize || 0);
   const note = typeof data.note === "string" ? data.note.trim().slice(0, 500) : "";
+  const clientIntentId = String(data.clientIntentId || "").trim();
 
   if (!to || !fileName || !fileSize) {
     return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
@@ -1840,6 +1857,29 @@ if (data.type === "send_intent") {
     return send(ws, { type: "error", message: "Recipient is not your friend" });
   }
 
+  // ✅ De-dup if client retries with same intent id
+  if (clientIntentId) {
+    const existing = findIntentByClientId(ws.username, clientIntentId);
+    if (existing) {
+      const receiverWs = online.get(existing.to);
+      if (receiverWs) {
+        send(receiverWs, { type: "incoming_intent", intent: existing });
+        try { send(receiverWs, { type: "inbox", items: loadIntentsForUser(existing.to) }); } catch {}
+      }
+      return send(ws, {
+        type: "intent_ok",
+        intentId: existing.id,
+        clientIntentId,
+        to: existing.to,
+        fileName: existing.fileName,
+        receiverOnline: Boolean(receiverWs),
+        receiverClient: receiverWs?.client || null,
+        expiresAt: existing.expiresAt,
+        createdAt: existing.createdAt
+      });
+    }
+  }
+
   // ✅ Create + store intent even if receiver is offline
   const intent = {
     id: randomUUID(),
@@ -1848,6 +1888,7 @@ if (data.type === "send_intent") {
     fileName,
     fileSize,
     note,
+    clientIntentId: clientIntentId || null,
     createdAt: Date.now(),
     expiresAt: Date.now() + RETENTION_MS,
     status: "pending", // pending | uploading | stored | completed
@@ -1870,6 +1911,7 @@ if (data.type === "send_intent") {
   return send(ws, {
     type: "intent_ok",
     intentId: intent.id,
+    clientIntentId: clientIntentId || null,
     to,
     fileName,
     receiverOnline: Boolean(receiverWs),
