@@ -196,6 +196,16 @@ function saveIntent(intent) {
   fs.writeFileSync(file, JSON.stringify(intent, null, 2));
 }
 
+function loadIntent(intentId) {
+  try {
+    const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+    if (!fs.existsSync(intentFile)) return null;
+    return JSON.parse(fs.readFileSync(intentFile, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
 function generateSessionToken() {
   return randomUUID() + randomUUID();
 }
@@ -557,6 +567,7 @@ if (data.type === "auth_signup") {
 if (data.type === "auth_resume") {
   const username = String(data.username || "").trim();
   const token = String(data.sessionToken || "");
+  const client = String(data.client || "unknown");
 
   const user = loadUser(username);
   if (!user || !user.sessionTokens?.includes(token)) {
@@ -572,6 +583,7 @@ if (!user.friends.includes(user.username)) {
 
 
   ws.username = username;
+  ws.client = client;
   online.set(username, ws);
 
   send(ws, {
@@ -579,6 +591,7 @@ if (!user.friends.includes(user.username)) {
     username,
     sessionToken: token,
     resumed: true,
+    client: ws.client,
   });
 
   const pending = loadIntentsForUser(username);
@@ -1058,6 +1071,80 @@ if (intentOnDisk?.stored) {
     // 🔓 Allow ping before login (keepalive / handshake safety)
 if (data.type === "ping") {
   return; // silently ignore or keepalive ack not needed
+}
+
+// =========================
+// 🌐 WebRTC Signaling (P2P)
+// =========================
+if (data.type === "webrtc_offer") {
+  const to = String(data.to || "").trim();
+  const intentId = String(data.intentId || "").trim();
+  if (!to || !intentId || !data.sdp) {
+    return send(ws, { type: "error", message: "Missing webrtc_offer fields" });
+  }
+  const intent = loadIntent(intentId);
+  if (!intent || intent.from !== ws.username || intent.to !== to) {
+    return send(ws, { type: "error", message: "Invalid intent for WebRTC" });
+  }
+  const receiver = online.get(to);
+  if (!receiver) {
+    return send(ws, { type: "webrtc_unavailable", intentId });
+  }
+  return send(receiver, {
+    type: "webrtc_offer",
+    from: ws.username,
+    intentId,
+    sdp: data.sdp
+  });
+}
+
+if (data.type === "webrtc_answer") {
+  const to = String(data.to || "").trim();
+  const intentId = String(data.intentId || "").trim();
+  if (!to || !intentId || !data.sdp) {
+    return send(ws, { type: "error", message: "Missing webrtc_answer fields" });
+  }
+  const intent = loadIntent(intentId);
+  if (!intent || intent.to !== ws.username || intent.from !== to) {
+    return send(ws, { type: "error", message: "Invalid intent for WebRTC" });
+  }
+  const sender = online.get(to);
+  if (!sender) return;
+  return send(sender, {
+    type: "webrtc_answer",
+    from: ws.username,
+    intentId,
+    sdp: data.sdp
+  });
+}
+
+if (data.type === "webrtc_ice") {
+  const to = String(data.to || "").trim();
+  const intentId = String(data.intentId || "").trim();
+  if (!to || !intentId || !data.candidate) {
+    return send(ws, { type: "error", message: "Missing webrtc_ice fields" });
+  }
+  const intent = loadIntent(intentId);
+  if (!intent || (intent.from !== ws.username && intent.to !== ws.username)) {
+    return send(ws, { type: "error", message: "Invalid intent for WebRTC" });
+  }
+  const peer = online.get(to);
+  if (!peer) return;
+  return send(peer, {
+    type: "webrtc_ice",
+    from: ws.username,
+    intentId,
+    candidate: data.candidate
+  });
+}
+
+if (data.type === "webrtc_cancel") {
+  const to = String(data.to || "").trim();
+  const intentId = String(data.intentId || "").trim();
+  if (!to || !intentId) return;
+  const peer = online.get(to);
+  if (!peer) return;
+  return send(peer, { type: "webrtc_cancel", intentId });
 }
 
 
@@ -1661,6 +1748,8 @@ if (data.type === "send_intent") {
     intentId: intent.id,
     to,
     fileName,
+    receiverOnline: Boolean(receiverWs),
+    receiverClient: receiverWs?.client || null,
     expiresAt: intent.expiresAt,
     createdAt: intent.createdAt
   });
