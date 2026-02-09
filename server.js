@@ -1990,6 +1990,24 @@ return send(ws, {
     if (t) {
       try { t.tcp?.destroy(); } catch {}
       try { t.writeStream?.destroy(); } catch {}
+      if (t.mode === "offline" && t.filePath) {
+        try { if (fs.existsSync(t.filePath)) fs.unlinkSync(t.filePath); } catch {}
+      }
+      try {
+        const intent = t.intent || loadIntent(ws.currentUploadIntentId);
+        if (intent) {
+          const receiver = online.get(intent.to);
+          const sender = online.get(intent.from);
+          const payload = {
+            type: "upload_failed",
+            intentId: ws.currentUploadIntentId,
+            message: "Upload interrupted (connection closed)"
+          };
+          if (receiver) send(receiver, payload);
+          if (sender) send(sender, payload);
+          deleteIntentAndNotify(intent);
+        }
+      } catch {}
       activeTransfers.delete(ws.currentUploadIntentId);
     }
   }
