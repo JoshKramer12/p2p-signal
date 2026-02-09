@@ -1663,6 +1663,9 @@ if (receiver) {
     type: "incoming_file",
     intent
   });
+  try {
+    send(receiver, { type: "inbox", items: loadIntentsForUser(intent.to) });
+  } catch {}
 
   // ✅ FIX 2: if recipient is iOS, immediately trigger TCP download
   if (receiver.client === "ios") {
@@ -1759,6 +1762,9 @@ if (data.type === "send_intent") {
   const receiverWs = online.get(to);
   if (receiverWs) {
     send(receiverWs, { type: "incoming_intent", intent });
+    try {
+      send(receiverWs, { type: "inbox", items: loadIntentsForUser(to) });
+    } catch {}
   }
 
   // ✅ Always acknowledge sender
