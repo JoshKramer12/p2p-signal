@@ -1294,6 +1294,14 @@ if (data.type === "stats") {
   });
 }
 
+// =========================
+// 📬 INBOX SYNC
+// =========================
+if (data.type === "inbox_request") {
+  const items = loadIntentsForUser(ws.username);
+  return send(ws, { type: "inbox", items });
+}
+
 
 // =========================
 // 👥 FRIENDS: REMOVE
