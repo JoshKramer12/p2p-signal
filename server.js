@@ -299,19 +299,25 @@ function generateSessionToken() {
 function loadIntentsForUser(username) {
   const intents = [];
   for (const file of fs.readdirSync(INTENTS_DIR)) {
-    const intent = JSON.parse(
-      fs.readFileSync(path.join(INTENTS_DIR, file), "utf8")
-    );
+    let intent;
+    try {
+      intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
+    } catch {
+      continue;
+    }
     if (intent.to === username) {
-  if (!intent.downloadToken) {
-    intent.downloadToken = generateDownloadToken();
-    saveIntent(intent);
+      if (!intent.downloadToken) {
+        intent.downloadToken = generateDownloadToken();
+        saveIntent(intent);
+      }
+      // Only show if:
+      // - stored file is ready, OR
+      // - it's pending/accepted (still valid intent)
+      // (uploading should show, but NOT as downloadable unless stored=true)
+      intents.push(intent);
+    }
   }
-  // Only show if:
-  // - stored file is ready, OR
-  // - it's pending/accepted (still valid intent)
-  // (uploading should show, but NOT as downloadable unless stored=true)
-  intents.push(intent);
+  return intents;
 }
 
 function findIntentByClientId(sender, clientIntentId) {
@@ -328,10 +334,6 @@ function findIntentByClientId(sender, clientIntentId) {
     }
   } catch {}
   return null;
-}
-
-  }
-  return intents;
 }
 
 
