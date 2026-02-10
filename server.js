@@ -528,9 +528,11 @@ if (!ok) {
 
       maybeSendUploadProgress(t);
 
-      if (t.bytesSent % (1024 * 1024) < incomingLen) {
-        console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
-      }
+    if (!t.nextLogBytes) t.nextLogBytes = 64 * 1024 * 1024;
+    if (t.bytesSent >= t.nextLogBytes) {
+      console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
+      t.nextLogBytes += 64 * 1024 * 1024;
+    }
       return;
     }
 
@@ -550,8 +552,10 @@ if (!ok) {
 
     maybeSendUploadProgress(t);
 
-    if (t.bytesSent % (1024 * 1024) < incomingLen) {
+    if (!t.nextLogBytes) t.nextLogBytes = 64 * 1024 * 1024;
+    if (t.bytesSent >= t.nextLogBytes) {
       console.log(`➡️ Forwarded ${t.bytesSent}/${t.bytesExpected} bytes`);
+      t.nextLogBytes += 64 * 1024 * 1024;
     }
 
     return;
@@ -1624,9 +1628,9 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
 
     // Create write stream for raw bytes
     const writeStream = fs.createWriteStream(filePath, {
-  flags: "w",
-  highWaterMark: 4 * 1024 * 1024, // 4 MB buffer
-});
+      flags: "w",
+      highWaterMark: 16 * 1024 * 1024, // 16 MB buffer for higher throughput
+    });
 
 
     writeStream.on("error", (err) => {
