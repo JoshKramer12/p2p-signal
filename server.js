@@ -357,9 +357,9 @@ function maybeSendUploadProgress(t) {
   if (!t.lastProgressBytes) t.lastProgressBytes = 0;
 
   const shouldSend =
-    now - t.lastProgressTs > 300 ||
+    now - t.lastProgressTs > 1000 ||
     t.bytesSent === t.bytesExpected ||
-    t.bytesSent - t.lastProgressBytes > 8 * 1024 * 1024;
+    t.bytesSent - t.lastProgressBytes > 32 * 1024 * 1024;
 
   if (!shouldSend) return;
 
@@ -1629,7 +1629,7 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
     // Create write stream for raw bytes
     const writeStream = fs.createWriteStream(filePath, {
       flags: "w",
-      highWaterMark: 16 * 1024 * 1024, // 16 MB buffer for higher throughput
+      highWaterMark: 128 * 1024 * 1024, // 128 MB buffer for higher throughput
     });
 
 
