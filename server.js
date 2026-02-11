@@ -641,6 +641,10 @@ if (data.type === "delete_account") {
 if (data.type === "auth_signup") {
   const username = String(data.username || "").trim();
   const password = String(data.password || "");
+  const signupName = String(data.name || "").trim();
+  const signupFirst = String(data.firstName || "").trim();
+  const signupLast = String(data.lastName || "").trim();
+  const signupEmail = String(data.email || "").trim();
 
   if (!username) return send(ws, { type: "error", message: "Missing username" });
   if (!password || password.length < 6) {
@@ -657,6 +661,19 @@ if (data.type === "auth_signup") {
 
   const passwordHash = bcrypt.hashSync(password, 12);
 
+  let firstName = signupFirst;
+  let lastName = signupLast;
+  if ((!firstName || !lastName) && signupName) {
+    const parts = signupName.split(/\s+/).filter(Boolean);
+    if (!firstName && parts.length) firstName = parts[0];
+    if (!lastName && parts.length > 1) lastName = parts.slice(1).join(" ");
+  }
+  const profile = {};
+  if (firstName) profile.firstName = firstName;
+  if (lastName) profile.lastName = lastName;
+  if (signupEmail) profile.email = signupEmail;
+  if (signupName) profile.name = signupName;
+
   const user = {
   username,
   passwordHash,
@@ -664,6 +681,7 @@ if (data.type === "auth_signup") {
   incomingRequests: [],
   outgoingRequests: [],
   declinedRequests: [],
+  profile,
   createdAt: Date.now(),
   sessionTokens: [],
 };
@@ -1534,6 +1552,8 @@ if (data.type === "update_profile") {
   if (typeof updates.lastName === "string") profile.lastName = updates.lastName;
   if (typeof updates.email === "string") profile.email = updates.email;
   if (typeof updates.phone === "string") profile.phone = updates.phone;
+  if (typeof updates.phoneCountryCode === "string") profile.phoneCountryCode = updates.phoneCountryCode;
+  if (typeof updates.phoneLocal === "string") profile.phoneLocal = updates.phoneLocal;
   if (typeof updates.avatarDataUrl === "string") profile.avatarDataUrl = updates.avatarDataUrl;
 
   user.profile = profile;
