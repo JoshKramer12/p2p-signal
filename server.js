@@ -338,6 +338,19 @@ function findIntentByClientId(sender, clientIntentId) {
   return null;
 }
 
+function normalizeIntentIdList(values, max = 300) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(values) ? values : []) {
+    const id = String(raw || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
 
 
 
@@ -1499,6 +1512,47 @@ if (data.type === "inbox_request") {
   return send(ws, { type: "inbox", items });
 }
 
+// =========================
+// 👁️ READ RECEIPTS
+// =========================
+if (data.type === "read_receipt") {
+  const friend = String(data.friend || "").trim();
+  const intentIds = normalizeIntentIdList(data.intentIds);
+  if (!friend || !intentIds.length) return;
+
+  const now = Date.now();
+  const updates = [];
+
+  for (const intentId of intentIds) {
+    const intent = loadIntent(intentId);
+    if (!intent) continue;
+    if (intent.to !== ws.username) continue;
+    if (intent.from !== friend) continue;
+    if (!intent.stored) continue;
+
+    const priorReadAt = Number(intent.readByRecipientAt || 0);
+    if (!priorReadAt || priorReadAt < now) {
+      intent.readByRecipientAt = now;
+      saveIntent(intent);
+    }
+    updates.push({
+      intentId,
+      readAt: intent.readByRecipientAt || now
+    });
+  }
+
+  if (!updates.length) return;
+  const senderWs = online.get(friend);
+  if (senderWs) {
+    send(senderWs, {
+      type: "read_receipt",
+      from: ws.username,
+      intents: updates
+    });
+  }
+  return;
+}
+
 
 // =========================
 // 👥 FRIENDS: REMOVE
@@ -1971,7 +2025,8 @@ if (data.type === "send_intent") {
     createdAt: Date.now(),
     expiresAt: Date.now() + RETENTION_MS,
     status: "pending", // pending | uploading | stored | completed
-    downloadToken: generateDownloadToken()
+    downloadToken: generateDownloadToken(),
+    readByRecipientAt: null
   };
 
   if (!inboxes.has(to)) inboxes.set(to, []);
