@@ -10,6 +10,8 @@ const PORT = process.env.PORT || 8080;
 
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 30);
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const TRANSFER_IDLE_TIMEOUT_MS = Number(process.env.TRANSFER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
+const TRANSFER_SWEEP_INTERVAL_MS = Number(process.env.TRANSFER_SWEEP_INTERVAL_MS || 15 * 1000);
 
 // username -> ws
 const online = new Map();
@@ -377,6 +379,68 @@ function maybeSendUploadProgress(t) {
   });
 }
 
+function pauseWsInbound(ws) {
+  const sock = ws?._socket;
+  if (sock && typeof sock.pause === "function") {
+    try { sock.pause(); } catch {}
+  }
+}
+
+function resumeWsInbound(ws) {
+  const sock = ws?._socket;
+  if (sock && typeof sock.resume === "function") {
+    try { sock.resume(); } catch {}
+  }
+}
+
+function notifyUploadFailed(intent, intentId, message) {
+  const payload = { type: "upload_failed", intentId, message };
+  const sender = intent?.from ? online.get(intent.from) : null;
+  const receiver = intent?.to ? online.get(intent.to) : null;
+  if (sender) send(sender, payload);
+  if (receiver && receiver !== sender) send(receiver, payload);
+}
+
+function failActiveTransfer(intentId, message, options = {}) {
+  if (!intentId) return null;
+  const t = activeTransfers.get(intentId);
+  const intent = t?.intent || loadIntent(intentId);
+
+  try { t?.tcp?.destroy(); } catch {}
+  try { t?.writeStream?.destroy(); } catch {}
+  if (t?.mode === "offline" && t?.filePath) {
+    try { if (fs.existsSync(t.filePath)) fs.unlinkSync(t.filePath); } catch {}
+  }
+
+  if (t?.senderWs?.currentUploadIntentId === intentId) {
+    t.senderWs.currentUploadIntentId = null;
+  }
+
+  activeTransfers.delete(intentId);
+
+  if (intent && options.notify !== false) {
+    notifyUploadFailed(intent, intentId, message);
+  }
+  if (intent && options.deleteIntent !== false) {
+    deleteIntentAndNotify(intent);
+  }
+  return intent || null;
+}
+
+function cleanupStalledTransfers() {
+  const now = Date.now();
+  for (const [intentId, t] of activeTransfers.entries()) {
+    if (!intentId || !t) continue;
+    const baseTimeout = Number.isFinite(TRANSFER_IDLE_TIMEOUT_MS) ? TRANSFER_IDLE_TIMEOUT_MS : 180000;
+    const timeoutMs = (t.mode === "live" && !t.tcp) ? Math.max(baseTimeout, 5 * 60 * 1000) : baseTimeout;
+    const lastTs = Number(t.lastActivityAt || t.startedAt || 0);
+    if (!lastTs) continue;
+    if (now - lastTs <= timeoutMs) continue;
+    console.warn(`⏱️ Transfer timeout: ${intentId} idle for ${now - lastTs}ms`);
+    failActiveTransfer(intentId, "Upload timed out due to inactivity");
+  }
+}
+
 
 
 function getPublicEndpoint(req) {
@@ -504,9 +568,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
     const incomingLen = msg.length;
     if (t.bytesSent + incomingLen > t.bytesExpected) {
       console.log("❌ Too many bytes for intent", intentId);
-      try { t.tcp?.destroy(); } catch {}
-      try { t.writeStream?.destroy(); } catch {}
-      activeTransfers.delete(intentId);
+      failActiveTransfer(intentId, "Upload exceeded expected size");
       ws.currentUploadIntentId = null;
       return send(ws, { type: "error", message: "Upload exceeded expected size" });
     }
@@ -515,24 +577,26 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
     if (t.mode === "offline") {
       if (!t.writeStream) {
         console.log("❌ Offline transfer missing writeStream", intentId);
+        failActiveTransfer(intentId, "Server not ready for upload");
         return send(ws, { type: "error", message: "Server not ready for offline upload" });
       }
 
       const ok = t.writeStream.write(msg);
-t.bytesSent += incomingLen;
+      t.bytesSent += incomingLen;
+      t.lastActivityAt = Date.now();
 
-if (!ok) {
-  ws.pause();
-  t.writeStream.once("drain", () => ws.resume());
-}
+      if (!ok) {
+        pauseWsInbound(ws);
+        t.writeStream.once("drain", () => resumeWsInbound(ws));
+      }
 
       maybeSendUploadProgress(t);
 
-    if (!t.nextLogBytes) t.nextLogBytes = 64 * 1024 * 1024;
-    if (t.bytesSent >= t.nextLogBytes) {
-      console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
-      t.nextLogBytes += 64 * 1024 * 1024;
-    }
+      if (!t.nextLogBytes) t.nextLogBytes = 64 * 1024 * 1024;
+      if (t.bytesSent >= t.nextLogBytes) {
+        console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
+        t.nextLogBytes += 64 * 1024 * 1024;
+      }
       return;
     }
 
@@ -543,12 +607,13 @@ if (!ok) {
     }
 
     const ok = t.tcp.write(msg);
-t.bytesSent += incomingLen;
+    t.bytesSent += incomingLen;
+    t.lastActivityAt = Date.now();
 
-if (!ok) {
-  ws.pause();
-  t.tcp.once("drain", () => ws.resume());
-}
+    if (!ok) {
+      pauseWsInbound(ws);
+      t.tcp.once("drain", () => resumeWsInbound(ws));
+    }
 
     maybeSendUploadProgress(t);
 
@@ -1166,6 +1231,7 @@ if (intentOnDisk?.stored) {
   const tcp = net.createConnection(
     { host, port: ws.tcpPort },
     () => {
+      t.lastActivityAt = Date.now();
       tcp.write(JSON.stringify({
         name: intent.fileName,
         size: intent.fileSize
@@ -1179,10 +1245,11 @@ if (intentOnDisk?.stored) {
   );
 
   t.tcp = tcp;
+  t.lastActivityAt = Date.now();
 
   tcp.on("error", err => {
     console.error("❌ TCP error:", err);
-    activeTransfers.delete(intent.id);
+    failActiveTransfer(intent.id, "Receiver connection failed");
   });
 
   // 🔥 NOW start transfer (correct timing)
@@ -1655,20 +1722,21 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
 
     writeStream.on("error", (err) => {
       console.error("❌ File writeStream error:", err);
-      activeTransfers.delete(intentId);
+      failActiveTransfer(intentId, "Server failed writing file");
       ws.currentUploadIntentId = null;
-      try { fs.unlinkSync(filePath); } catch {}
-      try { send(ws, { type: "error", message: "Server failed writing file" }); } catch {}
     });
 
     activeTransfers.set(intentId, {
       mode: "offline",
       tcp: null,
+      senderWs: ws,
       writeStream,
       filePath,
       bytesExpected: size,
       bytesSent: 0,
       ended: false,
+      startedAt: Date.now(),
+      lastActivityAt: Date.now(),
       intent, // ✅ ADD THIS
     });
 
@@ -1705,9 +1773,12 @@ saveIntent(intent);
 activeTransfers.set(intentId, {
   mode: "live",
   tcp: null,
+  senderWs: ws,
   bytesExpected: size,
   bytesSent: 0,
   ended: false,
+  startedAt: Date.now(),
+  lastActivityAt: Date.now(),
   intent, // ✅ ADD THIS
 });
 
@@ -1734,29 +1805,8 @@ if (data.type === "upload_end") {
 
   // Reject incomplete uploads (prevents “downloaded but broken” files)
   if (t.bytesSent !== t.bytesExpected) {
-    try { t.tcp?.destroy(); } catch {}
-    try { t.writeStream?.destroy(); } catch {}
-    activeTransfers.delete(intentId);
+    failActiveTransfer(intentId, "Upload incomplete (size mismatch)");
     ws.currentUploadIntentId = null;
-    const intent = loadIntent(intentId);
-    if (intent?.storedFile) {
-      try {
-        const filePath = path.join(FILES_DIR, intent.storedFile);
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      } catch {}
-    }
-    if (intent) {
-      const receiver = online.get(intent.to);
-      const sender = online.get(intent.from);
-      const payload = {
-        type: "upload_failed",
-        intentId,
-        message: "Upload incomplete (size mismatch)"
-      };
-      if (receiver) send(receiver, payload);
-      if (sender) send(sender, payload);
-      deleteIntentAndNotify(intent);
-    }
     return send(ws, { type: "error", message: "Upload incomplete (size mismatch)", intentId });
   }
 
@@ -1790,7 +1840,9 @@ intent.storedBytes = intent.fileSize;
 intent.status = "stored";
 saveIntent(intent);
 
-    } catch {
+    } catch (err) {
+      console.error("❌ Failed to finalize intent after upload:", err);
+      send(ws, { type: "upload_failed", intentId, message: "Server failed finalizing upload" });
       return;
     }
     //test
@@ -2055,30 +2107,8 @@ return send(ws, {
   }
 
   if (ws.currentUploadIntentId) {
-    const t = activeTransfers.get(ws.currentUploadIntentId);
-    if (t) {
-      try { t.tcp?.destroy(); } catch {}
-      try { t.writeStream?.destroy(); } catch {}
-      if (t.mode === "offline" && t.filePath) {
-        try { if (fs.existsSync(t.filePath)) fs.unlinkSync(t.filePath); } catch {}
-      }
-      try {
-        const intent = t.intent || loadIntent(ws.currentUploadIntentId);
-        if (intent) {
-          const receiver = online.get(intent.to);
-          const sender = online.get(intent.from);
-          const payload = {
-            type: "upload_failed",
-            intentId: ws.currentUploadIntentId,
-            message: "Upload interrupted (connection closed)"
-          };
-          if (receiver) send(receiver, payload);
-          if (sender) send(sender, payload);
-          deleteIntentAndNotify(intent);
-        }
-      } catch {}
-      activeTransfers.delete(ws.currentUploadIntentId);
-    }
+    failActiveTransfer(ws.currentUploadIntentId, "Upload interrupted (connection closed)");
+    ws.currentUploadIntentId = null;
   }
 });
 
@@ -2086,6 +2116,7 @@ return send(ws, {
 
 cleanupExpiredIntents();
 setInterval(cleanupExpiredIntents, 60 * 60 * 1000);
+setInterval(cleanupStalledTransfers, TRANSFER_SWEEP_INTERVAL_MS);
 
 server.listen(PORT, () => {
   console.log(`✅ Signaling server running on port ${PORT}`);
