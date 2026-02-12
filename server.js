@@ -1716,7 +1716,7 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
     // Create write stream for raw bytes
     const writeStream = fs.createWriteStream(filePath, {
       flags: "w",
-      highWaterMark: 128 * 1024 * 1024, // 128 MB buffer for higher throughput
+      highWaterMark: 8 * 1024 * 1024, // smaller buffer = steadier backpressure
     });
 
 
