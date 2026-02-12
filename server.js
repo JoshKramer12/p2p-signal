@@ -1963,13 +1963,26 @@ if (receiver) {
 // 3a) send intent only (NO transport)
 if (data.type === "send_intent") {
   const to = String(data.to || "").trim();
-  const fileName = String(data.fileName || "").trim();
+  const rawFileName = String(data.fileName || "").trim();
+  const fileName = rawFileName ? safeBasename(rawFileName) : "";
   const fileSize = Number(data.fileSize || 0);
   const note = typeof data.note === "string" ? data.note.trim().slice(0, 500) : "";
+  const text = typeof data.text === "string" ? data.text.trim().slice(0, 5000) : "";
+  const isTextOnly = Boolean(data.isTextOnly) || (!!text && !fileName && !fileSize);
   const clientIntentId = String(data.clientIntentId || "").trim();
 
-  if (!to || !fileName || !fileSize) {
-    return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
+  if (!to) {
+    return send(ws, { type: "error", message: "Missing recipient" });
+  }
+
+  if (isTextOnly) {
+    if (!text) {
+      return send(ws, { type: "error", message: "Message cannot be empty" });
+    }
+  } else {
+    if (!fileName || !Number.isFinite(fileSize) || fileSize <= 0) {
+      return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
+    }
   }
 
   if (to === ws.username) {
@@ -1996,7 +2009,11 @@ if (data.type === "send_intent") {
     if (existing) {
       const receiverWs = online.get(existing.to);
       if (receiverWs) {
-        send(receiverWs, { type: "incoming_intent", intent: existing });
+        if (existing.isTextOnly || existing.messageType === "text") {
+          send(receiverWs, { type: "incoming_file", intent: existing });
+        } else {
+          send(receiverWs, { type: "incoming_intent", intent: existing });
+        }
         try { send(receiverWs, { type: "inbox", items: loadIntentsForUser(existing.to) }); } catch {}
       }
       return send(ws, {
@@ -2004,30 +2021,43 @@ if (data.type === "send_intent") {
         intentId: existing.id,
         clientIntentId,
         to: existing.to,
-        fileName: existing.fileName,
+        fileName: existing.fileName || "",
         receiverOnline: Boolean(receiverWs),
         receiverClient: receiverWs?.client || null,
         expiresAt: existing.expiresAt,
-        createdAt: existing.createdAt
+        createdAt: existing.createdAt,
+        isTextOnly: Boolean(existing.isTextOnly || existing.messageType === "text"),
+        text: existing.text || ""
       });
     }
   }
 
   // ✅ Create + store intent even if receiver is offline
+  const now = Date.now();
   const intent = {
     id: randomUUID(),
     from: ws.username,
     to,
-    fileName,
-    fileSize,
-    note,
+    fileName: isTextOnly ? "" : fileName,
+    fileSize: isTextOnly ? 0 : fileSize,
+    note: isTextOnly ? "" : note,
+    text: isTextOnly ? text : "",
+    isTextOnly,
+    messageType: isTextOnly ? "text" : "file",
     clientIntentId: clientIntentId || null,
-    createdAt: Date.now(),
-    expiresAt: Date.now() + RETENTION_MS,
-    status: "pending", // pending | uploading | stored | completed
-    downloadToken: generateDownloadToken(),
+    createdAt: now,
+    expiresAt: now + RETENTION_MS,
+    status: isTextOnly ? "completed" : "pending", // pending | uploading | stored | completed
+    downloadToken: isTextOnly ? null : generateDownloadToken(),
     readByRecipientAt: null
   };
+  if (isTextOnly) {
+    intent.stored = true;
+    intent.storedFile = null;
+    intent.storedBytes = 0;
+    intent.uploadedAt = now;
+    intent.completedAt = now;
+  }
 
   if (!inboxes.has(to)) inboxes.set(to, []);
   inboxes.get(to).push(intent);
@@ -2035,7 +2065,11 @@ if (data.type === "send_intent") {
 
   const receiverWs = online.get(to);
   if (receiverWs) {
-    send(receiverWs, { type: "incoming_intent", intent });
+    if (isTextOnly) {
+      send(receiverWs, { type: "incoming_file", intent });
+    } else {
+      send(receiverWs, { type: "incoming_intent", intent });
+    }
     try {
       send(receiverWs, { type: "inbox", items: loadIntentsForUser(to) });
     } catch {}
@@ -2047,11 +2081,13 @@ if (data.type === "send_intent") {
     intentId: intent.id,
     clientIntentId: clientIntentId || null,
     to,
-    fileName,
+    fileName: intent.fileName || "",
     receiverOnline: Boolean(receiverWs),
     receiverClient: receiverWs?.client || null,
     expiresAt: intent.expiresAt,
-    createdAt: intent.createdAt
+    createdAt: intent.createdAt,
+    isTextOnly,
+    text: intent.text || ""
   });
 }
 
