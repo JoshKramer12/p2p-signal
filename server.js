@@ -138,6 +138,30 @@ function countUsers() {
   }
 }
 
+function listUsersAlphabetical() {
+  try {
+    return fs.readdirSync(USERS_DIR)
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => path.basename(f, ".json"))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+  } catch {
+    return [];
+  }
+}
+
+function buildStatsPayload(username = "") {
+  return {
+    totalUsers: countUsers(),
+    onlineUsers: online.size,
+    pendingRequests: countPendingRequestsForUser(username),
+    storedFiles: countStoredFiles(),
+    storageBytes: storageBytesUsed(),
+    largestFiles: largestStoredFiles(100),
+    allUsers: listUsersAlphabetical()
+  };
+}
+
 
 
 function mapStoredFilesToIntents() {
@@ -1495,12 +1519,7 @@ if (data.type === "friend_request_clear_declined") {
 if (data.type === "stats") {
   return send(ws, {
     type: "stats",
-    totalUsers: countUsers(),
-    onlineUsers: online.size,
-    pendingRequests: countPendingRequestsForUser(ws.username),
-    storedFiles: countStoredFiles(),
-    storageBytes: storageBytesUsed(),
-    largestFiles: largestStoredFiles(100),
+    ...buildStatsPayload(ws.username)
   });
 }
 
@@ -1597,7 +1616,7 @@ if (data.type === "delete_file") {
   const intent = intentMap.get(storedFile);
   if (intent) deleteIntentAndNotify(intent);
 
-  return send(ws, { type: "stats", storageBytes: storageBytesUsed(), storedFiles: countStoredFiles(), largestFiles: largestStoredFiles(100) });
+  return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
 }
 
 if (data.type === "delete_files") {
@@ -1612,7 +1631,7 @@ if (data.type === "delete_files") {
     if (intent) deleteIntentAndNotify(intent);
   }
 
-  return send(ws, { type: "stats", storageBytes: storageBytesUsed(), storedFiles: countStoredFiles(), largestFiles: largestStoredFiles(100) });
+  return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
 }
 
 if (data.type === "delete_message_everyone") {
@@ -1640,7 +1659,7 @@ if (data.type === "delete_message_everyone") {
 
   deleteIntentAndNotify(intent);
 
-  return send(ws, { type: "stats", storageBytes: storageBytesUsed(), storedFiles: countStoredFiles(), largestFiles: largestStoredFiles(100) });
+  return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
 }
 
 // =========================
