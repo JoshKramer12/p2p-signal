@@ -280,23 +280,24 @@ function isFileIntent(intent) {
   return true;
 }
 
-function resolveStoredIntentSize(intent) {
-  if (!intent?.storedFile) return 0;
+function resolveStoredFileSize(storedFile) {
+  const safeName = String(storedFile || "").trim();
+  if (!safeName) return null;
   try {
-    const filePath = path.join(FILES_DIR, intent.storedFile);
+    const filePath = path.join(FILES_DIR, safeName);
     if (fs.existsSync(filePath)) {
       return fs.statSync(filePath).size;
     }
   } catch {}
-  const fallback = Number(intent?.fileSize || 0);
-  return Number.isFinite(fallback) && fallback > 0 ? fallback : 0;
+  return null;
 }
 
 function buildUserStoragePayload(username) {
   const quotaBytes = USER_STORAGE_QUOTA_BYTES > 0 ? USER_STORAGE_QUOTA_BYTES : 5 * 1024 * 1024 * 1024;
   const sentFiles = [];
   let usedBytes = 0;
-  let chatStoredFilesCount = 0;
+  let sentStoredFilesCount = 0;
+  const countedStoredFiles = new Set();
 
   if (!username) {
     return {
@@ -306,6 +307,7 @@ function buildUserStoragePayload(username) {
       usedPercent: 0,
       sentFilesCount: 0,
       chatStoredFilesCount: 0,
+      sentStoredFilesCount: 0,
       sentFiles: []
     };
   }
@@ -323,19 +325,20 @@ function buildUserStoragePayload(username) {
       if (!isFileIntent(intent)) continue;
 
       const from = String(intent.from || "");
-      const to = String(intent.to || "");
-      const touchesUser = from === username || to === username;
-      if (!touchesUser) continue;
-
-      chatStoredFilesCount += 1;
       if (from !== username) continue;
 
-      const size = resolveStoredIntentSize(intent);
-      usedBytes += size;
+      const fileSizeOnDisk = resolveStoredFileSize(intent.storedFile);
+      if (fileSizeOnDisk === null) continue;
+
+      sentStoredFilesCount += 1;
+      if (!countedStoredFiles.has(intent.storedFile)) {
+        countedStoredFiles.add(intent.storedFile);
+        usedBytes += fileSizeOnDisk;
+      }
       sentFiles.push({
         storedFile: intent.storedFile,
         name: intent.fileName || intent.storedFile,
-        size,
+        size: fileSizeOnDisk,
         intentId: intent.id || null,
         from: intent.from || null,
         to: intent.to || null,
@@ -363,7 +366,8 @@ function buildUserStoragePayload(username) {
     remainingBytes,
     usedPercent,
     sentFilesCount,
-    chatStoredFilesCount,
+    chatStoredFilesCount: sentStoredFilesCount,
+    sentStoredFilesCount,
     sentFiles
   };
 }
