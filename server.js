@@ -12,6 +12,7 @@ const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 30);
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const TRANSFER_IDLE_TIMEOUT_MS = Number(process.env.TRANSFER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
 const TRANSFER_SWEEP_INTERVAL_MS = Number(process.env.TRANSFER_SWEEP_INTERVAL_MS || 15 * 1000);
+const USER_STORAGE_QUOTA_BYTES = Number(process.env.USER_STORAGE_QUOTA_BYTES || 5 * 1024 * 1024 * 1024);
 
 // username -> ws
 const online = new Map();
@@ -270,6 +271,101 @@ function largestStoredFiles(limit = 50) {
   } catch {
     return [];
   }
+}
+
+function isFileIntent(intent) {
+  if (!intent) return false;
+  if (!intent.stored || !intent.storedFile) return false;
+  if (intent.isTextOnly || intent.messageType === "text") return false;
+  return true;
+}
+
+function resolveStoredIntentSize(intent) {
+  if (!intent?.storedFile) return 0;
+  try {
+    const filePath = path.join(FILES_DIR, intent.storedFile);
+    if (fs.existsSync(filePath)) {
+      return fs.statSync(filePath).size;
+    }
+  } catch {}
+  const fallback = Number(intent?.fileSize || 0);
+  return Number.isFinite(fallback) && fallback > 0 ? fallback : 0;
+}
+
+function buildUserStoragePayload(username) {
+  const quotaBytes = USER_STORAGE_QUOTA_BYTES > 0 ? USER_STORAGE_QUOTA_BYTES : 5 * 1024 * 1024 * 1024;
+  const sentFiles = [];
+  let usedBytes = 0;
+  let chatStoredFilesCount = 0;
+
+  if (!username) {
+    return {
+      quotaBytes,
+      usedBytes: 0,
+      remainingBytes: quotaBytes,
+      usedPercent: 0,
+      sentFilesCount: 0,
+      chatStoredFilesCount: 0,
+      sentFiles: []
+    };
+  }
+
+  try {
+    const files = fs.readdirSync(INTENTS_DIR).filter((f) => f.endsWith(".json"));
+    for (const file of files) {
+      let intent;
+      try {
+        intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
+      } catch {
+        continue;
+      }
+
+      if (!isFileIntent(intent)) continue;
+
+      const from = String(intent.from || "");
+      const to = String(intent.to || "");
+      const touchesUser = from === username || to === username;
+      if (!touchesUser) continue;
+
+      chatStoredFilesCount += 1;
+      if (from !== username) continue;
+
+      const size = resolveStoredIntentSize(intent);
+      usedBytes += size;
+      sentFiles.push({
+        storedFile: intent.storedFile,
+        name: intent.fileName || intent.storedFile,
+        size,
+        intentId: intent.id || null,
+        from: intent.from || null,
+        to: intent.to || null,
+        createdAt: intent.createdAt || null,
+        expiresAt: intent.expiresAt || null
+      });
+    }
+  } catch {}
+
+  sentFiles.sort((a, b) => {
+    if (b.size !== a.size) return b.size - a.size;
+    return Number(b.createdAt || 0) - Number(a.createdAt || 0);
+  });
+
+  const sentFilesCount = sentFiles.length;
+  const remainingBytes = Math.max(quotaBytes - usedBytes, 0);
+  const usedPercentRaw = quotaBytes > 0 ? (usedBytes / quotaBytes) * 100 : 0;
+  const usedPercent = Number.isFinite(usedPercentRaw)
+    ? Math.max(0, Math.round(usedPercentRaw * 100) / 100)
+    : 0;
+
+  return {
+    quotaBytes,
+    usedBytes,
+    remainingBytes,
+    usedPercent,
+    sentFilesCount,
+    chatStoredFilesCount,
+    sentFiles
+  };
 }
 
 function countPendingRequestsForUser(username) {
@@ -1520,6 +1616,13 @@ if (data.type === "stats") {
   return send(ws, {
     type: "stats",
     ...buildStatsPayload(ws.username)
+  });
+}
+
+if (data.type === "storage_stats") {
+  return send(ws, {
+    type: "storage_stats",
+    ...buildUserStoragePayload(ws.username)
   });
 }
 
