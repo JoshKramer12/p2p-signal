@@ -181,6 +181,38 @@ function mapStoredFilesToIntents() {
   return map;
 }
 
+function findIntentsByStoredFile(storedFile) {
+  const target = String(storedFile || "").trim();
+  if (!target) return [];
+  const intents = [];
+  try {
+    const files = fs.readdirSync(INTENTS_DIR).filter((f) => f.endsWith(".json"));
+    for (const file of files) {
+      try {
+        const intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
+        if (intent?.storedFile === target) intents.push(intent);
+      } catch {}
+    }
+  } catch {}
+  return intents;
+}
+
+function deleteStoredFileAndNotify(storedFile) {
+  const safeName = String(storedFile || "").trim();
+  if (!safeName) return;
+
+  const filePath = path.join(FILES_DIR, safeName);
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (err) {
+    console.error("❌ Failed to delete stored file:", err);
+    throw err;
+  }
+
+  const intents = findIntentsByStoredFile(safeName);
+  intents.forEach((intent) => deleteIntentAndNotify(intent));
+}
+
 function deleteIntentAndNotify(intent) {
   if (!intent) return;
   const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
@@ -188,6 +220,8 @@ function deleteIntentAndNotify(intent) {
 
   const receiver = online.get(intent.to);
   const sender = online.get(intent.from);
+  const senderOnline = Boolean(sender && sender.readyState === WebSocket.OPEN);
+  const receiverOnline = Boolean(receiver && receiver.readyState === WebSocket.OPEN);
   const payload = {
     type: "intent_deleted",
     intentId: intent.id,
@@ -195,8 +229,10 @@ function deleteIntentAndNotify(intent) {
     from: intent.from,
     to: intent.to
   };
-  if (receiver) send(receiver, payload);
-  if (sender && sender !== receiver) send(sender, payload);
+  if (!senderOnline) queueIntentDeletionForUser(intent.from, payload);
+  if (!receiverOnline) queueIntentDeletionForUser(intent.to, payload);
+  if (receiverOnline) send(receiver, payload);
+  if (senderOnline && sender !== receiver) send(sender, payload);
 }
 
 function cleanupExpiredIntents() {
@@ -622,6 +658,8 @@ function ensureUserShape(u) {
   if (!Array.isArray(u.declinedRequests)) u.declinedRequests = [];
   if (!u.deletedFriends) u.deletedFriends = [];
   if (!Array.isArray(u.deletedFriends)) u.deletedFriends = [];
+  if (!u.deletedIntents) u.deletedIntents = [];
+  if (!Array.isArray(u.deletedIntents)) u.deletedIntents = [];
   if (!u.profile) u.profile = {};
   return u;
 }
@@ -647,6 +685,41 @@ function sendFriendRequestsUpdate(username) {
     outgoing: u.outgoingRequests || [],
     declined: u.declinedRequests || []
   });
+}
+
+function queueIntentDeletionForUser(username, payload) {
+  const name = String(username || "").trim();
+  const intentId = String(payload?.intentId || "").trim();
+  if (!name || !intentId) return;
+
+  const u0 = loadUser(name);
+  if (!u0) return;
+  const user = ensureUserShape(u0);
+  const list = Array.isArray(user.deletedIntents) ? user.deletedIntents : [];
+  if (!list.some((entry) => String(entry?.intentId || "") === intentId)) {
+    list.push({
+      intentId,
+      storedFile: payload?.storedFile || null,
+      from: payload?.from || null,
+      to: payload?.to || null,
+      deletedAt: Date.now()
+    });
+  }
+  user.deletedIntents = list.slice(-5000);
+  saveUser(user);
+}
+
+function flushQueuedIntentDeletions(ws, userRecord) {
+  if (!ws?.username) return;
+  const base = userRecord || loadUser(ws.username);
+  if (!base) return;
+  const user = ensureUserShape(base);
+  const queued = Array.isArray(user.deletedIntents) ? user.deletedIntents.filter(Boolean) : [];
+  if (queued.length) {
+    send(ws, { type: "deleted_intents", items: queued });
+    user.deletedIntents = [];
+    saveUser(user);
+  }
 }
 
 function addFriendSymmetric(a, b) {
@@ -930,6 +1003,7 @@ if (!user.friends.includes(user.username)) {
 
   const u2 = ensureUserShape(user);
   saveUser(u2);
+  flushQueuedIntentDeletions(ws, u2);
   send(ws, { type: "friends_list", friends: u2.friends, deletedFriends: u2.deletedFriends });
   send(ws, { type: "profiles", profiles: loadProfiles(u2.friends || []) });
   send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests, declined: u2.declinedRequests });
@@ -1045,6 +1119,7 @@ if (!user.friends.includes(user.username)) {
   // ───────────────────────────
   const u2 = ensureUserShape(loadUser(username));
   saveUser(u2);
+  flushQueuedIntentDeletions(ws, u2);
   send(ws, {
     type: "friends_list",
     friends: u2.friends || [],
@@ -1711,17 +1786,11 @@ if (data.type === "delete_file") {
   const storedFile = String(data.storedFile || "").trim();
   if (!storedFile) return send(ws, { type: "error", message: "Missing storedFile" });
 
-  const filePath = path.join(FILES_DIR, storedFile);
   try {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    deleteStoredFileAndNotify(storedFile);
   } catch (err) {
-    console.error("❌ Failed to delete stored file:", err);
     return send(ws, { type: "error", message: "Failed to delete file" });
   }
-
-  const intentMap = mapStoredFilesToIntents();
-  const intent = intentMap.get(storedFile);
-  if (intent) deleteIntentAndNotify(intent);
 
   return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
 }
@@ -1730,12 +1799,10 @@ if (data.type === "delete_files") {
   const storedFiles = Array.isArray(data.storedFiles) ? data.storedFiles : [];
   if (!storedFiles.length) return send(ws, { type: "error", message: "No files specified" });
 
-  const intentMap = mapStoredFilesToIntents();
-  for (const storedFile of storedFiles) {
-    const filePath = path.join(FILES_DIR, storedFile);
-    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
-    const intent = intentMap.get(storedFile);
-    if (intent) deleteIntentAndNotify(intent);
+  for (const rawStoredFile of storedFiles) {
+    const storedFile = String(rawStoredFile || "").trim();
+    if (!storedFile) continue;
+    try { deleteStoredFileAndNotify(storedFile); } catch {}
   }
 
   return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
