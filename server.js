@@ -30,6 +30,46 @@ function setCors(res) {
   res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition");
 }
 
+function contentTypeForName(name = "") {
+  const ext = String(path.extname(name || "") || "").toLowerCase();
+  const map = {
+    ".pdf": "application/pdf",
+    ".txt": "text/plain; charset=utf-8",
+    ".rtf": "application/rtf",
+    ".json": "application/json; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".tsv": "text/tab-separated-values; charset=utf-8",
+    ".xml": "application/xml; charset=utf-8",
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".svg": "image/svg+xml",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".zip": "application/zip",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".folder": "application/x-merm-folder"
+  };
+  return map[ext] || "application/octet-stream";
+}
+
 function generateDownloadToken() {
   return randomUUID() + randomUUID();
 }
@@ -84,7 +124,7 @@ const server = http.createServer((req, res) => {
       const stat = fs.statSync(filePath);
       const safeName = safeBasename(intent.fileName || "file");
       res.writeHead(200, {
-        "content-type": "application/octet-stream",
+        "content-type": contentTypeForName(safeName),
         "content-length": stat.size,
         "content-disposition": `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
       });
@@ -1711,6 +1751,44 @@ if (data.type === "storage_stats") {
 if (data.type === "inbox_request") {
   const items = loadIntentsForUser(ws.username);
   return send(ws, { type: "inbox", items });
+}
+
+if (data.type === "intent_access_request") {
+  const intentId = String(data.intentId || "").trim();
+  if (!intentId) {
+    return send(ws, { type: "error", message: "Missing intentId" });
+  }
+
+  const intent = loadIntent(intentId);
+  if (!intent) {
+    return send(ws, { type: "intent_access", intentId, intent: null });
+  }
+
+  const canAccess = intent.from === ws.username || intent.to === ws.username;
+  if (!canAccess) {
+    return send(ws, { type: "intent_access", intentId, intent: null });
+  }
+
+  if (!intent.downloadToken && !(intent.isTextOnly || intent.messageType === "text")) {
+    intent.downloadToken = generateDownloadToken();
+    saveIntent(intent);
+  }
+
+  return send(ws, {
+    type: "intent_access",
+    intentId,
+    intent: {
+      id: intent.id,
+      intentId: intent.id,
+      fileName: intent.fileName || "",
+      fileSize: Number(intent.fileSize || 0),
+      createdAt: Number(intent.createdAt || 0),
+      downloadToken: intent.downloadToken || null,
+      stored: Boolean(intent.stored),
+      status: intent.status || "",
+      isTextOnly: Boolean(intent.isTextOnly || intent.messageType === "text")
+    }
+  });
 }
 
 // =========================
