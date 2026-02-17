@@ -2200,6 +2200,10 @@ if (data.type === "send_intent") {
   if (clientIntentId) {
     const existing = findIntentByClientId(ws.username, clientIntentId);
     if (existing) {
+      if (!existing.downloadToken && !(existing.isTextOnly || existing.messageType === "text")) {
+        existing.downloadToken = generateDownloadToken();
+        saveIntent(existing);
+      }
       const receiverWs = online.get(existing.to);
       if (receiverWs) {
         if (existing.isTextOnly || existing.messageType === "text") {
@@ -2215,6 +2219,7 @@ if (data.type === "send_intent") {
         clientIntentId,
         to: existing.to,
         fileName: existing.fileName || "",
+        downloadToken: existing.downloadToken || null,
         receiverOnline: Boolean(receiverWs),
         receiverClient: receiverWs?.client || null,
         expiresAt: existing.expiresAt,
@@ -2275,6 +2280,7 @@ if (data.type === "send_intent") {
     clientIntentId: clientIntentId || null,
     to,
     fileName: intent.fileName || "",
+    downloadToken: intent.downloadToken || null,
     receiverOnline: Boolean(receiverWs),
     receiverClient: receiverWs?.client || null,
     expiresAt: intent.expiresAt,
