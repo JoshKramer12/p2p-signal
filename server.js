@@ -5,6 +5,7 @@ const http = require("http");
 const WebSocket = require("ws");
 const { randomUUID } = require("crypto");
 const net = require("net");
+const JSZip = require("jszip");
 
 const PORT = process.env.PORT || 8080;
 
@@ -92,7 +93,7 @@ function generateDownloadToken() {
   return randomUUID() + randomUUID();
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
 
@@ -106,6 +107,163 @@ const server = http.createServer((req, res) => {
     if (url.pathname === "/" || url.pathname === "/health") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("ok");
+      return;
+    }
+
+    if (url.pathname.startsWith("/download-entry/")) {
+      setCors(res);
+      const intentId = url.pathname.split("/")[2] || "";
+      const token = url.searchParams.get("token") || "";
+      const rawEntryPath = String(url.searchParams.get("path") || "");
+      const mode = String(url.searchParams.get("disposition") || "").toLowerCase();
+      const dispositionType = mode === "inline" ? "inline" : "attachment";
+
+      const entryPath = rawEntryPath.replace(/\\/g, "/").replace(/^\/+/, "");
+      const invalidEntryPath = !entryPath || entryPath.includes("..") || entryPath.includes("\0");
+      if (!intentId || !token || invalidEntryPath) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Missing intentId, token or entry path");
+        return;
+      }
+
+      const intent = loadIntent(intentId);
+      if (!intent || !intent.stored || !intent.storedFile) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("File not found");
+        return;
+      }
+
+      if (intent.downloadToken !== token) {
+        res.writeHead(403, { "content-type": "text/plain" });
+        res.end("Forbidden");
+        return;
+      }
+
+      const filePath = path.join(FILES_DIR, intent.storedFile);
+      if (!fs.existsSync(filePath)) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("File missing");
+        return;
+      }
+
+      const ext = String(path.extname(intent.fileName || "") || "").toLowerCase();
+      if (ext !== ".zip" && ext !== ".folder") {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Not a folder or zip package");
+        return;
+      }
+
+      let zip;
+      try {
+        const zipBuffer = fs.readFileSync(filePath);
+        zip = await JSZip.loadAsync(zipBuffer);
+      } catch {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("Could not read package");
+        return;
+      }
+
+      const entry = zip.file(entryPath);
+      if (!entry || entry.dir) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("Entry not found");
+        return;
+      }
+
+      let out;
+      try {
+        out = await entry.async("nodebuffer");
+      } catch {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("Could not read package entry");
+        return;
+      }
+
+      const safeName = safeBasename(path.basename(entryPath) || "file");
+      const totalSize = out.length;
+      const baseHeaders = {
+        "content-type": contentTypeForName(safeName),
+        "accept-ranges": "bytes",
+        "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
+      };
+
+      if (totalSize <= 0) {
+        res.writeHead(200, {
+          ...baseHeaders,
+          "content-length": 0
+        });
+        res.end();
+        return;
+      }
+
+      const rangeRaw = String(req.headers.range || "").trim();
+      let start = 0;
+      let end = totalSize - 1;
+      let statusCode = 200;
+
+      if (rangeRaw) {
+        const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeRaw);
+        if (!match) {
+          res.writeHead(416, {
+            ...baseHeaders,
+            "content-range": `bytes */${totalSize}`
+          });
+          res.end();
+          return;
+        }
+
+        const startRaw = match[1];
+        const endRaw = match[2];
+
+        if (startRaw === "" && endRaw === "") {
+          res.writeHead(416, {
+            ...baseHeaders,
+            "content-range": `bytes */${totalSize}`
+          });
+          res.end();
+          return;
+        }
+
+        if (startRaw !== "") {
+          start = Number(startRaw);
+          end = endRaw !== "" ? Number(endRaw) : end;
+        } else {
+          const suffixLength = Number(endRaw);
+          if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+            res.writeHead(416, {
+              ...baseHeaders,
+              "content-range": `bytes */${totalSize}`
+            });
+            res.end();
+            return;
+          }
+          start = Math.max(0, totalSize - suffixLength);
+          end = totalSize - 1;
+        }
+
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= totalSize) {
+          res.writeHead(416, {
+            ...baseHeaders,
+            "content-range": `bytes */${totalSize}`
+          });
+          res.end();
+          return;
+        }
+
+        end = Math.min(end, totalSize - 1);
+        statusCode = 206;
+      }
+
+      const slice = out.subarray(start, end + 1);
+      const headers = {
+        ...baseHeaders,
+        "content-length": slice.length
+      };
+      if (statusCode === 206) {
+        headers["content-range"] = `bytes ${start}-${end}/${totalSize}`;
+      }
+      res.writeHead(statusCode, headers);
+      res.end(slice);
       return;
     }
 
