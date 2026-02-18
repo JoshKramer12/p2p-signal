@@ -26,8 +26,8 @@ const activeTransfers = new Map();
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition,Content-Range,Accept-Ranges");
 }
 
 function contentTypeForName(name = "") {
@@ -123,13 +123,91 @@ const server = http.createServer((req, res) => {
 
       const stat = fs.statSync(filePath);
       const safeName = safeBasename(intent.fileName || "file");
-      res.writeHead(200, {
+      const mode = String(url.searchParams.get("disposition") || "").toLowerCase();
+      const dispositionType = mode === "inline" ? "inline" : "attachment";
+      const baseHeaders = {
         "content-type": contentTypeForName(safeName),
-        "content-length": stat.size,
-        "content-disposition": `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
-      });
+        "accept-ranges": "bytes",
+        "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
+      };
 
-      const rs = fs.createReadStream(filePath);
+      if (stat.size <= 0) {
+        res.writeHead(200, {
+          ...baseHeaders,
+          "content-length": 0
+        });
+        res.end();
+        return;
+      }
+
+      const rangeRaw = String(req.headers.range || "").trim();
+      let start = 0;
+      let end = stat.size - 1;
+      let statusCode = 200;
+
+      if (rangeRaw) {
+        const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeRaw);
+        if (!match) {
+          res.writeHead(416, {
+            ...baseHeaders,
+            "content-range": `bytes */${stat.size}`
+          });
+          res.end();
+          return;
+        }
+
+        const startRaw = match[1];
+        const endRaw = match[2];
+
+        if (startRaw === "" && endRaw === "") {
+          res.writeHead(416, {
+            ...baseHeaders,
+            "content-range": `bytes */${stat.size}`
+          });
+          res.end();
+          return;
+        }
+
+        if (startRaw !== "") {
+          start = Number(startRaw);
+          end = endRaw !== "" ? Number(endRaw) : end;
+        } else {
+          const suffixLength = Number(endRaw);
+          if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+            res.writeHead(416, {
+              ...baseHeaders,
+              "content-range": `bytes */${stat.size}`
+            });
+            res.end();
+            return;
+          }
+          start = Math.max(0, stat.size - suffixLength);
+          end = Math.max(0, stat.size - 1);
+        }
+
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= stat.size) {
+          res.writeHead(416, {
+            ...baseHeaders,
+            "content-range": `bytes */${stat.size}`
+          });
+          res.end();
+          return;
+        }
+
+        end = Math.min(end, Math.max(0, stat.size - 1));
+        statusCode = 206;
+      }
+
+      const headers = {
+        ...baseHeaders,
+        "content-length": Math.max(0, end - start + 1)
+      };
+      if (statusCode === 206) {
+        headers["content-range"] = `bytes ${start}-${end}/${stat.size}`;
+      }
+      res.writeHead(statusCode, headers);
+
+      const rs = fs.createReadStream(filePath, { start, end });
       rs.on("error", () => {
         try { res.end(); } catch {}
       });
