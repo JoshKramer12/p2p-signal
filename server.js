@@ -115,16 +115,30 @@ const server = http.createServer(async (req, res) => {
       const pathParts = url.pathname.split("/").filter(Boolean);
       const intentId = pathParts[1] || "";
       const token = url.searchParams.get("token") || "";
+      const rawEntryRef = String(url.searchParams.get("entry") || "");
       const rawEntryPathFromPath = pathParts.length > 2 ? pathParts.slice(2).join("/") : "";
       const rawEntryPath = String(rawEntryPathFromPath || url.searchParams.get("path") || "");
       const mode = String(url.searchParams.get("disposition") || "").toLowerCase();
       const dispositionType = mode === "inline" ? "inline" : "attachment";
 
       let entryPath = "";
-      try {
-        entryPath = decodeURIComponent(rawEntryPath);
-      } catch {
-        entryPath = rawEntryPath;
+      if (rawEntryRef) {
+        try {
+          entryPath = Buffer.from(rawEntryRef, "base64url").toString("utf8");
+        } catch {
+          try {
+            const base64 = rawEntryRef.replace(/-/g, "+").replace(/_/g, "/");
+            entryPath = Buffer.from(base64, "base64").toString("utf8");
+          } catch {
+            entryPath = "";
+          }
+        }
+      } else {
+        try {
+          entryPath = decodeURIComponent(rawEntryPath);
+        } catch {
+          entryPath = rawEntryPath;
+        }
       }
       entryPath = entryPath.replace(/\\/g, "/").replace(/^\/+/, "");
       const invalidEntryPath = !entryPath || entryPath.includes("..") || entryPath.includes("\0");
