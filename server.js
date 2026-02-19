@@ -112,13 +112,21 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname.startsWith("/download-entry/")) {
       setCors(res);
-      const intentId = url.pathname.split("/")[2] || "";
+      const pathParts = url.pathname.split("/").filter(Boolean);
+      const intentId = pathParts[1] || "";
       const token = url.searchParams.get("token") || "";
-      const rawEntryPath = String(url.searchParams.get("path") || "");
+      const rawEntryPathFromPath = pathParts.length > 2 ? pathParts.slice(2).join("/") : "";
+      const rawEntryPath = String(rawEntryPathFromPath || url.searchParams.get("path") || "");
       const mode = String(url.searchParams.get("disposition") || "").toLowerCase();
       const dispositionType = mode === "inline" ? "inline" : "attachment";
 
-      const entryPath = rawEntryPath.replace(/\\/g, "/").replace(/^\/+/, "");
+      let entryPath = "";
+      try {
+        entryPath = decodeURIComponent(rawEntryPath);
+      } catch {
+        entryPath = rawEntryPath;
+      }
+      entryPath = entryPath.replace(/\\/g, "/").replace(/^\/+/, "");
       const invalidEntryPath = !entryPath || entryPath.includes("..") || entryPath.includes("\0");
       if (!intentId || !token || invalidEntryPath) {
         res.writeHead(400, { "content-type": "text/plain" });
