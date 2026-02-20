@@ -93,6 +93,17 @@ function generateDownloadToken() {
   return randomUUID() + randomUUID();
 }
 
+function zipEntrySize(entry) {
+  const raw =
+    entry?.uncompressedSize ??
+    entry?._data?.uncompressedSize ??
+    entry?._dataBinary?.length ??
+    entry?._data?.length ??
+    0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -107,6 +118,76 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/" || url.pathname === "/health") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("ok");
+      return;
+    }
+
+    if (url.pathname.startsWith("/download-index/")) {
+      setCors(res);
+      const intentId = url.pathname.split("/")[2] || "";
+      const token = url.searchParams.get("token") || "";
+      if (!intentId || !token) {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Missing intentId or token");
+        return;
+      }
+
+      const intent = loadIntent(intentId);
+      if (!intent || !intent.stored || !intent.storedFile) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("File not found");
+        return;
+      }
+
+      if (intent.downloadToken !== token) {
+        res.writeHead(403, { "content-type": "text/plain" });
+        res.end("Forbidden");
+        return;
+      }
+
+      const filePath = path.join(FILES_DIR, intent.storedFile);
+      if (!fs.existsSync(filePath)) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("File missing");
+        return;
+      }
+
+      const ext = String(path.extname(intent.fileName || "") || "").toLowerCase();
+      if (ext !== ".zip" && ext !== ".folder") {
+        res.writeHead(400, { "content-type": "text/plain" });
+        res.end("Not a folder or zip package");
+        return;
+      }
+
+      let zip;
+      try {
+        const zipBuffer = await fs.promises.readFile(filePath);
+        zip = await JSZip.loadAsync(zipBuffer);
+      } catch {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("Could not read package");
+        return;
+      }
+
+      const entries = Object.values(zip.files || {})
+        .map((entry) => {
+          const name = String(entry?.name || "").replace(/\\/g, "/").replace(/^\/+/, "");
+          if (!name || name.includes("\0")) return null;
+          const dateMs = entry?.date instanceof Date ? entry.date.getTime() : 0;
+          return {
+            name,
+            dir: Boolean(entry?.dir),
+            size: zipEntrySize(entry),
+            date: Number.isFinite(dateMs) && dateMs > 0 ? dateMs : 0
+          };
+        })
+        .filter(Boolean)
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+
+      res.writeHead(200, {
+        "content-type": "application/json; charset=utf-8",
+        "cache-control": "no-store"
+      });
+      res.end(JSON.stringify({ intentId, entries }));
       return;
     }
 
@@ -177,7 +258,7 @@ const server = http.createServer(async (req, res) => {
 
       let zip;
       try {
-        const zipBuffer = fs.readFileSync(filePath);
+        const zipBuffer = await fs.promises.readFile(filePath);
         zip = await JSZip.loadAsync(zipBuffer);
       } catch {
         res.writeHead(500, { "content-type": "text/plain" });
