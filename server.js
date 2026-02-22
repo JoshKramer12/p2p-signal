@@ -3,7 +3,7 @@
 
 const http = require("http");
 const WebSocket = require("ws");
-const { randomUUID } = require("crypto");
+const { randomUUID, createHash } = require("crypto");
 const net = require("net");
 const yauzl = require("yauzl");
 
@@ -18,6 +18,8 @@ const ARCHIVE_PREVIEW_MAX_BYTES = Math.max(
   Number(process.env.ARCHIVE_PREVIEW_MAX_BYTES || 0) || 0,
   10 * 1024 * 1024 * 1024
 );
+const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
+const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
 
 // username -> ws
@@ -28,6 +30,8 @@ const inboxes = new Map();
 
 // intentId -> { tcp: net.Socket, bytesExpected, bytesSent, senderWs, receiverWs }
 const activeTransfers = new Map();
+const archiveIndexCache = new Map(); // intentId -> { entries, archiveSize, archiveMtimeMs, cachedAt }
+const previewExtractJobs = new Map(); // cachePath -> Promise<void>
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -163,6 +167,294 @@ function parseHttpRange(rangeRaw = "", totalSize = 0) {
   };
 }
 
+function pruneArchiveIndexCache(maxEntries = 200) {
+  if (archiveIndexCache.size <= maxEntries) return;
+  const now = Date.now();
+  const rows = Array.from(archiveIndexCache.entries());
+  rows.sort((a, b) => {
+    const aTs = Number(a?.[1]?.cachedAt || 0);
+    const bTs = Number(b?.[1]?.cachedAt || 0);
+    return aTs - bTs;
+  });
+  while (archiveIndexCache.size > maxEntries && rows.length) {
+    const item = rows.shift();
+    if (!item) break;
+    archiveIndexCache.delete(item[0]);
+  }
+  // Drop stale entries even if cache is small.
+  for (const [key, value] of archiveIndexCache.entries()) {
+    const cachedAt = Number(value?.cachedAt || 0);
+    if (!cachedAt || now - cachedAt > ARCHIVE_INDEX_CACHE_TTL_MS) {
+      archiveIndexCache.delete(key);
+    }
+  }
+}
+
+function getCachedArchiveIndex(intentId, archiveStat) {
+  const key = String(intentId || "");
+  if (!key) return null;
+  const cached = archiveIndexCache.get(key);
+  if (!cached) return null;
+
+  const now = Date.now();
+  if (!cached.cachedAt || now - cached.cachedAt > ARCHIVE_INDEX_CACHE_TTL_MS) {
+    archiveIndexCache.delete(key);
+    return null;
+  }
+  if (Number(cached.archiveSize || 0) !== Number(archiveStat?.size || 0)) {
+    archiveIndexCache.delete(key);
+    return null;
+  }
+  if (Number(cached.archiveMtimeMs || 0) !== Number(archiveStat?.mtimeMs || 0)) {
+    archiveIndexCache.delete(key);
+    return null;
+  }
+  return Array.isArray(cached.entries) ? cached.entries : null;
+}
+
+function setCachedArchiveIndex(intentId, archiveStat, entries = []) {
+  const key = String(intentId || "");
+  if (!key) return;
+  archiveIndexCache.set(key, {
+    entries: Array.isArray(entries) ? entries : [],
+    archiveSize: Number(archiveStat?.size || 0),
+    archiveMtimeMs: Number(archiveStat?.mtimeMs || 0),
+    cachedAt: Date.now()
+  });
+  pruneArchiveIndexCache();
+}
+
+function buildPreviewEntryCachePath(intentId, entryPath, safeName = "file") {
+  const key = `${String(intentId || "")}\n${String(entryPath || "")}`;
+  const hash = createHash("sha1").update(key).digest("hex");
+  const extRaw = String(path.extname(safeName || "") || "").toLowerCase();
+  const ext = /^[a-z0-9.]{1,20}$/.test(extRaw) ? extRaw : "";
+  return path.join(PREVIEW_CACHE_DIR, `${intentId}--${hash}${ext}`);
+}
+
+function touchFile(filePath) {
+  try {
+    const now = new Date();
+    fs.utimesSync(filePath, now, now);
+  } catch {}
+}
+
+function removePreviewCacheForIntent(intentId) {
+  const id = String(intentId || "").trim();
+  if (!id) return;
+  try {
+    const names = fs.readdirSync(PREVIEW_CACHE_DIR);
+    const prefix = `${id}--`;
+    names.forEach((name) => {
+      if (!name.startsWith(prefix)) return;
+      try {
+        fs.unlinkSync(path.join(PREVIEW_CACHE_DIR, name));
+      } catch {}
+    });
+  } catch {}
+}
+
+function cleanupPreviewCache() {
+  try {
+    const ttl = Math.max(5 * 60 * 1000, Number(PREVIEW_CACHE_TTL_MS || 0));
+    const now = Date.now();
+    const names = fs.readdirSync(PREVIEW_CACHE_DIR);
+    names.forEach((name) => {
+      const full = path.join(PREVIEW_CACHE_DIR, name);
+      try {
+        const stat = fs.statSync(full);
+        if (!stat.isFile()) return;
+        const touchedAt = Math.max(Number(stat.mtimeMs || 0), Number(stat.atimeMs || 0));
+        if (!touchedAt || now - touchedAt > ttl) {
+          fs.unlinkSync(full);
+        }
+      } catch {}
+    });
+  } catch {}
+}
+
+function serveFileFromDisk(req, res, filePath, safeName, dispositionType = "attachment") {
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("File missing");
+    return;
+  }
+
+  const totalSize = Number(stat?.size || 0);
+  const baseHeaders = {
+    "content-type": contentTypeForName(safeName),
+    "accept-ranges": "bytes",
+    "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
+  };
+
+  if (!Number.isFinite(totalSize) || totalSize <= 0) {
+    res.writeHead(200, {
+      ...baseHeaders,
+      "content-length": 0
+    });
+    res.end();
+    return;
+  }
+
+  const parsedRange = parseHttpRange(req.headers.range, totalSize);
+  if (!parsedRange.ok) {
+    res.writeHead(416, {
+      ...baseHeaders,
+      "content-range": `bytes */${totalSize}`
+    });
+    res.end();
+    return;
+  }
+
+  const start = parsedRange.start;
+  const end = parsedRange.end;
+  const hasRange = parsedRange.hasRange;
+  const headers = {
+    ...baseHeaders,
+    "content-length": hasRange ? Math.max(0, end - start + 1) : totalSize
+  };
+  if (hasRange) {
+    headers["content-range"] = `bytes ${start}-${end}/${totalSize}`;
+  }
+  res.writeHead(hasRange ? 206 : 200, headers);
+
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+
+  const rs = fs.createReadStream(filePath, { start, end });
+  rs.on("error", () => {
+    try { res.end(); } catch {}
+  });
+  rs.pipe(res);
+}
+
+function extractZipEntryToPath(zipPath, entryPath, outputPath) {
+  const normalizedEntry = normalizeZipPath(entryPath);
+  if (!normalizedEntry) {
+    const err = new Error("Entry not found");
+    err.status = 404;
+    return Promise.reject(err);
+  }
+
+  const tmpPath = `${outputPath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  return new Promise(async (resolve, reject) => {
+    let zipFile;
+    let settled = false;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
+      try { if (zipFile) zipFile.close(); } catch {}
+      if (err) reject(err);
+      else resolve();
+    };
+
+    try {
+      zipFile = await openZipFile(zipPath, { lazyEntries: true, autoClose: false });
+    } catch (err) {
+      finish(err || new Error("Could not open package"));
+      return;
+    }
+
+    const fail = (message, status = 500) => {
+      const err = message instanceof Error ? message : new Error(String(message || "Could not read package"));
+      err.status = status;
+      finish(err);
+    };
+
+    const onZipError = (err) => fail(err || new Error("Could not read package"), 500);
+    const onZipEnd = () => fail("Entry not found", 404);
+
+    zipFile.once("error", onZipError);
+    zipFile.once("end", onZipEnd);
+    zipFile.on("entry", (entry) => {
+      const name = normalizeZipPath(entry?.fileName || "");
+      if (name !== normalizedEntry) {
+        zipFile.readEntry();
+        return;
+      }
+
+      zipFile.removeListener("end", onZipEnd);
+      if (/\/$/.test(name)) {
+        fail("Entry not found", 404);
+        return;
+      }
+
+      zipFile.openReadStream(entry, { decompress: true }, (err, stream) => {
+        if (err || !stream) {
+          fail(err || new Error("Could not extract file"), 500);
+          return;
+        }
+
+        try {
+          fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+        } catch (mkErr) {
+          fail(mkErr || new Error("Could not prepare preview cache"), 500);
+          return;
+        }
+
+        const ws = fs.createWriteStream(tmpPath, { flags: "w", mode: 0o644 });
+        let done = false;
+        const complete = (writeErr) => {
+          if (done) return;
+          done = true;
+          try { stream.destroy(); } catch {}
+          try { ws.destroy(); } catch {}
+          if (writeErr) {
+            fail(writeErr, 500);
+            return;
+          }
+          try {
+            if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+          } catch {}
+          try {
+            fs.renameSync(tmpPath, outputPath);
+            finish(null);
+          } catch (renameErr) {
+            fail(renameErr || new Error("Could not cache preview"), 500);
+          }
+        };
+
+        stream.on("error", (streamErr) => complete(streamErr));
+        ws.on("error", (writeErr) => complete(writeErr));
+        ws.on("finish", () => complete(null));
+        stream.pipe(ws);
+      });
+    });
+
+    zipFile.readEntry();
+  });
+}
+
+async function ensureZipEntryExtracted(intentId, zipPath, entryPath, safeName) {
+  const cachePath = buildPreviewEntryCachePath(intentId, entryPath, safeName);
+  try {
+    const stat = fs.statSync(cachePath);
+    if (stat.isFile()) {
+      touchFile(cachePath);
+      return { cachePath, size: Number(stat.size || 0) };
+    }
+  } catch {}
+
+  let job = previewExtractJobs.get(cachePath);
+  if (!job) {
+    job = extractZipEntryToPath(zipPath, entryPath, cachePath)
+      .finally(() => previewExtractJobs.delete(cachePath));
+    previewExtractJobs.set(cachePath, job);
+  }
+  await job;
+
+  const stat = fs.statSync(cachePath);
+  touchFile(cachePath);
+  return { cachePath, size: Number(stat?.size || 0) };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
@@ -230,6 +522,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      const cachedEntries = getCachedArchiveIndex(intentId, archiveStat);
+      if (cachedEntries) {
+        res.writeHead(200, {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store"
+        });
+        res.end(JSON.stringify({ intentId, entries: cachedEntries }));
+        return;
+      }
+
       let zipFile;
       try {
         zipFile = await openZipFile(filePath, { lazyEntries: true, autoClose: true });
@@ -285,6 +587,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+      setCachedArchiveIndex(intentId, archiveStat, entries);
 
       res.writeHead(200, {
         "content-type": "application/json; charset=utf-8",
@@ -372,160 +675,29 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      let zipFile;
+      const safeName = safeBasename(path.basename(entryPath) || "file");
+      let extracted;
       try {
-        zipFile = await openZipFile(filePath, { lazyEntries: true, autoClose: false });
-      } catch {
-        res.writeHead(500, { "content-type": "text/plain" });
+        extracted = await ensureZipEntryExtracted(intentId, filePath, entryPath, safeName);
+      } catch (err) {
+        const status = Number(err?.status || 500);
+        const message = String(err?.message || "").trim();
+        res.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
+        if (status === 404) {
+          res.end("Entry not found");
+        } else {
+          res.end(message || "Could not read package");
+        }
+        return;
+      }
+
+      if (!extracted?.cachePath || !fs.existsSync(extracted.cachePath)) {
+        res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
         res.end("Could not read package");
         return;
       }
 
-      const matched = await new Promise((resolve, reject) => {
-        let done = false;
-        const finish = (result, err) => {
-          if (done) return;
-          done = true;
-          zipFile.removeAllListeners("entry");
-          zipFile.removeAllListeners("end");
-          zipFile.removeAllListeners("error");
-          if (err) reject(err);
-          else resolve(result);
-        };
-
-        zipFile.on("entry", (entry) => {
-          const name = normalizeZipPath(entry?.fileName || "");
-          if (name === entryPath) {
-            finish(entry, null);
-            return;
-          }
-          zipFile.readEntry();
-        });
-        zipFile.once("end", () => finish(null, null));
-        zipFile.once("error", (err) => finish(null, err));
-        zipFile.readEntry();
-      }).catch(() => null);
-
-      if (!matched || /\/$/.test(String(matched.fileName || ""))) {
-        try { zipFile.close(); } catch {}
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("Entry not found");
-        return;
-      }
-
-      const safeName = safeBasename(path.basename(entryPath) || "file");
-      const totalSize = Number(matched.uncompressedSize || 0);
-      const baseHeaders = {
-        "content-type": contentTypeForName(safeName),
-        "accept-ranges": "bytes",
-        "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
-      };
-
-      if (!Number.isFinite(totalSize) || totalSize <= 0) {
-        try { zipFile.close(); } catch {}
-        res.writeHead(200, {
-          ...baseHeaders,
-          "content-length": 0
-        });
-        res.end();
-        return;
-      }
-
-      const parsedRange = parseHttpRange(req.headers.range, totalSize);
-      if (!parsedRange.ok) {
-        try { zipFile.close(); } catch {}
-        res.writeHead(416, {
-          ...baseHeaders,
-          "content-range": `bytes */${totalSize}`
-        });
-        res.end();
-        return;
-      }
-
-      const start = parsedRange.start;
-      const end = parsedRange.end;
-      const hasRange = parsedRange.hasRange;
-      const requestedLength = Math.max(0, end - start + 1);
-      const headers = {
-        ...baseHeaders,
-        "content-length": hasRange ? requestedLength : totalSize
-      };
-      if (hasRange) {
-        headers["content-range"] = `bytes ${start}-${end}/${totalSize}`;
-      }
-      res.writeHead(hasRange ? 206 : 200, headers);
-
-      zipFile.openReadStream(matched, { decompress: true }, (err, stream) => {
-        if (err || !stream) {
-          try { zipFile.close(); } catch {}
-          try { if (!res.writableEnded) res.end(); } catch {}
-          return;
-        }
-
-        let closed = false;
-        const closeZip = () => {
-          if (closed) return;
-          closed = true;
-          try { zipFile.close(); } catch {}
-        };
-
-        const abort = () => {
-          try { stream.destroy(); } catch {}
-          closeZip();
-        };
-
-        res.on("close", abort);
-        stream.on("error", abort);
-
-        if (!hasRange) {
-          stream.on("end", closeZip);
-          stream.pipe(res);
-          return;
-        }
-
-        let inputOffset = 0;
-        let sent = 0;
-        stream.on("data", (chunk) => {
-          if (!chunk || chunk.length === 0) return;
-          const chunkStart = inputOffset;
-          const chunkEnd = inputOffset + chunk.length - 1;
-          inputOffset += chunk.length;
-
-          if (chunkEnd < start) return;
-          if (chunkStart > end) {
-            stream.destroy();
-            return;
-          }
-
-          const from = Math.max(0, start - chunkStart);
-          const to = Math.min(chunk.length, end - chunkStart + 1);
-          if (to <= from) return;
-          const outChunk = chunk.subarray(from, to);
-          sent += outChunk.length;
-          if (!res.write(outChunk)) {
-            stream.pause();
-            res.once("drain", () => stream.resume());
-          }
-
-          if (sent >= requestedLength || inputOffset > end) {
-            stream.destroy();
-          }
-        });
-
-        stream.on("close", () => {
-          if (!res.writableEnded) {
-            try { res.end(); } catch {}
-          }
-          closeZip();
-        });
-
-        stream.on("end", () => {
-          if (!res.writableEnded) {
-            try { res.end(); } catch {}
-          }
-          closeZip();
-        });
-      });
+      serveFileFromDisk(req, res, extracted.cachePath, safeName, dispositionType);
       return;
     }
 
@@ -686,6 +858,7 @@ const STORAGE_DIR = process.env.STORAGE_DIR || DEFAULT_STORAGE_DIR;
 const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
 const FILES_DIR = path.join(STORAGE_DIR, "files");
 const USERS_DIR = path.join(STORAGE_DIR, "users");
+const PREVIEW_CACHE_DIR = path.join(STORAGE_DIR, "preview-cache");
 
 function countUsers() {
   try {
@@ -773,6 +946,8 @@ function deleteIntentAndNotify(intent) {
   if (!intent) return;
   const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
   try { if (fs.existsSync(intentFile)) fs.unlinkSync(intentFile); } catch {}
+  removePreviewCacheForIntent(intent.id);
+  archiveIndexCache.delete(String(intent.id || ""));
 
   const receiver = online.get(intent.to);
   const sender = online.get(intent.from);
@@ -831,12 +1006,15 @@ function cleanupExpiredIntents() {
 function cleanupOrphanStoredFiles() {
   try {
     const inUse = new Set();
+    const intentIds = new Set();
     const intents = fs.readdirSync(INTENTS_DIR).filter((f) => f.endsWith(".json"));
     intents.forEach((file) => {
       try {
         const intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
         const stored = String(intent?.storedFile || "").trim();
         if (stored) inUse.add(stored);
+        const id = String(intent?.id || "").trim();
+        if (id) intentIds.add(id);
       } catch {}
     });
 
@@ -845,6 +1023,16 @@ function cleanupOrphanStoredFiles() {
       if (inUse.has(storedFile)) return;
       try {
         fs.unlinkSync(path.join(FILES_DIR, storedFile));
+      } catch {}
+    });
+
+    const cacheFiles = fs.readdirSync(PREVIEW_CACHE_DIR);
+    cacheFiles.forEach((name) => {
+      const idx = name.indexOf("--");
+      const intentId = idx > 0 ? name.slice(0, idx) : "";
+      if (!intentId || intentIds.has(intentId)) return;
+      try {
+        fs.unlinkSync(path.join(PREVIEW_CACHE_DIR, name));
       } catch {}
     });
   } catch {}
@@ -1018,6 +1206,7 @@ function safeBasename(name) {
 fs.mkdirSync(INTENTS_DIR, { recursive: true });
 fs.mkdirSync(FILES_DIR, { recursive: true });
 fs.mkdirSync(USERS_DIR, { recursive: true });
+fs.mkdirSync(PREVIEW_CACHE_DIR, { recursive: true });
 
 
 function saveIntent(intent) {
@@ -1427,7 +1616,9 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
   let data;
     try {
       data = JSON.parse(msg.toString());
-      console.log("📩 Message received:", data);
+      if (!["ping", "inbox_request", "friends_list"].includes(String(data?.type || ""))) {
+        console.log("📩 Message received:", data);
+      }
     } catch {
       return; // Ignore malformed JSON
     }
@@ -3031,8 +3222,10 @@ return send(ws, {
 
 cleanupExpiredIntents();
 cleanupOrphanStoredFiles();
+cleanupPreviewCache();
 setInterval(cleanupExpiredIntents, 60 * 60 * 1000);
 setInterval(cleanupOrphanStoredFiles, 60 * 60 * 1000);
+setInterval(cleanupPreviewCache, 60 * 60 * 1000);
 setInterval(cleanupStalledTransfers, TRANSFER_SWEEP_INTERVAL_MS);
 
 server.listen(PORT, () => {
