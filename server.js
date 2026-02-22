@@ -35,7 +35,7 @@ const previewExtractJobs = new Map(); // cachePath -> Promise<void>
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range");
   res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition,Content-Range,Accept-Ranges");
 }
@@ -386,7 +386,7 @@ function extractZipEntryToPath(zipPath, entryPath, outputPath) {
         return;
       }
 
-      zipFile.openReadStream(entry, { decompress: true }, (err, stream) => {
+      zipFile.openReadStream(entry, (err, stream) => {
         if (err || !stream) {
           fail(err || new Error("Could not extract file"), 500);
           return;
