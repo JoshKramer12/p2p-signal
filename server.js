@@ -2624,6 +2624,42 @@ if (data.type === "delete_files") {
   return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
 }
 
+if (data.type === "cancel_send") {
+  const intentId = String(data.intentId || "").trim();
+  if (!intentId) return send(ws, { type: "error", message: "Missing intentId" });
+
+  const intent = loadIntent(intentId);
+  if (!intent) {
+    return send(ws, { type: "cancel_send_ok", intentId, status: "not_found" });
+  }
+  if (intent.from !== ws.username) {
+    return send(ws, { type: "error", message: "Not authorized" });
+  }
+
+  const transfer = activeTransfers.get(intentId) || null;
+  const status = String(intent.status || "");
+  const canCancel = Boolean(transfer) || status === "pending" || status === "uploading" || !intent.stored;
+  if (!canCancel) {
+    return send(ws, { type: "cancel_send_ok", intentId, status: "ignored" });
+  }
+
+  if (transfer) {
+    failActiveTransfer(intentId, "Upload canceled by sender", { notify: false, deleteIntent: false });
+  } else if (ws.currentUploadIntentId === intentId) {
+    ws.currentUploadIntentId = null;
+  }
+
+  const storedFileName = String(intent.storedFile || "").trim();
+  if (storedFileName) {
+    const filePath = path.join(FILES_DIR, storedFileName);
+    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  }
+
+  deleteIntentAndNotify(intent);
+  send(ws, { type: "cancel_send_ok", intentId, status: "canceled" });
+  return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
+}
+
 if (data.type === "delete_message_everyone") {
   const intentId = String(data.intentId || "").trim();
   if (!intentId) return send(ws, { type: "error", message: "Missing intentId" });
