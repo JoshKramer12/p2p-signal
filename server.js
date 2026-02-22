@@ -5,7 +5,7 @@ const http = require("http");
 const WebSocket = require("ws");
 const { randomUUID } = require("crypto");
 const net = require("net");
-const JSZip = require("jszip");
+const yauzl = require("yauzl");
 
 const PORT = process.env.PORT || 8080;
 
@@ -14,6 +14,11 @@ const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const TRANSFER_IDLE_TIMEOUT_MS = Number(process.env.TRANSFER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
 const TRANSFER_SWEEP_INTERVAL_MS = Number(process.env.TRANSFER_SWEEP_INTERVAL_MS || 15 * 1000);
 const USER_STORAGE_QUOTA_BYTES = Number(process.env.USER_STORAGE_QUOTA_BYTES || 5 * 1024 * 1024 * 1024);
+const ARCHIVE_PREVIEW_MAX_BYTES = Math.max(
+  Number(process.env.ARCHIVE_PREVIEW_MAX_BYTES || 0) || 0,
+  10 * 1024 * 1024 * 1024
+);
+const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
 
 // username -> ws
 const online = new Map();
@@ -93,15 +98,69 @@ function generateDownloadToken() {
   return randomUUID() + randomUUID();
 }
 
-function zipEntrySize(entry) {
-  const raw =
-    entry?.uncompressedSize ??
-    entry?._data?.uncompressedSize ??
-    entry?._dataBinary?.length ??
-    entry?._data?.length ??
-    0;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : 0;
+function normalizeZipPath(value = "") {
+  return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "");
+}
+
+function openZipFile(filePath, options = {}) {
+  const opts = {
+    lazyEntries: true,
+    autoClose: true,
+    decodeStrings: true,
+    validateEntrySizes: true,
+    ...options
+  };
+  return new Promise((resolve, reject) => {
+    yauzl.open(filePath, opts, (err, zipFile) => {
+      if (err || !zipFile) {
+        reject(err || new Error("Could not open package"));
+        return;
+      }
+      resolve(zipFile);
+    });
+  });
+}
+
+function parseHttpRange(rangeRaw = "", totalSize = 0) {
+  const raw = String(rangeRaw || "").trim();
+  if (!raw) return { ok: true, hasRange: false, start: 0, end: Math.max(0, totalSize - 1) };
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(raw);
+  if (!match) return { ok: false };
+
+  let start = 0;
+  let end = Math.max(0, totalSize - 1);
+  const startRaw = match[1];
+  const endRaw = match[2];
+
+  if (startRaw === "" && endRaw === "") return { ok: false };
+
+  if (startRaw !== "") {
+    start = Number(startRaw);
+    end = endRaw !== "" ? Number(endRaw) : end;
+  } else {
+    const suffixLength = Number(endRaw);
+    if (!Number.isFinite(suffixLength) || suffixLength <= 0) return { ok: false };
+    start = Math.max(0, totalSize - suffixLength);
+    end = Math.max(0, totalSize - 1);
+  }
+
+  if (
+    !Number.isFinite(start) ||
+    !Number.isFinite(end) ||
+    start < 0 ||
+    end < start ||
+    start >= totalSize
+  ) {
+    return { ok: false };
+  }
+
+  end = Math.min(end, Math.max(0, totalSize - 1));
+  return {
+    ok: true,
+    hasRange: true,
+    start,
+    end
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -150,6 +209,14 @@ const server = http.createServer(async (req, res) => {
         res.end("File missing");
         return;
       }
+      let archiveStat;
+      try {
+        archiveStat = fs.statSync(filePath);
+      } catch {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("File missing");
+        return;
+      }
 
       const ext = String(path.extname(intent.fileName || "") || "").toLowerCase();
       if (ext !== ".zip" && ext !== ".folder") {
@@ -157,31 +224,67 @@ const server = http.createServer(async (req, res) => {
         res.end("Not a folder or zip package");
         return;
       }
+      if (archiveStat.size > ARCHIVE_PREVIEW_MAX_BYTES) {
+        res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Preview is unavailable for very large folders. Download the folder instead.");
+        return;
+      }
 
-      let zip;
+      let zipFile;
       try {
-        const zipBuffer = await fs.promises.readFile(filePath);
-        zip = await JSZip.loadAsync(zipBuffer);
+        zipFile = await openZipFile(filePath, { lazyEntries: true, autoClose: true });
       } catch {
         res.writeHead(500, { "content-type": "text/plain" });
         res.end("Could not read package");
         return;
       }
 
-      const entries = Object.values(zip.files || {})
-        .map((entry) => {
-          const name = String(entry?.name || "").replace(/\\/g, "/").replace(/^\/+/, "");
-          if (!name || name.includes("\0")) return null;
-          const dateMs = entry?.date instanceof Date ? entry.date.getTime() : 0;
-          return {
+      const entries = await new Promise((resolve, reject) => {
+        const out = [];
+        let done = false;
+        const finish = (err) => {
+          if (done) return;
+          done = true;
+          zipFile.removeAllListeners("entry");
+          zipFile.removeAllListeners("error");
+          zipFile.removeAllListeners("end");
+          if (err) reject(err);
+          else resolve(out);
+        };
+
+        zipFile.on("entry", (entry) => {
+          const rawName = normalizeZipPath(entry?.fileName || "");
+          if (!rawName || rawName.includes("\0")) {
+            zipFile.readEntry();
+            return;
+          }
+
+          const dir = /\/$/.test(rawName);
+          const name = dir ? rawName : rawName.replace(/\/+$/, "");
+          const size = Number(entry?.uncompressedSize || 0);
+          const lastMod = entry?.getLastModDate instanceof Function ? entry.getLastModDate() : null;
+          const dateMs = lastMod instanceof Date ? lastMod.getTime() : 0;
+          out.push({
             name,
-            dir: Boolean(entry?.dir),
-            size: zipEntrySize(entry),
+            dir,
+            size: Number.isFinite(size) && size >= 0 ? size : 0,
             date: Number.isFinite(dateMs) && dateMs > 0 ? dateMs : 0
-          };
-        })
-        .filter(Boolean)
-        .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+          });
+          zipFile.readEntry();
+        });
+
+        zipFile.once("end", () => finish(null));
+        zipFile.once("error", (err) => finish(err));
+        zipFile.readEntry();
+      }).catch(() => null);
+
+      if (!entries) {
+        res.writeHead(500, { "content-type": "text/plain" });
+        res.end("Could not read package");
+        return;
+      }
+
+      entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
 
       res.writeHead(200, {
         "content-type": "application/json; charset=utf-8",
@@ -248,6 +351,14 @@ const server = http.createServer(async (req, res) => {
         res.end("File missing");
         return;
       }
+      let archiveStat;
+      try {
+        archiveStat = fs.statSync(filePath);
+      } catch {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("File missing");
+        return;
+      }
 
       const ext = String(path.extname(intent.fileName || "") || "").toLowerCase();
       if (ext !== ".zip" && ext !== ".folder") {
@@ -255,42 +366,63 @@ const server = http.createServer(async (req, res) => {
         res.end("Not a folder or zip package");
         return;
       }
+      if (archiveStat.size > ARCHIVE_PREVIEW_MAX_BYTES) {
+        res.writeHead(413, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Preview is unavailable for very large folders. Download the folder instead.");
+        return;
+      }
 
-      let zip;
+      let zipFile;
       try {
-        const zipBuffer = await fs.promises.readFile(filePath);
-        zip = await JSZip.loadAsync(zipBuffer);
+        zipFile = await openZipFile(filePath, { lazyEntries: true, autoClose: false });
       } catch {
         res.writeHead(500, { "content-type": "text/plain" });
         res.end("Could not read package");
         return;
       }
 
-      const entry = zip.file(entryPath);
-      if (!entry || entry.dir) {
+      const matched = await new Promise((resolve, reject) => {
+        let done = false;
+        const finish = (result, err) => {
+          if (done) return;
+          done = true;
+          zipFile.removeAllListeners("entry");
+          zipFile.removeAllListeners("end");
+          zipFile.removeAllListeners("error");
+          if (err) reject(err);
+          else resolve(result);
+        };
+
+        zipFile.on("entry", (entry) => {
+          const name = normalizeZipPath(entry?.fileName || "");
+          if (name === entryPath) {
+            finish(entry, null);
+            return;
+          }
+          zipFile.readEntry();
+        });
+        zipFile.once("end", () => finish(null, null));
+        zipFile.once("error", (err) => finish(null, err));
+        zipFile.readEntry();
+      }).catch(() => null);
+
+      if (!matched || /\/$/.test(String(matched.fileName || ""))) {
+        try { zipFile.close(); } catch {}
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("Entry not found");
         return;
       }
 
-      let out;
-      try {
-        out = await entry.async("nodebuffer");
-      } catch {
-        res.writeHead(500, { "content-type": "text/plain" });
-        res.end("Could not read package entry");
-        return;
-      }
-
       const safeName = safeBasename(path.basename(entryPath) || "file");
-      const totalSize = out.length;
+      const totalSize = Number(matched.uncompressedSize || 0);
       const baseHeaders = {
         "content-type": contentTypeForName(safeName),
         "accept-ranges": "bytes",
         "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
       };
 
-      if (totalSize <= 0) {
+      if (!Number.isFinite(totalSize) || totalSize <= 0) {
+        try { zipFile.close(); } catch {}
         res.writeHead(200, {
           ...baseHeaders,
           "content-length": 0
@@ -299,74 +431,101 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const rangeRaw = String(req.headers.range || "").trim();
-      let start = 0;
-      let end = totalSize - 1;
-      let statusCode = 200;
-
-      if (rangeRaw) {
-        const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeRaw);
-        if (!match) {
-          res.writeHead(416, {
-            ...baseHeaders,
-            "content-range": `bytes */${totalSize}`
-          });
-          res.end();
-          return;
-        }
-
-        const startRaw = match[1];
-        const endRaw = match[2];
-
-        if (startRaw === "" && endRaw === "") {
-          res.writeHead(416, {
-            ...baseHeaders,
-            "content-range": `bytes */${totalSize}`
-          });
-          res.end();
-          return;
-        }
-
-        if (startRaw !== "") {
-          start = Number(startRaw);
-          end = endRaw !== "" ? Number(endRaw) : end;
-        } else {
-          const suffixLength = Number(endRaw);
-          if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
-            res.writeHead(416, {
-              ...baseHeaders,
-              "content-range": `bytes */${totalSize}`
-            });
-            res.end();
-            return;
-          }
-          start = Math.max(0, totalSize - suffixLength);
-          end = totalSize - 1;
-        }
-
-        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= totalSize) {
-          res.writeHead(416, {
-            ...baseHeaders,
-            "content-range": `bytes */${totalSize}`
-          });
-          res.end();
-          return;
-        }
-
-        end = Math.min(end, totalSize - 1);
-        statusCode = 206;
+      const parsedRange = parseHttpRange(req.headers.range, totalSize);
+      if (!parsedRange.ok) {
+        try { zipFile.close(); } catch {}
+        res.writeHead(416, {
+          ...baseHeaders,
+          "content-range": `bytes */${totalSize}`
+        });
+        res.end();
+        return;
       }
 
-      const slice = out.subarray(start, end + 1);
+      const start = parsedRange.start;
+      const end = parsedRange.end;
+      const hasRange = parsedRange.hasRange;
+      const requestedLength = Math.max(0, end - start + 1);
       const headers = {
         ...baseHeaders,
-        "content-length": slice.length
+        "content-length": hasRange ? requestedLength : totalSize
       };
-      if (statusCode === 206) {
+      if (hasRange) {
         headers["content-range"] = `bytes ${start}-${end}/${totalSize}`;
       }
-      res.writeHead(statusCode, headers);
-      res.end(slice);
+      res.writeHead(hasRange ? 206 : 200, headers);
+
+      zipFile.openReadStream(matched, { decompress: true }, (err, stream) => {
+        if (err || !stream) {
+          try { zipFile.close(); } catch {}
+          try { if (!res.writableEnded) res.end(); } catch {}
+          return;
+        }
+
+        let closed = false;
+        const closeZip = () => {
+          if (closed) return;
+          closed = true;
+          try { zipFile.close(); } catch {}
+        };
+
+        const abort = () => {
+          try { stream.destroy(); } catch {}
+          closeZip();
+        };
+
+        res.on("close", abort);
+        stream.on("error", abort);
+
+        if (!hasRange) {
+          stream.on("end", closeZip);
+          stream.pipe(res);
+          return;
+        }
+
+        let inputOffset = 0;
+        let sent = 0;
+        stream.on("data", (chunk) => {
+          if (!chunk || chunk.length === 0) return;
+          const chunkStart = inputOffset;
+          const chunkEnd = inputOffset + chunk.length - 1;
+          inputOffset += chunk.length;
+
+          if (chunkEnd < start) return;
+          if (chunkStart > end) {
+            stream.destroy();
+            return;
+          }
+
+          const from = Math.max(0, start - chunkStart);
+          const to = Math.min(chunk.length, end - chunkStart + 1);
+          if (to <= from) return;
+          const outChunk = chunk.subarray(from, to);
+          sent += outChunk.length;
+          if (!res.write(outChunk)) {
+            stream.pause();
+            res.once("drain", () => stream.resume());
+          }
+
+          if (sent >= requestedLength || inputOffset > end) {
+            stream.destroy();
+          }
+        });
+
+        stream.on("close", () => {
+          if (!res.writableEnded) {
+            try { res.end(); } catch {}
+          }
+          closeZip();
+        });
+
+        stream.on("end", () => {
+          if (!res.writableEnded) {
+            try { res.end(); } catch {}
+          }
+          closeZip();
+        });
+      });
       return;
     }
 
@@ -504,7 +663,7 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocket.Server({
   server,
   perMessageDeflate: false,
-  maxPayload: 1024 * 1024 * 1024 * 10, // 10 GB
+  maxPayload: WS_MAX_PAYLOAD_BYTES,
 });
 
 
@@ -643,8 +802,17 @@ function cleanupExpiredIntents() {
       } catch {
         continue;
       }
-      if (!intent?.expiresAt) continue;
-      if (now < intent.expiresAt) continue;
+      const createdAt = Number(intent?.createdAt || 0);
+      const expiresAt = Number(intent?.expiresAt || 0);
+      const createdAtExpiry = createdAt > 0 ? createdAt + RETENTION_MS : 0;
+      let effectiveExpiry = 0;
+      if (expiresAt > 0 && createdAtExpiry > 0) {
+        effectiveExpiry = Math.min(expiresAt, createdAtExpiry);
+      } else {
+        effectiveExpiry = Math.max(expiresAt, createdAtExpiry);
+      }
+      if (!effectiveExpiry) continue;
+      if (now < effectiveExpiry) continue;
 
       if (intent.stored && intent.storedFile) {
         const filePath = path.join(FILES_DIR, intent.storedFile);
@@ -657,6 +825,28 @@ function cleanupExpiredIntents() {
         if (fs.existsSync(intentFile)) fs.unlinkSync(intentFile);
       } catch {}
     }
+  } catch {}
+}
+
+function cleanupOrphanStoredFiles() {
+  try {
+    const inUse = new Set();
+    const intents = fs.readdirSync(INTENTS_DIR).filter((f) => f.endsWith(".json"));
+    intents.forEach((file) => {
+      try {
+        const intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
+        const stored = String(intent?.storedFile || "").trim();
+        if (stored) inUse.add(stored);
+      } catch {}
+    });
+
+    const files = fs.readdirSync(FILES_DIR);
+    files.forEach((storedFile) => {
+      if (inUse.has(storedFile)) return;
+      try {
+        fs.unlinkSync(path.join(FILES_DIR, storedFile));
+      } catch {}
+    });
   } catch {}
 }
 
@@ -2692,8 +2882,6 @@ if (data.type === "send_intent") {
     intent.completedAt = now;
   }
 
-  if (!inboxes.has(to)) inboxes.set(to, []);
-  inboxes.get(to).push(intent);
   saveIntent(intent);
 
   const receiverWs = online.get(to);
@@ -2734,11 +2922,12 @@ if (data.type === "accept_intent") {
     return send(ws, { type: "error", message: "Missing intentId" });
   }
 
-  const inbox = inboxes.get(ws.username) || [];
-  const intent = inbox.find(i => i.id === intentId);
-
+  const intent = loadIntent(intentId);
   if (!intent) {
     return send(ws, { type: "error", message: "Intent not found" });
+  }
+  if (intent.to !== ws.username) {
+    return send(ws, { type: "error", message: "Not authorized" });
   }
 
   if (intent.status !== "pending") {
@@ -2747,6 +2936,7 @@ if (data.type === "accept_intent") {
 
   // ✅ Mark as accepted
 intent.status = "accepted";
+saveIntent(intent);
 
 // ✅ Notify receiver
 send(ws, {
@@ -2840,7 +3030,9 @@ return send(ws, {
 });
 
 cleanupExpiredIntents();
+cleanupOrphanStoredFiles();
 setInterval(cleanupExpiredIntents, 60 * 60 * 1000);
+setInterval(cleanupOrphanStoredFiles, 60 * 60 * 1000);
 setInterval(cleanupStalledTransfers, TRANSFER_SWEEP_INTERVAL_MS);
 
 server.listen(PORT, () => {

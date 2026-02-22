@@ -1,3 +1,12 @@
 node_modules
 .env
+.git
+.DS_Store
+*.log
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
+# Never send runtime data to image build context
+p2p-storage
+public/p2p-storage
