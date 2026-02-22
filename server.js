@@ -1243,19 +1243,16 @@ function loadIntentsForUser(username) {
     } catch {
       continue;
     }
-    if (intent.to === username) {
-      if (!intent.downloadToken) {
+    const isParticipant = intent.to === username || intent.from === username;
+    if (!isParticipant) continue;
+    if (!intent.downloadToken && !(intent.isTextOnly || intent.messageType === "text")) {
         intent.downloadToken = generateDownloadToken();
         saveIntent(intent);
-      }
-      // Only show if:
-      // - stored file is ready, OR
-      // - it's pending/accepted (still valid intent)
-      // (uploading should show, but NOT as downloadable unless stored=true)
-      intents.push(intent);
     }
+    // Return full message timeline for this account (sent + received)
+    intents.push(intent);
   }
-  return intents;
+  return intents.sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0));
 }
 
 function findIntentByClientId(sender, clientIntentId) {
