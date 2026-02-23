@@ -24,7 +24,7 @@ const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 102
 const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CACHE_TTL_MS || 10 * 1000));
 const OFFLINE_UPLOAD_STREAM_HWM_BYTES = Math.max(
   1024 * 1024,
-  Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 32 * 1024 * 1024)
+  Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 64 * 1024 * 1024)
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 
