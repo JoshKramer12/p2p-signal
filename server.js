@@ -21,12 +21,12 @@ const ARCHIVE_PREVIEW_MAX_BYTES = Math.max(
 const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
-const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CACHE_TTL_MS || 30 * 1000));
+const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CACHE_TTL_MS || 10 * 1000));
 const OFFLINE_UPLOAD_STREAM_HWM_BYTES = Math.max(
   1024 * 1024,
-  Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 64 * 1024 * 1024)
+  Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 32 * 1024 * 1024)
 );
-const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 700));
+const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 
 // username -> ws
 const online = new Map();
