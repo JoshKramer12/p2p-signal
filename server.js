@@ -1497,6 +1497,42 @@ function sendFriendRequestsUpdate(username) {
   });
 }
 
+function friendsListPayload(userRecord) {
+  const user = ensureUserShape(userRecord);
+  return {
+    type: "friends_list",
+    friends: user.friends || [],
+    deletedFriends: user.deletedFriends || [],
+    onlineUsers: Array.from(online.keys())
+  };
+}
+
+function sendFriendsList(ws, userRecord = null) {
+  if (!ws) return false;
+  let user = userRecord;
+  if (!user && ws.username) {
+    user = loadUser(ws.username);
+  }
+  if (!user) {
+    return send(ws, { type: "friends_list", friends: [], deletedFriends: [], onlineUsers: Array.from(online.keys()) });
+  }
+  return send(ws, friendsListPayload(user));
+}
+
+function broadcastFriendsListForUserAndFriends(username) {
+  const name = String(username || "").trim();
+  if (!name) return;
+  const u0 = loadUser(name);
+  if (!u0) return;
+  const user = ensureUserShape(u0);
+  const targets = new Set([name, ...(user.friends || [])]);
+  targets.forEach((target) => {
+    const w = online.get(target);
+    if (!w) return;
+    sendFriendsList(w);
+  });
+}
+
 function queueIntentDeletionForUser(username, payload) {
   const name = String(username || "").trim();
   const intentId = String(payload?.intentId || "").trim();
@@ -1677,6 +1713,10 @@ if (data.type === "delete_account") {
     return send(ws, { type: "error", message: "Not logged in" });
   }
 
+  if (online.get(username) === ws) {
+    online.delete(username);
+  }
+
   // Mark as deleted in other users' lists
   try {
     const files = fs.readdirSync(USERS_DIR).filter(f => f.endsWith(".json"));
@@ -1695,7 +1735,7 @@ if (data.type === "delete_account") {
 
       const w = online.get(u.username);
       if (w) {
-        send(w, { type: "friends_list", friends: u.friends, deletedFriends: u.deletedFriends });
+        sendFriendsList(w, u);
         sendFriendRequestsUpdate(u.username);
       }
     }
@@ -1711,7 +1751,7 @@ if (data.type === "delete_account") {
     console.error("❌ Failed to delete user file:", err);
   }
 
-  // Remove from online users
+  // Remove from online users (already removed above when this socket owns the session)
   online.delete(username);
 
   // Acknowledge + disconnect
@@ -1818,9 +1858,10 @@ if (!user.friends.includes(user.username)) {
   const u2 = ensureUserShape(user);
   saveUser(u2);
   flushQueuedIntentDeletions(ws, u2);
-  send(ws, { type: "friends_list", friends: u2.friends, deletedFriends: u2.deletedFriends });
+  sendFriendsList(ws, u2);
   send(ws, { type: "profiles", profiles: loadProfiles(u2.friends || []) });
   send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests, declined: u2.declinedRequests });
+  broadcastFriendsListForUserAndFriends(username);
 
   return;
 }
@@ -1934,11 +1975,7 @@ if (!user.friends.includes(user.username)) {
   const u2 = ensureUserShape(loadUser(username));
   saveUser(u2);
   flushQueuedIntentDeletions(ws, u2);
-  send(ws, {
-    type: "friends_list",
-    friends: u2.friends || [],
-    deletedFriends: u2.deletedFriends || [],
-  });
+  sendFriendsList(ws, u2);
   send(ws, {
     type: "profiles",
     profiles: loadProfiles(u2.friends || [])
@@ -1949,6 +1986,7 @@ if (!user.friends.includes(user.username)) {
     outgoing: u2.outgoingRequests || [],
     declined: u2.declinedRequests || [],
   });
+  broadcastFriendsListForUserAndFriends(username);
 
   return;
 }
@@ -1984,6 +2022,7 @@ if (data.type === "login") {
 
   const pending = loadIntentsForUser(name);
   send(ws, { type: "inbox", items: pending });
+  broadcastFriendsListForUserAndFriends(name);
 
   return;
 }
@@ -2441,12 +2480,12 @@ if (data.type === "friend_request_accept") {
 
   // Push updated friends list to both sides if online
   const meUpdated = ensureUserShape(loadUser(ws.username));
-  send(ws, { type: "friends_list", friends: meUpdated.friends, deletedFriends: meUpdated.deletedFriends });
+  sendFriendsList(ws, meUpdated);
 
   const otherWs = online.get(requester);
   if (otherWs) {
     const otherUpdated = ensureUserShape(loadUser(requester));
-    send(otherWs, { type: "friends_list", friends: otherUpdated.friends, deletedFriends: otherUpdated.deletedFriends });
+    sendFriendsList(otherWs, otherUpdated);
   }
 
   sendFriendRequestsUpdate(ws.username);
@@ -2634,7 +2673,7 @@ if (data.type === "remove_friend") {
   me.declinedRequests = (me.declinedRequests || []).filter(n => n !== target);
   saveUser(me);
 
-  send(ws, { type: "friends_list", friends: me.friends, deletedFriends: me.deletedFriends });
+  sendFriendsList(ws, me);
   sendFriendRequestsUpdate(ws.username);
   return;
 }
@@ -2738,14 +2777,12 @@ if (data.type === "delete_message_everyone") {
 // =========================
 if (data.type === "friends_list") {
   const u0 = loadUser(ws.username);
-if (!u0) return send(ws, { type: "friends_list", friends: [] });
+if (!u0) return sendFriendsList(ws, null);
 
 const user = ensureUserShape(u0);
-send(ws, { type: "friends_list", friends: user.friends, deletedFriends: user.deletedFriends });
+sendFriendsList(ws, user);
 send(ws, { type: "profiles", profiles: loadProfiles(user.friends || []) });
 return;
-
-  return send(ws, { type: "friends_list", friends: user?.friends || [] });
 }
 
 // =========================
@@ -2793,12 +2830,12 @@ if (data.type === "add_friend") {
 
   // Push updated friends list to both sides if online
   const me = ensureUserShape(loadUser(ws.username));
-  send(ws, { type: "friends_list", friends: me.friends });
+  sendFriendsList(ws, me);
 
   const otherWs = online.get(friend);
   if (otherWs) {
     const other = ensureUserShape(loadUser(friend));
-    send(otherWs, { type: "friends_list", friends: other.friends });
+    sendFriendsList(otherWs, other);
   }
 
   return;
@@ -3289,8 +3326,10 @@ return send(ws, {
   });
 
   ws.on("close", () => {
-  if (ws.username && online.get(ws.username) === ws) {
-    online.delete(ws.username);
+  const disconnectedUser = String(ws.username || "").trim();
+  if (disconnectedUser && online.get(disconnectedUser) === ws) {
+    online.delete(disconnectedUser);
+    broadcastFriendsListForUserAndFriends(disconnectedUser);
   }
 
   if (ws.currentUploadIntentId) {
