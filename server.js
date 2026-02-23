@@ -21,6 +21,12 @@ const ARCHIVE_PREVIEW_MAX_BYTES = Math.max(
 const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
+const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CACHE_TTL_MS || 30 * 1000));
+const OFFLINE_UPLOAD_STREAM_HWM_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 64 * 1024 * 1024)
+);
+const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 700));
 
 // username -> ws
 const online = new Map();
@@ -32,6 +38,7 @@ const inboxes = new Map();
 const activeTransfers = new Map();
 const archiveIndexCache = new Map(); // intentId -> { entries, archiveSize, archiveMtimeMs, cachedAt }
 const previewExtractJobs = new Map(); // cachePath -> Promise<void>
+const intentListCacheByUser = new Map(); // username -> { ts, items }
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -946,6 +953,7 @@ function deleteIntentAndNotify(intent) {
   if (!intent) return;
   const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
   try { if (fs.existsSync(intentFile)) fs.unlinkSync(intentFile); } catch {}
+  invalidateIntentListCacheForIntent(intent);
   removePreviewCacheForIntent(intent.id);
   archiveIndexCache.delete(String(intent.id || ""));
 
@@ -1212,6 +1220,7 @@ fs.mkdirSync(PREVIEW_CACHE_DIR, { recursive: true });
 function saveIntent(intent) {
   const file = path.join(INTENTS_DIR, `${intent.id}.json`);
   fs.writeFileSync(file, JSON.stringify(intent, null, 2));
+  invalidateIntentListCacheForIntent(intent);
 }
 
 function loadIntent(intentId) {
@@ -1233,8 +1242,28 @@ function generateSessionToken() {
   return randomUUID() + randomUUID();
 }
 
+function invalidateIntentListCacheForUser(username) {
+  const key = String(username || "").trim();
+  if (!key) return;
+  intentListCacheByUser.delete(key);
+}
+
+function invalidateIntentListCacheForIntent(intent) {
+  if (!intent) return;
+  invalidateIntentListCacheForUser(intent.from);
+  invalidateIntentListCacheForUser(intent.to);
+}
 
 function loadIntentsForUser(username) {
+  const key = String(username || "").trim();
+  if (!key) return [];
+
+  const now = Date.now();
+  const cached = intentListCacheByUser.get(key);
+  if (cached && now - Number(cached.ts || 0) < INTENT_LIST_CACHE_TTL_MS) {
+    return Array.isArray(cached.items) ? cached.items : [];
+  }
+
   const intents = [];
   for (const file of fs.readdirSync(INTENTS_DIR)) {
     let intent;
@@ -1243,16 +1272,24 @@ function loadIntentsForUser(username) {
     } catch {
       continue;
     }
-    const isParticipant = intent.to === username || intent.from === username;
+    const isParticipant = intent.to === key || intent.from === key;
     if (!isParticipant) continue;
     if (!intent.downloadToken && !(intent.isTextOnly || intent.messageType === "text")) {
         intent.downloadToken = generateDownloadToken();
-        saveIntent(intent);
+        const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
+        try {
+          fs.writeFileSync(intentFile, JSON.stringify(intent, null, 2));
+        } catch {}
     }
     // Return full message timeline for this account (sent + received)
     intents.push(intent);
   }
-  return intents.sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0));
+  intents.sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0));
+  intentListCacheByUser.set(key, {
+    ts: now,
+    items: intents
+  });
+  return intents;
 }
 
 function findIntentByClientId(sender, clientIntentId) {
@@ -1515,6 +1552,8 @@ function addFriendSymmetric(a, b) {
 
 
 wss.on("connection", (ws, req) => {
+  try { ws?._socket?.setNoDelay(true); } catch {}
+  try { ws?._socket?.setKeepAlive(true, 15_000); } catch {}
 
   const endpoint = getPublicEndpoint(req);
 ws.publicIp = endpoint.ip;
@@ -2484,6 +2523,15 @@ if (data.type === "storage_stats") {
 // 📬 INBOX SYNC
 // =========================
 if (data.type === "inbox_request") {
+  const now = Date.now();
+  const force = Boolean(data.force);
+  if (!force) {
+    const lastTs = Number(ws._lastInboxRequestTs || 0);
+    if (lastTs && (now - lastTs) < INBOX_REQUEST_MIN_INTERVAL_MS) {
+      return;
+    }
+  }
+  ws._lastInboxRequestTs = now;
   const items = loadIntentsForUser(ws.username);
   return send(ws, { type: "inbox", items });
 }
@@ -2812,7 +2860,7 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
     // Create write stream for raw bytes
     const writeStream = fs.createWriteStream(filePath, {
       flags: "w",
-      highWaterMark: 16 * 1024 * 1024, // balanced throughput + backpressure
+      highWaterMark: OFFLINE_UPLOAD_STREAM_HWM_BYTES, // tuned for high-throughput offline uploads
     });
 
 
