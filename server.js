@@ -2029,7 +2029,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
   let data;
     try {
       data = JSON.parse(msg.toString());
-      if (!["ping", "inbox_request", "friends_list"].includes(String(data?.type || ""))) {
+      if (!["ping", "inbox_request", "friends_list", "typing"].includes(String(data?.type || ""))) {
         console.log("📩 Message received:", data);
       }
     } catch {
@@ -2679,6 +2679,27 @@ if (intentOnDisk?.stored) {
     // 🔓 Allow ping before login (keepalive / handshake safety)
 if (data.type === "ping") {
   send(ws, { type: "pong" });
+  return;
+}
+
+if (data.type === "typing") {
+  const to = String(data.to || "").trim();
+  if (!to || to === ws.username) return;
+
+  const sender = ensureUserShape(loadUser(ws.username));
+  if (!sender?.friends?.includes(to)) return;
+
+  const receiverWs = online.get(to);
+  if (!receiverWs || receiverWs.readyState !== WebSocket.OPEN) return;
+
+  send(receiverWs, {
+    type: "typing",
+    from: ws.username,
+    isTyping: Boolean(data.isTyping),
+    hasText: Boolean(data.hasText),
+    hasFiles: Boolean(data.hasFiles),
+    at: Date.now()
+  });
   return;
 }
 
