@@ -49,7 +49,7 @@ const intentListCacheByUser = new Map(); // username -> { ts, items }
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password");
   res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition,Content-Range,Accept-Ranges");
 }
 
@@ -1316,6 +1316,13 @@ function sanitizeIntentAccessControl(raw = null, isTextOnly = false) {
     salt,
     hash
   };
+}
+
+function sanitizeIntentPasswordHint(raw = "", isTextOnly = false, accessControl = null) {
+  if (isTextOnly) return "";
+  if (String(accessControl?.type || "").toLowerCase() !== "password") return "";
+  if (typeof raw !== "string") return "";
+  return String(raw).trim().slice(0, 120);
 }
 
 function isIntentPasswordProtected(intent) {
@@ -2953,6 +2960,7 @@ if (data.type === "intent_access_request") {
       transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued")),
       encryption: intent.encryption || null,
       passwordProtected: isIntentPasswordProtected(intent),
+      passwordHint: String(intent.passwordHint || ""),
       customExpiry: hasIntentCustomExpiry(intent),
       isTextOnly: Boolean(intent.isTextOnly || intent.messageType === "text")
     }
@@ -3589,6 +3597,7 @@ if (data.type === "send_intent") {
   const clientIntentId = String(data.clientIntentId || "").trim();
   const encryption = sanitizeIntentEncryption(data.encryption || null, ws.username, to);
   const accessControl = sanitizeIntentAccessControl(data.accessControl || null, isTextOnly);
+  const passwordHint = sanitizeIntentPasswordHint(data.passwordHint, isTextOnly, accessControl);
   const now = Date.now();
   const rawExpiresAt = Number(data.expiresAt || 0);
   const hasCustomExpiry = Number.isFinite(rawExpiresAt) && rawExpiresAt > 0;
@@ -3691,6 +3700,7 @@ if (data.type === "send_intent") {
         uploadBytesExpected: Number(existing.uploadBytesExpected || existing.fileSize || 0),
         encryption: existing.encryption || null,
         passwordProtected: isIntentPasswordProtected(existing),
+        passwordHint: String(existing.passwordHint || ""),
         customExpiry: hasIntentCustomExpiry(existing),
         transferState: existing.transferState || (existing.readByRecipientAt ? "read" : (existing.stored ? "delivered" : "queued"))
       });
@@ -3711,6 +3721,7 @@ if (data.type === "send_intent") {
     encryption: encryption || null,
     accessControl: isTextOnly ? null : (accessControl || null),
     passwordProtected: Boolean(!isTextOnly && accessControl),
+    passwordHint: passwordHint || "",
     uploadBytesExpected: isTextOnly ? 0 : uploadBytesExpected,
     clientIntentId: clientIntentId || null,
     createdAt: now,
@@ -3771,6 +3782,7 @@ if (data.type === "send_intent") {
     uploadBytesExpected: Number(intent.uploadBytesExpected || intent.fileSize || 0),
     encryption: intent.encryption || null,
     passwordProtected: isIntentPasswordProtected(intent),
+    passwordHint: String(intent.passwordHint || ""),
     customExpiry: hasIntentCustomExpiry(intent),
     transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued"))
   });
