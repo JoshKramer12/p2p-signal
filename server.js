@@ -3,7 +3,7 @@
 
 const http = require("http");
 const WebSocket = require("ws");
-const { randomUUID, createHash } = require("crypto");
+const { randomUUID, createHash, timingSafeEqual } = require("crypto");
 const net = require("net");
 const yauzl = require("yauzl");
 
@@ -11,6 +11,7 @@ const PORT = process.env.PORT || 8080;
 
 const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 30);
 const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const MIN_INTENT_TTL_MS = Math.max(60 * 1000, Number(process.env.MIN_INTENT_TTL_MS || 60 * 1000));
 const TRANSFER_IDLE_TIMEOUT_MS = Number(process.env.TRANSFER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
 const TRANSFER_SWEEP_INTERVAL_MS = Number(process.env.TRANSFER_SWEEP_INTERVAL_MS || 15 * 1000);
 const USER_STORAGE_QUOTA_BYTES = Number(process.env.USER_STORAGE_QUOTA_BYTES || 5 * 1024 * 1024 * 1024);
@@ -22,11 +23,16 @@ const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 *
 const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
 const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CACHE_TTL_MS || 10 * 1000));
+const REQUIRE_E2EE = String(process.env.REQUIRE_E2EE || "1") !== "0";
 const OFFLINE_UPLOAD_STREAM_HWM_BYTES = Math.max(
   1024 * 1024,
   Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 64 * 1024 * 1024)
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
+const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
+  256 * 1024,
+  Number(process.env.UPLOAD_CHECKPOINT_EVERY_BYTES || 2 * 1024 * 1024)
+);
 
 // username -> ws
 const online = new Map();
@@ -501,6 +507,9 @@ const server = http.createServer(async (req, res) => {
         res.end("Forbidden");
         return;
       }
+      if (!enforceIntentPasswordGate(req, res, url, intent)) {
+        return;
+      }
 
       const filePath = path.join(FILES_DIR, intent.storedFile);
       if (!fs.existsSync(filePath)) {
@@ -654,6 +663,9 @@ const server = http.createServer(async (req, res) => {
         res.end("Forbidden");
         return;
       }
+      if (!enforceIntentPasswordGate(req, res, url, intent)) {
+        return;
+      }
 
       const filePath = path.join(FILES_DIR, intent.storedFile);
       if (!fs.existsSync(filePath)) {
@@ -728,6 +740,9 @@ const server = http.createServer(async (req, res) => {
       if (intent.downloadToken !== token) {
         res.writeHead(403, { "content-type": "text/plain" });
         res.end("Forbidden");
+        return;
+      }
+      if (!enforceIntentPasswordGate(req, res, url, intent)) {
         return;
       }
 
@@ -1210,6 +1225,143 @@ function safeBasename(name) {
     .trim();
 }
 
+function sanitizeIntentEncryption(raw = null, from = "", to = "") {
+  if (!raw || typeof raw !== "object") return null;
+  const mode = String(raw.mode || "").trim().toLowerCase();
+  if (!["file", "text"].includes(mode)) return null;
+
+  const version = Number(raw.v || raw.version || 1);
+  if (!Number.isFinite(version) || version <= 0 || version > 3) return null;
+
+  const alg = String(raw.alg || "AES-GCM").trim().slice(0, 40) || "AES-GCM";
+  const out = { v: version, mode, alg };
+
+  const keyWrap = raw.keyWrap && typeof raw.keyWrap === "object" ? raw.keyWrap : {};
+  const wrapped = {};
+  [from, to].forEach((username) => {
+    const key = String(username || "").trim();
+    if (!key) return;
+    const value = String(keyWrap[key] || "").trim();
+    if (!value || value.length > 8192) return;
+    wrapped[key] = value;
+  });
+  if (!wrapped[from] || !wrapped[to]) return null;
+  out.keyWrap = wrapped;
+
+  if (mode === "file") {
+    const chunkSize = Number(raw.chunkSize || 0);
+    const tagBytes = Number(raw.tagBytes || 16);
+    const plainSize = Number(raw.plainSize || 0);
+    const ivSeed = String(raw.ivSeed || "").trim();
+    if (!Number.isFinite(chunkSize) || chunkSize < 64 * 1024 || chunkSize > 8 * 1024 * 1024) return null;
+    if (!Number.isFinite(tagBytes) || tagBytes < 8 || tagBytes > 32) return null;
+    if (!Number.isFinite(plainSize) || plainSize <= 0) return null;
+    if (!ivSeed || ivSeed.length > 200) return null;
+    out.chunkSize = chunkSize;
+    out.tagBytes = tagBytes;
+    out.plainSize = plainSize;
+    out.ivSeed = ivSeed;
+  } else if (mode === "text") {
+    const iv = String(raw.iv || "").trim();
+    if (!iv || iv.length > 200) return null;
+    out.iv = iv;
+  }
+
+  return out;
+}
+
+function normalizeUploadBytesExpected(raw = 0, fallback = 0) {
+  const value = Number(raw || 0);
+  if (Number.isFinite(value) && value > 0) return Math.floor(value);
+  const fb = Number(fallback || 0);
+  if (Number.isFinite(fb) && fb > 0) return Math.floor(fb);
+  return 0;
+}
+
+function sha256Hex(text = "") {
+  return createHash("sha256").update(String(text || ""), "utf8").digest("hex");
+}
+
+function sanitizeIntentExpiresAt(rawExpiresAt, now = Date.now()) {
+  const maxExpiry = now + RETENTION_MS;
+  const raw = Number(rawExpiresAt || 0);
+  if (!Number.isFinite(raw) || raw <= 0) return maxExpiry;
+  const minExpiry = now + MIN_INTENT_TTL_MS;
+  const bounded = Math.min(maxExpiry, Math.max(minExpiry, Math.floor(raw)));
+  return bounded;
+}
+
+function sanitizeIntentAccessControl(raw = null, isTextOnly = false) {
+  if (!raw || typeof raw !== "object") return null;
+  if (isTextOnly) return null;
+  const type = String(raw.type || "").trim().toLowerCase();
+  if (type !== "password") return null;
+
+  const salt = String(raw.salt || "").trim().toLowerCase();
+  const hash = String(raw.hash || "").trim().toLowerCase();
+  const alg = String(raw.alg || "SHA-256").trim().toUpperCase();
+  if (alg !== "SHA-256") return null;
+  if (!/^[0-9a-f]{16,128}$/.test(salt)) return null;
+  if (!/^[0-9a-f]{64}$/.test(hash)) return null;
+
+  return {
+    v: 1,
+    type: "password",
+    alg: "SHA-256",
+    salt,
+    hash
+  };
+}
+
+function isIntentPasswordProtected(intent) {
+  return String(intent?.accessControl?.type || "").toLowerCase() === "password";
+}
+
+function extractIntentPasswordFromRequest(req, url) {
+  const headerRaw = req?.headers?.["x-merm-password"];
+  const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+  const fromHeader = String(headerValue || "").trim();
+  if (fromHeader) return fromHeader;
+  const fromQuery = String(url?.searchParams?.get("pw") || "").trim();
+  if (fromQuery) return fromQuery;
+  return "";
+}
+
+function verifyIntentPassword(intent, providedPassword = "") {
+  if (!isIntentPasswordProtected(intent)) {
+    return { ok: true };
+  }
+
+  const password = String(providedPassword || "");
+  if (!password) {
+    return { ok: false, status: 401, message: "Password required for this file" };
+  }
+
+  const salt = String(intent?.accessControl?.salt || "").trim().toLowerCase();
+  const expectedHash = String(intent?.accessControl?.hash || "").trim().toLowerCase();
+  if (!salt || !/^[0-9a-f]{64}$/.test(expectedHash)) {
+    return { ok: false, status: 403, message: "Invalid access protection state" };
+  }
+
+  const actualHash = sha256Hex(`${salt}:${password}`);
+  try {
+    const expectedBuf = Buffer.from(expectedHash, "hex");
+    const actualBuf = Buffer.from(actualHash, "hex");
+    if (expectedBuf.length === actualBuf.length && timingSafeEqual(expectedBuf, actualBuf)) {
+      return { ok: true };
+    }
+  } catch {}
+  return { ok: false, status: 403, message: "Incorrect password" };
+}
+
+function enforceIntentPasswordGate(req, res, url, intent) {
+  const check = verifyIntentPassword(intent, extractIntentPasswordFromRequest(req, url));
+  if (check.ok) return true;
+  res.writeHead(Number(check.status || 403), { "content-type": "text/plain; charset=utf-8" });
+  res.end(String(check.message || "Forbidden"));
+  return false;
+}
+
 
 fs.mkdirSync(INTENTS_DIR, { recursive: true });
 fs.mkdirSync(FILES_DIR, { recursive: true });
@@ -1221,6 +1373,14 @@ function saveIntent(intent) {
   const file = path.join(INTENTS_DIR, `${intent.id}.json`);
   fs.writeFileSync(file, JSON.stringify(intent, null, 2));
   invalidateIntentListCacheForIntent(intent);
+}
+
+function intentForClient(rawIntent) {
+  if (!rawIntent || typeof rawIntent !== "object") return null;
+  const intent = { ...rawIntent };
+  delete intent.accessControl;
+  intent.passwordProtected = isIntentPasswordProtected(rawIntent);
+  return intent;
 }
 
 function loadIntent(intentId) {
@@ -1281,8 +1441,22 @@ function loadIntentsForUser(username) {
           fs.writeFileSync(intentFile, JSON.stringify(intent, null, 2));
         } catch {}
     }
+    if (!intent.transferState) {
+      if (intent.readByRecipientAt) intent.transferState = "read";
+      else if (intent.stored) intent.transferState = "delivered";
+      else if (String(intent.status || "") === "uploading") intent.transferState = "uploading";
+      else intent.transferState = "queued";
+    }
+    intent.passwordProtected = isIntentPasswordProtected(intent);
+    if (intent.stored && !Number.isFinite(Number(intent.storedBytes || 0))) {
+      intent.storedBytes = resolveUploadExpectedBytes(intent) || Number(intent.fileSize || 0) || 0;
+    }
+    if (Number(intent.storedBytes || 0) > 0 && !Number.isFinite(Number(intent.plainStoredBytes || 0))) {
+      intent.plainStoredBytes = uploadBytesToPlainBytes(intent, Number(intent.storedBytes || 0));
+    }
     // Return full message timeline for this account (sent + received)
-    intents.push(intent);
+    const safeIntent = intentForClient(intent);
+    if (safeIntent) intents.push(safeIntent);
   }
   intents.sort((a, b) => Number(a?.createdAt || 0) - Number(b?.createdAt || 0));
   intentListCacheByUser.set(key, {
@@ -1335,6 +1509,110 @@ function send(ws, obj) {
   }
 }
 
+function resolveIntentEncryptionMeta(intent) {
+  const enc = intent?.encryption;
+  if (!enc || typeof enc !== "object") return null;
+  const mode = String(enc.mode || "").toLowerCase();
+  if (mode !== "file") return null;
+  const chunkSize = Number(enc.chunkSize || 0);
+  const tagBytes = Number(enc.tagBytes || 16);
+  if (!Number.isFinite(chunkSize) || chunkSize <= 0) return null;
+  if (!Number.isFinite(tagBytes) || tagBytes < 0 || tagBytes > 64) return null;
+  return {
+    chunkSize,
+    tagBytes,
+    plainSize: Number(enc.plainSize || intent?.fileSize || 0)
+  };
+}
+
+function resolveUploadExpectedBytes(intent) {
+  const uploadSize = Number(intent?.uploadBytesExpected || 0);
+  if (Number.isFinite(uploadSize) && uploadSize > 0) return uploadSize;
+  const fileSize = Number(intent?.fileSize || 0);
+  if (Number.isFinite(fileSize) && fileSize > 0) return fileSize;
+  return 0;
+}
+
+function resolveEncryptedChunkStride(intent) {
+  const enc = resolveIntentEncryptionMeta(intent);
+  if (!enc) return 0;
+  return enc.chunkSize + enc.tagBytes;
+}
+
+function alignResumeOffset(intent, uploadBytes) {
+  const raw = Math.max(0, Number(uploadBytes || 0));
+  const stride = resolveEncryptedChunkStride(intent);
+  if (!stride) return raw;
+  return Math.floor(raw / stride) * stride;
+}
+
+function uploadBytesToPlainBytes(intent, uploadBytes) {
+  const bytes = Math.max(0, Number(uploadBytes || 0));
+  const enc = resolveIntentEncryptionMeta(intent);
+  if (!enc) return bytes;
+
+  const stride = enc.chunkSize + enc.tagBytes;
+  if (!stride) return bytes;
+
+  const fullCipherChunks = Math.floor(bytes / stride);
+  const remCipher = bytes % stride;
+  let plain = fullCipherChunks * enc.chunkSize;
+  if (remCipher > enc.tagBytes) {
+    plain += remCipher - enc.tagBytes;
+  }
+  const plainSize = Number(enc.plainSize || intent?.fileSize || 0);
+  if (Number.isFinite(plainSize) && plainSize > 0) {
+    plain = Math.min(plain, plainSize);
+  }
+  return Math.max(0, plain);
+}
+
+function emitTransferState(intent, state, extra = {}) {
+  if (!intent || !intent.id) return;
+  const normalizedState = String(state || "").trim() || "queued";
+  const payload = {
+    type: "transfer_state",
+    intentId: intent.id,
+    from: intent.from,
+    to: intent.to,
+    state: normalizedState,
+    at: Date.now(),
+    sentBytes: Number(extra.sentBytes || 0),
+    totalBytes: Number(extra.totalBytes || resolveUploadExpectedBytes(intent) || 0),
+    plainSentBytes: Number(
+      Number.isFinite(extra.plainSentBytes)
+        ? extra.plainSentBytes
+        : uploadBytesToPlainBytes(intent, Number(extra.sentBytes || 0))
+    ),
+    plainTotalBytes: Number(
+      Number.isFinite(extra.plainTotalBytes)
+        ? extra.plainTotalBytes
+        : (Number(intent.fileSize || 0) || uploadBytesToPlainBytes(intent, resolveUploadExpectedBytes(intent)))
+    ),
+    retryable: Boolean(extra.retryable),
+    message: String(extra.message || "")
+  };
+  const sender = intent?.from ? online.get(intent.from) : null;
+  const receiver = intent?.to ? online.get(intent.to) : null;
+  if (sender) send(sender, payload);
+  if (receiver && receiver !== sender) send(receiver, payload);
+}
+
+function updateIntentUploadCheckpoint(intent, sentBytes, options = {}) {
+  if (!intent || !intent.id) return;
+  const uploadSent = Math.max(0, Number(sentBytes || 0));
+  const total = resolveUploadExpectedBytes(intent);
+  const plainSent = uploadBytesToPlainBytes(intent, uploadSent);
+  intent.stored = false;
+  intent.storedBytes = uploadSent;
+  intent.plainStoredBytes = plainSent;
+  intent.uploadBytesExpected = total || Number(intent.uploadBytesExpected || 0) || Number(intent.fileSize || 0) || 0;
+  intent.status = String(options.status || intent.status || "uploading");
+  intent.transferState = String(options.transferState || intent.transferState || "uploading");
+  intent.updatedAt = Date.now();
+  try { saveIntent(intent); } catch {}
+}
+
 function maybeSendUploadProgress(t) {
   if (!t || !t.intent || !t.intent.to) return;
   const now = Date.now();
@@ -1350,16 +1628,34 @@ function maybeSendUploadProgress(t) {
 
   t.lastProgressTs = now;
   t.lastProgressBytes = t.bytesSent;
+  const totalBytes = Number(t.bytesExpected || resolveUploadExpectedBytes(t.intent) || 0);
+  const plainSentBytes = uploadBytesToPlainBytes(t.intent, t.bytesSent);
+  const plainTotalBytes = Number(t.intent?.fileSize || 0) || uploadBytesToPlainBytes(t.intent, totalBytes);
 
   const receiverWs = online.get(t.intent.to);
-  if (!receiverWs) return;
+  if (receiverWs) {
+    send(receiverWs, {
+      type: "incoming_progress",
+      intentId: t.intent.id,
+      bytesSent: plainSentBytes,
+      bytesExpected: plainTotalBytes || Number(t.intent?.fileSize || 0) || 0
+    });
+  }
 
-  send(receiverWs, {
-    type: "incoming_progress",
-    intentId: t.intent.id,
-    bytesSent: t.bytesSent,
-    bytesExpected: t.bytesExpected
+  emitTransferState(t.intent, "uploading", {
+    sentBytes: t.bytesSent,
+    totalBytes,
+    plainSentBytes,
+    plainTotalBytes
   });
+
+  if (!t.lastCheckpointBytes || (t.bytesSent - t.lastCheckpointBytes) >= UPLOAD_CHECKPOINT_EVERY_BYTES || t.bytesSent === totalBytes) {
+    t.lastCheckpointBytes = t.bytesSent;
+    updateIntentUploadCheckpoint(t.intent, t.bytesSent, {
+      status: "uploading",
+      transferState: "uploading"
+    });
+  }
 }
 
 function pauseWsInbound(ws) {
@@ -1388,10 +1684,12 @@ function failActiveTransfer(intentId, message, options = {}) {
   if (!intentId) return null;
   const t = activeTransfers.get(intentId);
   const intent = t?.intent || loadIntent(intentId);
+  const preservePartial = Boolean(options.preservePartial);
+  const bytesUploaded = Number(t?.bytesSent || 0);
 
   try { t?.tcp?.destroy(); } catch {}
   try { t?.writeStream?.destroy(); } catch {}
-  if (t?.mode === "offline" && t?.filePath) {
+  if (!preservePartial && t?.mode === "offline" && t?.filePath) {
     try { if (fs.existsSync(t.filePath)) fs.unlinkSync(t.filePath); } catch {}
   }
 
@@ -1401,7 +1699,31 @@ function failActiveTransfer(intentId, message, options = {}) {
 
   activeTransfers.delete(intentId);
 
-  if (intent && options.notify !== false) {
+  if (intent && preservePartial && options.suppressState !== true) {
+    updateIntentUploadCheckpoint(intent, bytesUploaded, {
+      status: "uploading",
+      transferState: "uploading"
+    });
+    emitTransferState(intent, "uploading", {
+      sentBytes: bytesUploaded,
+      totalBytes: resolveUploadExpectedBytes(intent),
+      plainSentBytes: uploadBytesToPlainBytes(intent, bytesUploaded),
+      plainTotalBytes: Number(intent.fileSize || 0),
+      retryable: true,
+      message: String(message || "Transfer paused")
+    });
+  } else if (intent && options.suppressState !== true) {
+    emitTransferState(intent, "failed", {
+      sentBytes: bytesUploaded,
+      totalBytes: resolveUploadExpectedBytes(intent),
+      plainSentBytes: uploadBytesToPlainBytes(intent, bytesUploaded),
+      plainTotalBytes: Number(intent.fileSize || 0),
+      retryable: Boolean(options.retryable),
+      message: String(message || "Upload failed")
+    });
+  }
+
+  if (intent && options.notify !== false && !preservePartial) {
     notifyUploadFailed(intent, intentId, message);
   }
   if (intent && options.deleteIntent !== false) {
@@ -1420,7 +1742,12 @@ function cleanupStalledTransfers() {
     if (!lastTs) continue;
     if (now - lastTs <= timeoutMs) continue;
     console.warn(`⏱️ Transfer timeout: ${intentId} idle for ${now - lastTs}ms`);
-    failActiveTransfer(intentId, "Upload timed out due to inactivity");
+    failActiveTransfer(intentId, "Upload timed out due to inactivity", {
+      preservePartial: true,
+      deleteIntent: false,
+      notify: true,
+      retryable: true
+    });
   }
 }
 
@@ -2304,7 +2631,13 @@ if (intentOnDisk?.stored) {
 
       console.log("🔌 TCP connected & header sent");
 
-      send(sender, { type: "upload_ok", intentId: intent.id });
+      send(sender, {
+        type: "upload_ok",
+        intentId: intent.id,
+        resumeFrom: 0,
+        bytesExpected: Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0),
+        plainBytesExpected: Number(intent.fileSize || 0)
+      });
       console.log("✅ upload_ok sent");
     }
   );
@@ -2604,10 +2937,15 @@ if (data.type === "intent_access_request") {
       intentId: intent.id,
       fileName: intent.fileName || "",
       fileSize: Number(intent.fileSize || 0),
+      uploadBytesExpected: Number(intent.uploadBytesExpected || intent.fileSize || 0),
       createdAt: Number(intent.createdAt || 0),
+      expiresAt: Number(intent.expiresAt || 0),
       downloadToken: intent.downloadToken || null,
       stored: Boolean(intent.stored),
       status: intent.status || "",
+      transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued")),
+      encryption: intent.encryption || null,
+      passwordProtected: isIntentPasswordProtected(intent),
       isTextOnly: Boolean(intent.isTextOnly || intent.messageType === "text")
     }
   });
@@ -2634,6 +2972,8 @@ if (data.type === "read_receipt") {
     const priorReadAt = Number(intent.readByRecipientAt || 0);
     if (!priorReadAt || priorReadAt < now) {
       intent.readByRecipientAt = now;
+      intent.transferState = "read";
+      intent.status = "completed";
       saveIntent(intent);
     }
     updates.push({
@@ -2651,6 +2991,16 @@ if (data.type === "read_receipt") {
       intents: updates
     });
   }
+  updates.forEach((entry) => {
+    const intent = loadIntent(entry.intentId);
+    if (!intent) return;
+    emitTransferState(intent, "read", {
+      sentBytes: Number(intent.storedBytes || resolveUploadExpectedBytes(intent) || 0),
+      totalBytes: Number(resolveUploadExpectedBytes(intent) || 0),
+      plainSentBytes: Number(intent.plainStoredBytes || intent.fileSize || 0),
+      plainTotalBytes: Number(intent.fileSize || 0)
+    });
+  });
   return;
 }
 
@@ -2728,7 +3078,11 @@ if (data.type === "cancel_send") {
   }
 
   if (transfer) {
-    failActiveTransfer(intentId, "Upload canceled by sender", { notify: false, deleteIntent: false });
+    failActiveTransfer(intentId, "Upload canceled by sender", {
+      notify: false,
+      deleteIntent: false,
+      suppressState: true
+    });
   } else if (ws.currentUploadIntentId === intentId) {
     ws.currentUploadIntentId = null;
   }
@@ -2739,6 +3093,14 @@ if (data.type === "cancel_send") {
     try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
   }
 
+  emitTransferState(intent, "canceled", {
+    sentBytes: Number(intent.storedBytes || 0),
+    totalBytes: Number(resolveUploadExpectedBytes(intent) || 0),
+    plainSentBytes: Number(intent.plainStoredBytes || 0),
+    plainTotalBytes: Number(intent.fileSize || 0),
+    retryable: false,
+    message: "Canceled by sender"
+  });
   deleteIntentAndNotify(intent);
   send(ws, { type: "cancel_send_ok", intentId, status: "canceled" });
   return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
@@ -2803,6 +3165,15 @@ if (data.type === "update_profile") {
   if (typeof updates.phoneCountryCode === "string") profile.phoneCountryCode = updates.phoneCountryCode;
   if (typeof updates.phoneLocal === "string") profile.phoneLocal = updates.phoneLocal;
   if (typeof updates.avatarDataUrl === "string") profile.avatarDataUrl = updates.avatarDataUrl;
+  if (updates.e2eePublicKeyJwk && typeof updates.e2eePublicKeyJwk === "object") {
+    const jwk = updates.e2eePublicKeyJwk;
+    const kty = String(jwk.kty || "").toUpperCase();
+    const n = String(jwk.n || "");
+    const e = String(jwk.e || "");
+    if (kty === "RSA" && n && e && n.length < 4096 && e.length < 64) {
+      profile.e2eePublicKeyJwk = { kty: "RSA", n, e, alg: "RSA-OAEP-256", ext: true };
+    }
+  }
 
   user.profile = profile;
   saveUser(user);
@@ -2872,7 +3243,31 @@ if (intent.from !== ws.username) {
   ws.currentUploadIntentId = null;
   return send(ws, { type: "error", message: "Not sender" });
 }
+if (intent.stored && intent.storedFile && String(intent.transferState || "") !== "uploading") {
+  ws.currentUploadIntentId = null;
+  return send(ws, { type: "error", message: "File already uploaded", intentId });
+}
 
+const expectedBytes = resolveUploadExpectedBytes(intent);
+if (!Number.isFinite(expectedBytes) || expectedBytes <= 0) {
+  ws.currentUploadIntentId = null;
+  return send(ws, { type: "error", message: "Intent has invalid upload size" });
+}
+if (size !== expectedBytes) {
+  ws.currentUploadIntentId = null;
+  return send(ws, { type: "error", message: "Upload size does not match intent", intentId });
+}
+
+const existingTransfer = activeTransfers.get(intentId);
+if (existingTransfer && existingTransfer.senderWs && existingTransfer.senderWs !== ws) {
+  ws.currentUploadIntentId = null;
+  return send(ws, { type: "error", message: "Another upload is already active for this file", intentId });
+}
+if (existingTransfer && existingTransfer.senderWs === ws) {
+  try { existingTransfer.writeStream?.destroy(); } catch {}
+  try { existingTransfer.tcp?.destroy(); } catch {}
+  activeTransfers.delete(intentId);
+}
 
   // Always set current upload ID first (race-safe for binary frames)
   ws.currentUploadIntentId = intentId;
@@ -2891,19 +3286,38 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
   // =========================
   if (!receiverWs) {
     const safeName = safeBasename(name);
-    const storedFileName = `${intentId}__${safeName}`;
+    const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${safeName}`;
     const filePath = path.join(FILES_DIR, storedFileName);
+    let existingBytes = 0;
+    try {
+      const stat = fs.statSync(filePath);
+      existingBytes = Number(stat?.size || 0);
+    } catch {}
+
+    let resumeFrom = alignResumeOffset(intent, existingBytes);
+    if (!Number.isFinite(resumeFrom) || resumeFrom < 0) resumeFrom = 0;
+    if (resumeFrom > expectedBytes) resumeFrom = 0;
+    if (existingBytes !== resumeFrom) {
+      try { fs.truncateSync(filePath, resumeFrom); } catch {}
+      existingBytes = resumeFrom;
+    }
+
+    const streamFlags = resumeFrom > 0 ? "a" : "w";
 
     // Create write stream for raw bytes
     const writeStream = fs.createWriteStream(filePath, {
-      flags: "w",
+      flags: streamFlags,
       highWaterMark: OFFLINE_UPLOAD_STREAM_HWM_BYTES, // tuned for high-throughput offline uploads
     });
 
 
     writeStream.on("error", (err) => {
       console.error("❌ File writeStream error:", err);
-      failActiveTransfer(intentId, "Server failed writing file");
+      failActiveTransfer(intentId, "Server failed writing file", {
+        preservePartial: true,
+        deleteIntent: false,
+        retryable: true
+      });
       ws.currentUploadIntentId = null;
     });
 
@@ -2913,11 +3327,12 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
       senderWs: ws,
       writeStream,
       filePath,
-      bytesExpected: size,
-      bytesSent: 0,
+      bytesExpected: expectedBytes,
+      bytesSent: resumeFrom,
       ended: false,
       startedAt: Date.now(),
       lastActivityAt: Date.now(),
+      lastCheckpointBytes: resumeFrom,
       intent, // ✅ ADD THIS
     });
 
@@ -2925,16 +3340,30 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
 // Persist linkage but DO NOT mark stored until upload_end finishes
 intent.stored = false;
 intent.storedFile = storedFileName;
-intent.storedBytes = 0;
+intent.storedBytes = resumeFrom;
+intent.plainStoredBytes = uploadBytesToPlainBytes(intent, resumeFrom);
 intent.status = "uploading";
+intent.transferState = "uploading";
 saveIntent(intent);
+emitTransferState(intent, "uploading", {
+  sentBytes: resumeFrom,
+  totalBytes: expectedBytes,
+  plainSentBytes: uploadBytesToPlainBytes(intent, resumeFrom),
+  plainTotalBytes: Number(intent.fileSize || 0)
+});
 
 // ✅ let sender start streaming immediately
-send(ws, { type: "upload_ok", intentId });
+send(ws, {
+  type: "upload_ok",
+  intentId,
+  resumeFrom,
+  bytesExpected: expectedBytes,
+  plainBytesExpected: Number(intent.fileSize || 0)
+});
 
 
 
-    console.log(`💾 Offline upload_begin: storing to ${storedFileName}`);
+    console.log(`💾 Offline upload_begin: storing to ${storedFileName} (resumeFrom=${resumeFrom})`);
     return;
   }
 
@@ -2955,12 +3384,19 @@ activeTransfers.set(intentId, {
   mode: "live",
   tcp: null,
   senderWs: ws,
-  bytesExpected: size,
+  bytesExpected: expectedBytes,
   bytesSent: 0,
   ended: false,
   startedAt: Date.now(),
   lastActivityAt: Date.now(),
   intent, // ✅ ADD THIS
+});
+
+emitTransferState(intent, "uploading", {
+  sentBytes: 0,
+  totalBytes: expectedBytes,
+  plainSentBytes: 0,
+  plainTotalBytes: Number(intent.fileSize || 0)
 });
 
 
@@ -2986,9 +3422,27 @@ if (data.type === "upload_end") {
 
   // Reject incomplete uploads (prevents “downloaded but broken” files)
   if (t.bytesSent !== t.bytesExpected) {
-    failActiveTransfer(intentId, "Upload incomplete (size mismatch)");
+    failActiveTransfer(intentId, "Upload incomplete (size mismatch)", {
+      preservePartial: true,
+      deleteIntent: false,
+      retryable: true
+    });
     ws.currentUploadIntentId = null;
     return send(ws, { type: "error", message: "Upload incomplete (size mismatch)", intentId });
+  }
+
+  if (t.intent) {
+    t.intent.status = "processing";
+    t.intent.transferState = "processing";
+    t.intent.storedBytes = t.bytesSent;
+    t.intent.plainStoredBytes = uploadBytesToPlainBytes(t.intent, t.bytesSent);
+    saveIntent(t.intent);
+    emitTransferState(t.intent, "processing", {
+      sentBytes: t.bytesSent,
+      totalBytes: t.bytesExpected,
+      plainSentBytes: t.intent.plainStoredBytes,
+      plainTotalBytes: Number(t.intent.fileSize || 0)
+    });
   }
 
   // LIVE MODE: close TCP and HARD RESET upload state
@@ -2999,6 +3453,22 @@ if (t.mode === "live") {
   ws.currentUploadIntentId = null;
 
   activeTransfers.delete(intentId);
+
+  if (t.intent) {
+    t.intent.status = "stored";
+    t.intent.transferState = "delivered";
+    t.intent.stored = true;
+    t.intent.storedBytes = t.bytesExpected;
+    t.intent.plainStoredBytes = uploadBytesToPlainBytes(t.intent, t.bytesExpected);
+    t.intent.uploadedAt = Date.now();
+    saveIntent(t.intent);
+    emitTransferState(t.intent, "delivered", {
+      sentBytes: t.bytesExpected,
+      totalBytes: t.bytesExpected,
+      plainSentBytes: t.intent.plainStoredBytes,
+      plainTotalBytes: Number(t.intent.fileSize || 0)
+    });
+  }
 
   send(ws, { type: "upload_done", intentId });
   return;
@@ -3017,8 +3487,11 @@ if (t.mode === "offline") {
       const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
       intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
 intent.stored = true;
-intent.storedBytes = intent.fileSize;
+intent.storedBytes = t.bytesExpected;
+intent.plainStoredBytes = uploadBytesToPlainBytes(intent, t.bytesExpected);
 intent.status = "stored";
+intent.transferState = "delivered";
+intent.uploadedAt = Date.now();
 saveIntent(intent);
 
     } catch (err) {
@@ -3032,9 +3505,10 @@ saveIntent(intent);
     // 🔔 IMPORTANT: notify recipient that file is now ready
 const receiver = online.get(intent.to);
 if (receiver) {
+  const safeIntent = intentForClient(intent);
   send(receiver, {
     type: "incoming_file",
-    intent
+    intent: safeIntent
   });
   try {
     send(receiver, { type: "inbox", items: loadIntentsForUser(intent.to) });
@@ -3048,6 +3522,13 @@ if (receiver) {
     });
   }
 }
+
+emitTransferState(intent, "delivered", {
+  sentBytes: Number(intent.storedBytes || t.bytesExpected || 0),
+  totalBytes: Number(t.bytesExpected || resolveUploadExpectedBytes(intent) || 0),
+  plainSentBytes: Number(intent.plainStoredBytes || intent.fileSize || 0),
+  plainTotalBytes: Number(intent.fileSize || 0)
+});
 
 
     // ✅ acknowledge sender (iOS)
@@ -3093,10 +3574,15 @@ if (data.type === "send_intent") {
   const rawFileName = String(data.fileName || "").trim();
   const fileName = rawFileName ? safeBasename(rawFileName) : "";
   const fileSize = Number(data.fileSize || 0);
+  const uploadBytesExpected = normalizeUploadBytesExpected(data.uploadBytesExpected, fileSize);
   const note = typeof data.note === "string" ? data.note.trim().slice(0, 500) : "";
   const text = typeof data.text === "string" ? data.text.trim().slice(0, 5000) : "";
   const isTextOnly = Boolean(data.isTextOnly) || (!!text && !fileName && !fileSize);
   const clientIntentId = String(data.clientIntentId || "").trim();
+  const encryption = sanitizeIntentEncryption(data.encryption || null, ws.username, to);
+  const accessControl = sanitizeIntentAccessControl(data.accessControl || null, isTextOnly);
+  const now = Date.now();
+  const expiresAt = sanitizeIntentExpiresAt(data.expiresAt, now);
 
   if (!to) {
     return send(ws, { type: "error", message: "Missing recipient" });
@@ -3106,9 +3592,39 @@ if (data.type === "send_intent") {
     if (!text) {
       return send(ws, { type: "error", message: "Message cannot be empty" });
     }
+    if (data.accessControl) {
+      return send(ws, { type: "error", message: "Password protection is only available for files" });
+    }
   } else {
     if (!fileName || !Number.isFinite(fileSize) || fileSize <= 0) {
       return send(ws, { type: "error", message: "Missing to/fileName/fileSize" });
+    }
+    if (!Number.isFinite(uploadBytesExpected) || uploadBytesExpected <= 0) {
+      return send(ws, { type: "error", message: "Missing upload size" });
+    }
+    if (REQUIRE_E2EE && !encryption) {
+      return send(ws, { type: "error", message: "Encrypted file transfer is required" });
+    }
+    if (encryption && encryption.mode !== "file") {
+      return send(ws, { type: "error", message: "Invalid file encryption payload" });
+    }
+    if (!encryption && data.encryption) {
+      return send(ws, { type: "error", message: "Invalid encryption payload" });
+    }
+    if (!accessControl && data.accessControl) {
+      return send(ws, { type: "error", message: "Invalid password protection payload" });
+    }
+  }
+
+  if (isTextOnly) {
+    if (REQUIRE_E2EE && !encryption) {
+      return send(ws, { type: "error", message: "Encrypted messaging is required" });
+    }
+    if (encryption && encryption.mode !== "text") {
+      return send(ws, { type: "error", message: "Invalid text encryption payload" });
+    }
+    if (!encryption && data.encryption) {
+      return send(ws, { type: "error", message: "Invalid encryption payload" });
     }
   }
 
@@ -3140,10 +3656,11 @@ if (data.type === "send_intent") {
       }
       const receiverWs = online.get(existing.to);
       if (receiverWs) {
+        const safeExistingIntent = intentForClient(existing);
         if (existing.isTextOnly || existing.messageType === "text") {
-          send(receiverWs, { type: "incoming_file", intent: existing });
+          send(receiverWs, { type: "incoming_file", intent: safeExistingIntent });
         } else {
-          send(receiverWs, { type: "incoming_intent", intent: existing });
+          send(receiverWs, { type: "incoming_intent", intent: safeExistingIntent });
         }
         try { send(receiverWs, { type: "inbox", items: loadIntentsForUser(existing.to) }); } catch {}
       }
@@ -3159,13 +3676,17 @@ if (data.type === "send_intent") {
         expiresAt: existing.expiresAt,
         createdAt: existing.createdAt,
         isTextOnly: Boolean(existing.isTextOnly || existing.messageType === "text"),
-        text: existing.text || ""
+        text: existing.text || "",
+        fileSize: Number(existing.fileSize || 0),
+        uploadBytesExpected: Number(existing.uploadBytesExpected || existing.fileSize || 0),
+        encryption: existing.encryption || null,
+        passwordProtected: isIntentPasswordProtected(existing),
+        transferState: existing.transferState || (existing.readByRecipientAt ? "read" : (existing.stored ? "delivered" : "queued"))
       });
     }
   }
 
   // ✅ Create + store intent even if receiver is offline
-  const now = Date.now();
   const intent = {
     id: randomUUID(),
     from: ws.username,
@@ -3176,10 +3697,15 @@ if (data.type === "send_intent") {
     text: isTextOnly ? text : "",
     isTextOnly,
     messageType: isTextOnly ? "text" : "file",
+    encryption: encryption || null,
+    accessControl: isTextOnly ? null : (accessControl || null),
+    passwordProtected: Boolean(!isTextOnly && accessControl),
+    uploadBytesExpected: isTextOnly ? 0 : uploadBytesExpected,
     clientIntentId: clientIntentId || null,
     createdAt: now,
-    expiresAt: now + RETENTION_MS,
+    expiresAt,
     status: isTextOnly ? "completed" : "pending", // pending | uploading | stored | completed
+    transferState: isTextOnly ? "delivered" : "queued",
     downloadToken: isTextOnly ? null : generateDownloadToken(),
     readByRecipientAt: null
   };
@@ -3187,6 +3713,7 @@ if (data.type === "send_intent") {
     intent.stored = true;
     intent.storedFile = null;
     intent.storedBytes = 0;
+    intent.plainStoredBytes = 0;
     intent.uploadedAt = now;
     intent.completedAt = now;
   }
@@ -3195,15 +3722,24 @@ if (data.type === "send_intent") {
 
   const receiverWs = online.get(to);
   if (receiverWs) {
+    const safeIntent = intentForClient(intent);
     if (isTextOnly) {
-      send(receiverWs, { type: "incoming_file", intent });
+      send(receiverWs, { type: "incoming_file", intent: safeIntent });
     } else {
-      send(receiverWs, { type: "incoming_intent", intent });
+      send(receiverWs, { type: "incoming_intent", intent: safeIntent });
     }
     try {
       send(receiverWs, { type: "inbox", items: loadIntentsForUser(to) });
     } catch {}
   }
+
+  emitTransferState(intent, intent.transferState || "queued", {
+    sentBytes: Number(intent.storedBytes || 0),
+    totalBytes: resolveUploadExpectedBytes(intent),
+    plainSentBytes: Number(intent.plainStoredBytes || 0),
+    plainTotalBytes: Number(intent.fileSize || 0),
+    retryable: false
+  });
 
   // ✅ Always acknowledge sender
   return send(ws, {
@@ -3218,7 +3754,12 @@ if (data.type === "send_intent") {
     expiresAt: intent.expiresAt,
     createdAt: intent.createdAt,
     isTextOnly,
-    text: intent.text || ""
+    text: intent.text || "",
+    fileSize: Number(intent.fileSize || 0),
+    uploadBytesExpected: Number(intent.uploadBytesExpected || intent.fileSize || 0),
+    encryption: intent.encryption || null,
+    passwordProtected: isIntentPasswordProtected(intent),
+    transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued"))
   });
 }
 
@@ -3333,7 +3874,12 @@ return send(ws, {
   }
 
   if (ws.currentUploadIntentId) {
-    failActiveTransfer(ws.currentUploadIntentId, "Upload interrupted (connection closed)");
+    failActiveTransfer(ws.currentUploadIntentId, "Upload interrupted (connection closed)", {
+      preservePartial: true,
+      deleteIntent: false,
+      notify: true,
+      retryable: true
+    });
     ws.currentUploadIntentId = null;
   }
 });
