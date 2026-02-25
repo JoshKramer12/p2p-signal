@@ -1283,12 +1283,17 @@ function sha256Hex(text = "") {
 }
 
 function sanitizeIntentExpiresAt(rawExpiresAt, now = Date.now()) {
-  const maxExpiry = now + RETENTION_MS;
   const raw = Number(rawExpiresAt || 0);
-  if (!Number.isFinite(raw) || raw <= 0) return maxExpiry;
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  const maxExpiry = now + RETENTION_MS;
   const minExpiry = now + MIN_INTENT_TTL_MS;
   const bounded = Math.min(maxExpiry, Math.max(minExpiry, Math.floor(raw)));
   return bounded;
+}
+
+function hasIntentCustomExpiry(intent = null) {
+  if (!intent || typeof intent !== "object") return false;
+  return intent.customExpiry === true;
 }
 
 function sanitizeIntentAccessControl(raw = null, isTextOnly = false) {
@@ -1320,10 +1325,11 @@ function isIntentPasswordProtected(intent) {
 function extractIntentPasswordFromRequest(req, url) {
   const headerRaw = req?.headers?.["x-merm-password"];
   const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
-  const fromHeader = String(headerValue || "").trim();
-  if (fromHeader) return fromHeader;
-  const fromQuery = String(url?.searchParams?.get("pw") || "").trim();
-  if (fromQuery) return fromQuery;
+  if (headerValue != null) {
+    return String(headerValue);
+  }
+  const fromQuery = url?.searchParams?.get("pw");
+  if (fromQuery != null) return String(fromQuery);
   return "";
 }
 
@@ -1380,6 +1386,7 @@ function intentForClient(rawIntent) {
   const intent = { ...rawIntent };
   delete intent.accessControl;
   intent.passwordProtected = isIntentPasswordProtected(rawIntent);
+  intent.customExpiry = hasIntentCustomExpiry(rawIntent);
   return intent;
 }
 
@@ -2946,6 +2953,7 @@ if (data.type === "intent_access_request") {
       transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued")),
       encryption: intent.encryption || null,
       passwordProtected: isIntentPasswordProtected(intent),
+      customExpiry: hasIntentCustomExpiry(intent),
       isTextOnly: Boolean(intent.isTextOnly || intent.messageType === "text")
     }
   });
@@ -3582,7 +3590,9 @@ if (data.type === "send_intent") {
   const encryption = sanitizeIntentEncryption(data.encryption || null, ws.username, to);
   const accessControl = sanitizeIntentAccessControl(data.accessControl || null, isTextOnly);
   const now = Date.now();
-  const expiresAt = sanitizeIntentExpiresAt(data.expiresAt, now);
+  const rawExpiresAt = Number(data.expiresAt || 0);
+  const hasCustomExpiry = Number.isFinite(rawExpiresAt) && rawExpiresAt > 0;
+  const expiresAt = hasCustomExpiry ? sanitizeIntentExpiresAt(rawExpiresAt, now) : 0;
 
   if (!to) {
     return send(ws, { type: "error", message: "Missing recipient" });
@@ -3681,6 +3691,7 @@ if (data.type === "send_intent") {
         uploadBytesExpected: Number(existing.uploadBytesExpected || existing.fileSize || 0),
         encryption: existing.encryption || null,
         passwordProtected: isIntentPasswordProtected(existing),
+        customExpiry: hasIntentCustomExpiry(existing),
         transferState: existing.transferState || (existing.readByRecipientAt ? "read" : (existing.stored ? "delivered" : "queued"))
       });
     }
@@ -3704,6 +3715,7 @@ if (data.type === "send_intent") {
     clientIntentId: clientIntentId || null,
     createdAt: now,
     expiresAt,
+    customExpiry: Boolean(!isTextOnly && hasCustomExpiry && expiresAt > 0),
     status: isTextOnly ? "completed" : "pending", // pending | uploading | stored | completed
     transferState: isTextOnly ? "delivered" : "queued",
     downloadToken: isTextOnly ? null : generateDownloadToken(),
@@ -3759,6 +3771,7 @@ if (data.type === "send_intent") {
     uploadBytesExpected: Number(intent.uploadBytesExpected || intent.fileSize || 0),
     encryption: intent.encryption || null,
     passwordProtected: isIntentPasswordProtected(intent),
+    customExpiry: hasIntentCustomExpiry(intent),
     transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued"))
   });
 }
