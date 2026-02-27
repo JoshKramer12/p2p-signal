@@ -1222,6 +1222,14 @@ function hasIntentCustomExpiry(intent = null) {
   return intent.customExpiry === true;
 }
 
+function normalizeIntentPasswordMode(raw = "", fallback = "once") {
+  const mode = String(raw || "").trim().toLowerCase();
+  if (mode === "always") return "always";
+  if (mode === "once") return "once";
+  const fb = String(fallback || "").trim().toLowerCase();
+  return fb === "always" ? "always" : "once";
+}
+
 function sanitizeIntentAccessControl(raw = null, isTextOnly = false) {
   if (!raw || typeof raw !== "object") return null;
   if (isTextOnly) return null;
@@ -1231,6 +1239,7 @@ function sanitizeIntentAccessControl(raw = null, isTextOnly = false) {
   const salt = String(raw.salt || "").trim().toLowerCase();
   const hash = String(raw.hash || "").trim().toLowerCase();
   const alg = String(raw.alg || "SHA-256").trim().toUpperCase();
+  const unlockMode = normalizeIntentPasswordMode(raw.unlockMode || raw.passwordMode || "once", "once");
   if (alg !== "SHA-256") return null;
   if (!/^[0-9a-f]{16,128}$/.test(salt)) return null;
   if (!/^[0-9a-f]{64}$/.test(hash)) return null;
@@ -1240,7 +1249,8 @@ function sanitizeIntentAccessControl(raw = null, isTextOnly = false) {
     type: "password",
     alg: "SHA-256",
     salt,
-    hash
+    hash,
+    unlockMode
   };
 }
 
@@ -1253,6 +1263,11 @@ function sanitizeIntentPasswordHint(raw = "", isTextOnly = false, accessControl 
 
 function isIntentPasswordProtected(intent) {
   return String(intent?.accessControl?.type || "").toLowerCase() === "password";
+}
+
+function getIntentPasswordMode(intent) {
+  if (!isIntentPasswordProtected(intent)) return "once";
+  return normalizeIntentPasswordMode(intent?.accessControl?.unlockMode || "once", "once");
 }
 
 function extractIntentPasswordFromRequest(req, url) {
@@ -1319,6 +1334,11 @@ function intentForClient(rawIntent) {
   const intent = { ...rawIntent };
   delete intent.accessControl;
   intent.passwordProtected = isIntentPasswordProtected(rawIntent);
+  if (intent.passwordProtected) {
+    intent.passwordMode = getIntentPasswordMode(rawIntent);
+  } else {
+    intent.passwordMode = "once";
+  }
   intent.customExpiry = hasIntentCustomExpiry(rawIntent);
   return intent;
 }
@@ -2907,6 +2927,7 @@ if (data.type === "intent_access_request") {
       transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued")),
       encryption: intent.encryption || null,
       passwordProtected: isIntentPasswordProtected(intent),
+      passwordMode: getIntentPasswordMode(intent),
       passwordHint: String(intent.passwordHint || ""),
       customExpiry: hasIntentCustomExpiry(intent),
       isTextOnly: Boolean(intent.isTextOnly || intent.messageType === "text")
@@ -3647,6 +3668,7 @@ if (data.type === "send_intent") {
         uploadBytesExpected: Number(existing.uploadBytesExpected || existing.fileSize || 0),
         encryption: existing.encryption || null,
         passwordProtected: isIntentPasswordProtected(existing),
+        passwordMode: getIntentPasswordMode(existing),
         passwordHint: String(existing.passwordHint || ""),
         customExpiry: hasIntentCustomExpiry(existing),
         transferState: existing.transferState || (existing.readByRecipientAt ? "read" : (existing.stored ? "delivered" : "queued"))
@@ -3668,6 +3690,7 @@ if (data.type === "send_intent") {
     encryption: encryption || null,
     accessControl: isTextOnly ? null : (accessControl || null),
     passwordProtected: Boolean(!isTextOnly && accessControl),
+    passwordMode: Boolean(!isTextOnly && accessControl) ? normalizeIntentPasswordMode(accessControl?.unlockMode || "once", "once") : "once",
     passwordHint: passwordHint || "",
     uploadBytesExpected: isTextOnly ? 0 : uploadBytesExpected,
     clientIntentId: clientIntentId || null,
@@ -3729,6 +3752,7 @@ if (data.type === "send_intent") {
     uploadBytesExpected: Number(intent.uploadBytesExpected || intent.fileSize || 0),
     encryption: intent.encryption || null,
     passwordProtected: isIntentPasswordProtected(intent),
+    passwordMode: getIntentPasswordMode(intent),
     passwordHint: String(intent.passwordHint || ""),
     customExpiry: hasIntentCustomExpiry(intent),
     transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued"))
