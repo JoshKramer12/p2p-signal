@@ -23,7 +23,9 @@ const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 *
 const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
 const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CACHE_TTL_MS || 10 * 1000));
-const REQUIRE_E2EE = String(process.env.REQUIRE_E2EE || "1") !== "0";
+// Keep Office-native preview compatibility by default.
+// Set REQUIRE_E2EE=1 in env if you want to force encrypted file/message payloads again.
+const REQUIRE_E2EE = String(process.env.REQUIRE_E2EE || "0") !== "0";
 const OFFLINE_UPLOAD_STREAM_HWM_BYTES = Math.max(
   1024 * 1024,
   Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 64 * 1024 * 1024)
@@ -141,7 +143,18 @@ function openZipFile(filePath, options = {}) {
 function parseHttpRange(rangeRaw = "", totalSize = 0) {
   const raw = String(rangeRaw || "").trim();
   if (!raw) return { ok: true, hasRange: false, start: 0, end: Math.max(0, totalSize - 1) };
-  const match = /^bytes=(\d*)-(\d*)$/i.exec(raw);
+  const bytesMatch = /^bytes\s*=\s*(.+)$/i.exec(raw);
+  if (!bytesMatch) return { ok: false };
+
+  // Some clients request multiple ranges in one header (e.g. "bytes=0-1023, 4096-8191").
+  // Serve the first valid range instead of failing with 416.
+  const firstRange = String(bytesMatch[1] || "")
+    .split(",")
+    .map((part) => String(part || "").trim())
+    .find(Boolean);
+  if (!firstRange) return { ok: false };
+
+  const match = /^(\d*)-(\d*)$/.exec(firstRange);
   if (!match) return { ok: false };
 
   let start = 0;
@@ -753,97 +766,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const stat = fs.statSync(filePath);
       const safeName = safeBasename(intent.fileName || "file");
       const mode = String(url.searchParams.get("disposition") || "").toLowerCase();
       const dispositionType = mode === "inline" ? "inline" : "attachment";
-      const baseHeaders = {
-        "content-type": contentTypeForName(safeName),
-        "accept-ranges": "bytes",
-        "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
-      };
-
-      if (stat.size <= 0) {
-        res.writeHead(200, {
-          ...baseHeaders,
-          "content-length": 0
-        });
-        res.end();
-        return;
-      }
-
-      const rangeRaw = String(req.headers.range || "").trim();
-      let start = 0;
-      let end = stat.size - 1;
-      let statusCode = 200;
-
-      if (rangeRaw) {
-        const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeRaw);
-        if (!match) {
-          res.writeHead(416, {
-            ...baseHeaders,
-            "content-range": `bytes */${stat.size}`
-          });
-          res.end();
-          return;
-        }
-
-        const startRaw = match[1];
-        const endRaw = match[2];
-
-        if (startRaw === "" && endRaw === "") {
-          res.writeHead(416, {
-            ...baseHeaders,
-            "content-range": `bytes */${stat.size}`
-          });
-          res.end();
-          return;
-        }
-
-        if (startRaw !== "") {
-          start = Number(startRaw);
-          end = endRaw !== "" ? Number(endRaw) : end;
-        } else {
-          const suffixLength = Number(endRaw);
-          if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
-            res.writeHead(416, {
-              ...baseHeaders,
-              "content-range": `bytes */${stat.size}`
-            });
-            res.end();
-            return;
-          }
-          start = Math.max(0, stat.size - suffixLength);
-          end = Math.max(0, stat.size - 1);
-        }
-
-        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || start >= stat.size) {
-          res.writeHead(416, {
-            ...baseHeaders,
-            "content-range": `bytes */${stat.size}`
-          });
-          res.end();
-          return;
-        }
-
-        end = Math.min(end, Math.max(0, stat.size - 1));
-        statusCode = 206;
-      }
-
-      const headers = {
-        ...baseHeaders,
-        "content-length": Math.max(0, end - start + 1)
-      };
-      if (statusCode === 206) {
-        headers["content-range"] = `bytes ${start}-${end}/${stat.size}`;
-      }
-      res.writeHead(statusCode, headers);
-
-      const rs = fs.createReadStream(filePath, { start, end });
-      rs.on("error", () => {
-        try { res.end(); } catch {}
-      });
-      rs.pipe(res);
+      serveFileFromDisk(req, res, filePath, safeName, dispositionType);
       return;
     }
 
