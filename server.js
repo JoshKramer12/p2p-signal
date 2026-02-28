@@ -3,7 +3,7 @@
 
 const http = require("http");
 const WebSocket = require("ws");
-const { randomUUID, createHash, timingSafeEqual } = require("crypto");
+const { randomUUID, createHash, createHmac, timingSafeEqual } = require("crypto");
 const net = require("net");
 const yauzl = require("yauzl");
 
@@ -35,6 +35,15 @@ const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
   256 * 1024,
   Number(process.env.UPLOAD_CHECKPOINT_EVERY_BYTES || 2 * 1024 * 1024)
 );
+const INTENT_UNLOCK_TTL_ONCE_MS = Math.max(
+  60 * 1000,
+  Number(process.env.INTENT_UNLOCK_TTL_ONCE_MS || 12 * 60 * 60 * 1000)
+);
+const INTENT_UNLOCK_TTL_ALWAYS_MS = Math.max(
+  10 * 1000,
+  Number(process.env.INTENT_UNLOCK_TTL_ALWAYS_MS || 2 * 60 * 1000)
+);
+const INTENT_UNLOCK_SECRET = String(process.env.INTENT_UNLOCK_SECRET || randomUUID() + randomUUID());
 
 // username -> ws
 const online = new Map();
@@ -51,8 +60,8 @@ const intentListCacheByUser = new Map(); // username -> { ts, items }
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition,Content-Range,Accept-Ranges");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password,X-Merm-Unlock");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition,Content-Range,Accept-Ranges,X-Merm-Unlock,X-Merm-Unlock-Exp");
 }
 
 function contentTypeForName(name = "") {
@@ -1208,6 +1217,96 @@ function sha256Hex(text = "") {
   return createHash("sha256").update(String(text || ""), "utf8").digest("hex");
 }
 
+function base64UrlEncodeBuffer(buffer) {
+  if (!buffer) return "";
+  return Buffer.from(buffer).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecodeToBuffer(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (!/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+  const padded = raw + "===".slice((raw.length + 3) % 4);
+  const base64 = padded.replace(/-/g, "+").replace(/_/g, "/");
+  try {
+    return Buffer.from(base64, "base64");
+  } catch {
+    return null;
+  }
+}
+
+function signIntentUnlockPayload(payloadBase64 = "") {
+  return base64UrlEncodeBuffer(
+    createHmac("sha256", INTENT_UNLOCK_SECRET).update(String(payloadBase64 || ""), "utf8").digest()
+  );
+}
+
+function generateIntentUnlockToken(intent, mode = "once") {
+  const intentId = String(intent?.id || "").trim();
+  if (!intentId) return null;
+  const now = Date.now();
+  const normalizedMode = normalizeIntentPasswordMode(mode || getIntentPasswordMode(intent), "once");
+  const ttlMs = normalizedMode === "always" ? INTENT_UNLOCK_TTL_ALWAYS_MS : INTENT_UNLOCK_TTL_ONCE_MS;
+  const exp = now + ttlMs;
+  const payloadObj = {
+    v: 1,
+    i: intentId,
+    m: normalizedMode,
+    exp
+  };
+  const payloadBase64 = base64UrlEncodeBuffer(Buffer.from(JSON.stringify(payloadObj), "utf8"));
+  if (!payloadBase64) return null;
+  const sig = signIntentUnlockPayload(payloadBase64);
+  if (!sig) return null;
+  return {
+    token: `${payloadBase64}.${sig}`,
+    exp,
+    mode: normalizedMode
+  };
+}
+
+function verifyIntentUnlockToken(intent, providedToken = "") {
+  const raw = String(providedToken || "").trim();
+  if (!raw) return { ok: false, status: 401, message: "Password required for this file" };
+  const dot = raw.indexOf(".");
+  if (dot <= 0 || dot >= raw.length - 1) {
+    return { ok: false, status: 403, message: "Invalid unlock token" };
+  }
+  const payloadBase64 = raw.slice(0, dot);
+  const sig = raw.slice(dot + 1);
+  const expectedSig = signIntentUnlockPayload(payloadBase64);
+  if (!expectedSig) return { ok: false, status: 403, message: "Invalid unlock token" };
+  try {
+    const sigBuf = Buffer.from(sig, "utf8");
+    const expectedBuf = Buffer.from(expectedSig, "utf8");
+    if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
+      return { ok: false, status: 403, message: "Invalid unlock token" };
+    }
+  } catch {
+    return { ok: false, status: 403, message: "Invalid unlock token" };
+  }
+
+  const payloadBuf = base64UrlDecodeToBuffer(payloadBase64);
+  if (!payloadBuf) return { ok: false, status: 403, message: "Invalid unlock token" };
+  let payload;
+  try {
+    payload = JSON.parse(payloadBuf.toString("utf8"));
+  } catch {
+    return { ok: false, status: 403, message: "Invalid unlock token" };
+  }
+
+  const intentId = String(intent?.id || "").trim();
+  const tokenIntentId = String(payload?.i || "").trim();
+  const exp = Number(payload?.exp || 0);
+  if (!tokenIntentId || tokenIntentId !== intentId) {
+    return { ok: false, status: 403, message: "Invalid unlock token" };
+  }
+  if (!Number.isFinite(exp) || exp <= Date.now()) {
+    return { ok: false, status: 401, message: "Unlock token expired" };
+  }
+  return { ok: true, exp };
+}
+
 function sanitizeIntentExpiresAt(rawExpiresAt, now = Date.now()) {
   const raw = Number(rawExpiresAt || 0);
   if (!Number.isFinite(raw) || raw <= 0) return 0;
@@ -1281,6 +1380,17 @@ function extractIntentPasswordFromRequest(req, url) {
   return "";
 }
 
+function extractIntentUnlockFromRequest(req, url) {
+  const headerRaw = req?.headers?.["x-merm-unlock"];
+  const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+  if (headerValue != null) {
+    return String(headerValue);
+  }
+  const fromQuery = url?.searchParams?.get("ut");
+  if (fromQuery != null) return String(fromQuery);
+  return "";
+}
+
 function verifyIntentPassword(intent, providedPassword = "") {
   if (!isIntentPasswordProtected(intent)) {
     return { ok: true };
@@ -1309,8 +1419,23 @@ function verifyIntentPassword(intent, providedPassword = "") {
 }
 
 function enforceIntentPasswordGate(req, res, url, intent) {
+  if (!isIntentPasswordProtected(intent)) return true;
+
+  const unlockToken = extractIntentUnlockFromRequest(req, url);
+  if (unlockToken) {
+    const unlockCheck = verifyIntentUnlockToken(intent, unlockToken);
+    if (unlockCheck.ok) return true;
+  }
+
   const check = verifyIntentPassword(intent, extractIntentPasswordFromRequest(req, url));
-  if (check.ok) return true;
+  if (check.ok) {
+    const minted = generateIntentUnlockToken(intent, getIntentPasswordMode(intent));
+    if (minted?.token) {
+      res.setHeader("X-Merm-Unlock", minted.token);
+      res.setHeader("X-Merm-Unlock-Exp", String(Number(minted.exp || 0)));
+    }
+    return true;
+  }
   res.writeHead(Number(check.status || 403), { "content-type": "text/plain; charset=utf-8" });
   res.end(String(check.message || "Forbidden"));
   return false;
