@@ -3256,6 +3256,11 @@ send(ws, { type: "profiles", profiles: loadProfiles(user.friends || []) });
 return;
 }
 
+if (data.type === "friend_requests") {
+  sendFriendRequestsUpdate(ws.username);
+  return;
+}
+
 // =========================
 // 👤 PROFILE UPDATE
 // =========================
