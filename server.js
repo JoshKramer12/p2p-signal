@@ -815,6 +815,7 @@ const STORAGE_DIR = process.env.STORAGE_DIR || DEFAULT_STORAGE_DIR;
 const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
 const FILES_DIR = path.join(STORAGE_DIR, "files");
 const USERS_DIR = path.join(STORAGE_DIR, "users");
+const GROUPS_DIR = path.join(STORAGE_DIR, "groups");
 const PREVIEW_CACHE_DIR = path.join(STORAGE_DIR, "preview-cache");
 
 function countUsers() {
@@ -1095,6 +1096,7 @@ function buildUserStoragePayload(username) {
 
       const from = String(intent.from || "");
       if (from !== username) continue;
+      if (intent?.isGroupRecipientCopy && intent.to !== username) continue;
 
       const fileSizeOnDisk = resolveStoredFileSize(intent.storedFile);
       if (fileSizeOnDisk === null) continue;
@@ -1445,6 +1447,7 @@ function enforceIntentPasswordGate(req, res, url, intent) {
 fs.mkdirSync(INTENTS_DIR, { recursive: true });
 fs.mkdirSync(FILES_DIR, { recursive: true });
 fs.mkdirSync(USERS_DIR, { recursive: true });
+fs.mkdirSync(GROUPS_DIR, { recursive: true });
 fs.mkdirSync(PREVIEW_CACHE_DIR, { recursive: true });
 
 
@@ -1519,6 +1522,7 @@ function loadIntentsForUser(username) {
     }
     const isParticipant = intent.to === key || intent.from === key;
     if (!isParticipant) continue;
+    if (intent?.isGroupRecipientCopy && intent.from === key && intent.to !== key) continue;
     if (!intent.downloadToken && !(intent.isTextOnly || intent.messageType === "text")) {
         intent.downloadToken = generateDownloadToken();
         const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
@@ -1551,14 +1555,19 @@ function loadIntentsForUser(username) {
   return intents;
 }
 
-function findIntentByClientId(sender, clientIntentId) {
+function findIntentByClientId(sender, clientIntentId, expectedGroupId = "") {
   if (!clientIntentId) return null;
+  const groupId = String(expectedGroupId || "").trim();
   try {
     const files = fs.readdirSync(INTENTS_DIR).filter(f => f.endsWith(".json"));
     for (const file of files) {
       try {
         const intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
         if (intent?.from === sender && intent?.clientIntentId === clientIntentId) {
+          const intentGroupId = String(intent?.groupId || "").trim();
+          if (groupId && intentGroupId !== groupId) continue;
+          if (!groupId && intentGroupId) continue;
+          if (groupId && intent?.isGroupRecipientCopy && intent.to !== sender) continue;
           return intent;
         }
       } catch {}
@@ -1817,6 +1826,48 @@ function failActiveTransfer(intentId, message, options = {}) {
   return intent || null;
 }
 
+function finalizeGroupRecipientCopies(primaryIntent, options = {}) {
+  const primary = primaryIntent || null;
+  if (!primary) return;
+  const mirrorIds = Array.isArray(primary.groupMirrorIntentIds) ? primary.groupMirrorIntentIds : [];
+  if (!mirrorIds.length) return;
+
+  const uploadedAt = Number(options.uploadedAt || Date.now()) || Date.now();
+  const storedBytes = Number(options.storedBytes || primary.storedBytes || 0);
+  const totalBytes = Number(options.totalBytes || resolveUploadExpectedBytes(primary) || storedBytes || 0);
+
+  mirrorIds.forEach((mirrorId) => {
+    const mirror = loadIntent(mirrorId);
+    if (!mirror) return;
+    mirror.stored = true;
+    mirror.storedFile = primary.storedFile || mirror.storedFile || null;
+    mirror.storedBytes = storedBytes;
+    mirror.plainStoredBytes = uploadBytesToPlainBytes(mirror, storedBytes);
+    mirror.uploadBytesExpected = Number(mirror.uploadBytesExpected || primary.uploadBytesExpected || totalBytes || 0);
+    mirror.status = "stored";
+    mirror.transferState = "delivered";
+    mirror.uploadedAt = uploadedAt;
+    saveIntent(mirror);
+
+    emitTransferState(mirror, "delivered", {
+      sentBytes: storedBytes,
+      totalBytes: totalBytes || resolveUploadExpectedBytes(mirror),
+      plainSentBytes: mirror.plainStoredBytes,
+      plainTotalBytes: Number(mirror.fileSize || 0)
+    });
+
+    const receiver = online.get(mirror.to);
+    if (!receiver) return;
+    send(receiver, { type: "incoming_file", intent: intentForClient(mirror) });
+    try {
+      send(receiver, { type: "inbox", items: loadIntentsForUser(mirror.to) });
+    } catch {}
+    if (receiver.client === "ios") {
+      send(receiver, { type: "prepare_transfer", intentId: mirror.id });
+    }
+  });
+}
+
 function cleanupStalledTransfers() {
   const now = Date.now();
   for (const [intentId, t] of activeTransfers.entries()) {
@@ -1869,6 +1920,174 @@ function saveUser(user) {
   fs.writeFileSync(userFile(user.username), JSON.stringify(user, null, 2));
 }
 
+function groupFile(groupId = "") {
+  const id = String(groupId || "").trim();
+  if (!id) return "";
+  return path.join(GROUPS_DIR, `${id}.json`);
+}
+
+function normalizeGroupName(value = "") {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+}
+
+function normalizeGroupMembers(members = []) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(members) ? members : []) {
+    const name = String(raw || "").trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push(name);
+    if (out.length >= 64) break;
+  }
+  return out;
+}
+
+function loadGroup(groupId = "") {
+  const file = groupFile(groupId);
+  if (!file || !fs.existsSync(file)) return null;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!raw || typeof raw !== "object") return null;
+    const id = String(raw.id || groupId || "").trim();
+    if (!id) return null;
+    const members = normalizeGroupMembers(raw.members || []);
+    if (!members.length) return null;
+    return {
+      id,
+      name: normalizeGroupName(raw.name || ""),
+      members,
+      createdBy: String(raw.createdBy || members[0] || "").trim(),
+      createdAt: Number(raw.createdAt || Date.now()) || Date.now(),
+      updatedAt: Number(raw.updatedAt || raw.createdAt || Date.now()) || Date.now()
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveGroup(group) {
+  const id = String(group?.id || "").trim();
+  if (!id) return false;
+  const members = normalizeGroupMembers(group?.members || []);
+  if (!members.length) return false;
+  const payload = {
+    id,
+    name: normalizeGroupName(group?.name || ""),
+    members,
+    createdBy: String(group?.createdBy || members[0] || "").trim(),
+    createdAt: Number(group?.createdAt || Date.now()) || Date.now(),
+    updatedAt: Number(group?.updatedAt || Date.now()) || Date.now()
+  };
+  fs.writeFileSync(groupFile(id), JSON.stringify(payload, null, 2));
+  return true;
+}
+
+function groupForClient(group) {
+  if (!group || typeof group !== "object") return null;
+  return {
+    id: String(group.id || "").trim(),
+    name: normalizeGroupName(group.name || ""),
+    members: normalizeGroupMembers(group.members || []),
+    createdBy: String(group.createdBy || "").trim(),
+    createdAt: Number(group.createdAt || 0) || Date.now(),
+    updatedAt: Number(group.updatedAt || group.createdAt || 0) || Date.now()
+  };
+}
+
+function listGroupsForUser(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return [];
+  const u0 = loadUser(name);
+  if (!u0) return [];
+  const user = ensureUserShape(u0);
+  const valid = [];
+  let changed = false;
+  for (const id of normalizeGroupMembers(user.groups || [])) {
+    const group = loadGroup(id);
+    if (!group || !group.members.includes(name)) {
+      changed = true;
+      continue;
+    }
+    valid.push(group);
+  }
+  if (changed) {
+    user.groups = valid.map((g) => g.id);
+    saveUser(user);
+  }
+  valid.sort((a, b) => Number(a?.updatedAt || a?.createdAt || 0) - Number(b?.updatedAt || b?.createdAt || 0));
+  return valid;
+}
+
+function sendGroupsList(ws, username = "") {
+  if (!ws) return false;
+  const name = String(username || ws.username || "").trim();
+  if (!name) return false;
+  const groups = listGroupsForUser(name).map(groupForClient).filter(Boolean);
+  return send(ws, { type: "groups_list", groups });
+}
+
+function broadcastGroupsListToMembers(members = []) {
+  const unique = normalizeGroupMembers(members);
+  unique.forEach((name) => {
+    const memberWs = online.get(name);
+    if (memberWs) sendGroupsList(memberWs, name);
+  });
+}
+
+function removeUserFromGroups(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return [];
+  const affected = new Set();
+  let files = [];
+  try {
+    files = fs.readdirSync(GROUPS_DIR).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  files.forEach((file) => {
+    const id = path.basename(file, ".json");
+    const group = loadGroup(id);
+    if (!group || !group.members.includes(name)) return;
+    const nextMembers = group.members.filter((member) => member !== name);
+    if (nextMembers.length < 2) {
+      try { fs.unlinkSync(groupFile(group.id)); } catch {}
+      nextMembers.forEach((member) => {
+        const u0 = loadUser(member);
+        if (!u0) return;
+        const u = ensureUserShape(u0);
+        const beforeLen = u.groups.length;
+        u.groups = u.groups.filter((gid) => gid !== group.id);
+        if (u.groups.length !== beforeLen) {
+          saveUser(u);
+          affected.add(member);
+        }
+      });
+      return;
+    }
+    group.members = nextMembers;
+    group.updatedAt = Date.now();
+    if (group.createdBy === name) {
+      group.createdBy = nextMembers[0] || "";
+    }
+    saveGroup(group);
+    nextMembers.forEach((member) => {
+      const u0 = loadUser(member);
+      if (!u0) return;
+      const u = ensureUserShape(u0);
+      if (!u.groups.includes(group.id)) {
+        u.groups.push(group.id);
+        saveUser(u);
+      }
+      affected.add(member);
+    });
+  });
+  return Array.from(affected);
+}
+
 function ensureUserShape(u) {
   if (!u.friends) u.friends = [];
   if (!Array.isArray(u.friends)) u.friends = [];
@@ -1882,6 +2101,8 @@ function ensureUserShape(u) {
   if (!Array.isArray(u.deletedFriends)) u.deletedFriends = [];
   if (!u.deletedIntents) u.deletedIntents = [];
   if (!Array.isArray(u.deletedIntents)) u.deletedIntents = [];
+  if (!u.groups) u.groups = [];
+  if (!Array.isArray(u.groups)) u.groups = [];
   if (!u.profile) u.profile = {};
   return u;
 }
@@ -2100,7 +2321,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
   let data;
     try {
       data = JSON.parse(msg.toString());
-      if (!["ping", "inbox_request", "friends_list", "typing"].includes(String(data?.type || ""))) {
+      if (!["ping", "inbox_request", "friends_list", "friend_requests", "groups_list", "typing"].includes(String(data?.type || ""))) {
         console.log("📩 Message received:", data);
       }
     } catch {
@@ -2124,6 +2345,8 @@ if (data.type === "delete_account") {
   if (!username) {
     return send(ws, { type: "error", message: "Not logged in" });
   }
+
+  const affectedGroupMembers = removeUserFromGroups(username);
 
   if (online.get(username) === ws) {
     online.delete(username);
@@ -2165,6 +2388,7 @@ if (data.type === "delete_account") {
 
   // Remove from online users (already removed above when this socket owns the session)
   online.delete(username);
+  broadcastGroupsListToMembers(affectedGroupMembers);
 
   // Acknowledge + disconnect
   send(ws, { type: "account_deleted" });
@@ -2219,6 +2443,7 @@ if (data.type === "auth_signup") {
   username,
   passwordHash,
   friends: [username], // 👈 add self
+  groups: [],
   incomingRequests: [],
   outgoingRequests: [],
   declinedRequests: [],
@@ -2273,6 +2498,7 @@ if (!user.friends.includes(user.username)) {
   sendFriendsList(ws, u2);
   send(ws, { type: "profiles", profiles: loadProfiles(u2.friends || []) });
   send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests, declined: u2.declinedRequests });
+  sendGroupsList(ws, username);
   broadcastFriendsListForUserAndFriends(username);
 
   return;
@@ -2398,6 +2624,7 @@ if (!user.friends.includes(user.username)) {
     outgoing: u2.outgoingRequests || [],
     declined: u2.declinedRequests || [],
   });
+  sendGroupsList(ws, username);
   broadcastFriendsListForUserAndFriends(username);
 
   return;
@@ -3256,9 +3483,62 @@ send(ws, { type: "profiles", profiles: loadProfiles(user.friends || []) });
 return;
 }
 
+if (data.type === "groups_list") {
+  sendGroupsList(ws, ws.username);
+  return;
+}
+
 if (data.type === "friend_requests") {
   sendFriendRequestsUpdate(ws.username);
   return;
+}
+
+if (data.type === "group_create") {
+  const meName = String(ws.username || "").trim();
+  const me0 = loadUser(meName);
+  if (!me0) return send(ws, { type: "error", message: "User not found" });
+  const me = ensureUserShape(me0);
+
+  const requestedMembers = normalizeGroupMembers(data.members || []);
+  const membersSet = new Set([meName]);
+  requestedMembers.forEach((member) => {
+    if (!member || member === meName) return;
+    if (!me.friends.includes(member)) return;
+    if (!loadUser(member)) return;
+    membersSet.add(member);
+  });
+  const members = Array.from(membersSet);
+  if (members.length < 2) {
+    return send(ws, { type: "error", message: "Select at least one contact to create a group" });
+  }
+  if (members.length > 64) {
+    return send(ws, { type: "error", message: "Group limit is 64 members" });
+  }
+
+  const group = {
+    id: randomUUID(),
+    name: normalizeGroupName(data.name || ""),
+    createdBy: meName,
+    members,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  if (!saveGroup(group)) {
+    return send(ws, { type: "error", message: "Could not create group" });
+  }
+
+  members.forEach((member) => {
+    const u0 = loadUser(member);
+    if (!u0) return;
+    const u = ensureUserShape(u0);
+    if (!u.groups.includes(group.id)) {
+      u.groups.push(group.id);
+      saveUser(u);
+    }
+  });
+
+  broadcastGroupsListToMembers(members);
+  return send(ws, { type: "group_created", group: groupForClient(group) });
 }
 
 // =========================
@@ -3582,6 +3862,13 @@ if (t.mode === "live") {
       plainSentBytes: t.intent.plainStoredBytes,
       plainTotalBytes: Number(t.intent.fileSize || 0)
     });
+    if (t.intent.groupId) {
+      finalizeGroupRecipientCopies(t.intent, {
+        storedBytes: t.bytesExpected,
+        totalBytes: t.bytesExpected,
+        uploadedAt: t.intent.uploadedAt
+      });
+    }
   }
 
   send(ws, { type: "upload_done", intentId });
@@ -3618,7 +3905,7 @@ saveIntent(intent);
     // 🔔 IMPORTANT: notify recipient that file is now ready
     // 🔔 IMPORTANT: notify recipient that file is now ready
 const receiver = online.get(intent.to);
-if (receiver) {
+if (!intent.groupId && receiver) {
   const safeIntent = intentForClient(intent);
   send(receiver, {
     type: "incoming_file",
@@ -3635,6 +3922,14 @@ if (receiver) {
       intentId
     });
   }
+}
+
+if (intent.groupId) {
+  finalizeGroupRecipientCopies(intent, {
+    storedBytes: Number(intent.storedBytes || t.bytesExpected || 0),
+    totalBytes: Number(t.bytesExpected || resolveUploadExpectedBytes(intent) || 0),
+    uploadedAt: intent.uploadedAt
+  });
 }
 
 emitTransferState(intent, "delivered", {
@@ -3684,7 +3979,8 @@ emitTransferState(intent, "delivered", {
     // 3a) send intent only (NO transport)
 // 3a) send intent only (NO transport)
 if (data.type === "send_intent") {
-  const to = String(data.to || "").trim();
+  const requestedGroupId = String(data.groupId || "").trim();
+  let to = String(data.to || "").trim();
   const rawFileName = String(data.fileName || "").trim();
   const fileName = rawFileName ? safeBasename(rawFileName) : "";
   const fileSize = Number(data.fileSize || 0);
@@ -3693,13 +3989,29 @@ if (data.type === "send_intent") {
   const text = typeof data.text === "string" ? data.text.trim().slice(0, 5000) : "";
   const isTextOnly = Boolean(data.isTextOnly) || (!!text && !fileName && !fileSize);
   const clientIntentId = String(data.clientIntentId || "").trim();
-  const encryption = sanitizeIntentEncryption(data.encryption || null, ws.username, to);
-  const accessControl = sanitizeIntentAccessControl(data.accessControl || null, isTextOnly);
-  const passwordHint = sanitizeIntentPasswordHint(data.passwordHint, isTextOnly, accessControl);
   const now = Date.now();
   const rawExpiresAt = Number(data.expiresAt || 0);
   const hasCustomExpiry = Number.isFinite(rawExpiresAt) && rawExpiresAt > 0;
   const expiresAt = hasCustomExpiry ? sanitizeIntentExpiresAt(rawExpiresAt, now) : 0;
+  const isGroupSend = Boolean(requestedGroupId);
+  let targetGroup = null;
+  let groupRecipients = [];
+
+  if (isGroupSend) {
+    targetGroup = loadGroup(requestedGroupId);
+    if (!targetGroup) {
+      return send(ws, { type: "error", message: "Group not found" });
+    }
+    if (!targetGroup.members.includes(ws.username)) {
+      return send(ws, { type: "error", message: "You are not a member of this group" });
+    }
+    to = ws.username; // sender's own copy is the primary upload intent
+    groupRecipients = normalizeGroupMembers(targetGroup.members.filter((member) => member !== ws.username));
+  }
+
+  const encryption = sanitizeIntentEncryption(data.encryption || null, ws.username, to);
+  const accessControl = sanitizeIntentAccessControl(data.accessControl || null, isTextOnly);
+  const passwordHint = sanitizeIntentPasswordHint(data.passwordHint, isTextOnly, accessControl);
 
   if (!to) {
     return send(ws, { type: "error", message: "Missing recipient" });
@@ -3750,29 +4062,31 @@ if (data.type === "send_intent") {
     // continue
   }
 
-  // 🔒 Validate recipient exists
   const sender = ensureUserShape(loadUser(ws.username));
-  const recipient = loadUser(to);
-
-  if (!recipient) {
-    return send(ws, { type: "error", message: "Recipient does not exist" });
+  if (!sender) {
+    return send(ws, { type: "error", message: "User not found" });
   }
 
-  // 🔒 Validate friendship (WhatsApp-style)
-  if (!sender.friends.includes(to)) {
-    return send(ws, { type: "error", message: "Recipient is not your friend" });
+  if (!isGroupSend) {
+    const recipient = loadUser(to);
+    if (!recipient) {
+      return send(ws, { type: "error", message: "Recipient does not exist" });
+    }
+    if (!sender.friends.includes(to)) {
+      return send(ws, { type: "error", message: "Recipient is not your friend" });
+    }
   }
 
   // ✅ De-dup if client retries with same intent id
   if (clientIntentId) {
-    const existing = findIntentByClientId(ws.username, clientIntentId);
+    const existing = findIntentByClientId(ws.username, clientIntentId, requestedGroupId);
     if (existing) {
       if (!existing.downloadToken && !(existing.isTextOnly || existing.messageType === "text")) {
         existing.downloadToken = generateDownloadToken();
         saveIntent(existing);
       }
       const receiverWs = online.get(existing.to);
-      if (receiverWs) {
+      if (receiverWs && !isGroupSend) {
         const safeExistingIntent = intentForClient(existing);
         if (existing.isTextOnly || existing.messageType === "text") {
           send(receiverWs, { type: "incoming_file", intent: safeExistingIntent });
@@ -3806,11 +4120,8 @@ if (data.type === "send_intent") {
     }
   }
 
-  // ✅ Create + store intent even if receiver is offline
-  const intent = {
-    id: randomUUID(),
+  const baseIntent = {
     from: ws.username,
-    to,
     fileName: isTextOnly ? "" : fileName,
     fileSize: isTextOnly ? 0 : fileSize,
     note: isTextOnly ? "" : note,
@@ -3823,14 +4134,25 @@ if (data.type === "send_intent") {
     passwordMode: Boolean(!isTextOnly && accessControl) ? normalizeIntentPasswordMode(accessControl?.unlockMode || "once", "once") : "once",
     passwordHint: passwordHint || "",
     uploadBytesExpected: isTextOnly ? 0 : uploadBytesExpected,
-    clientIntentId: clientIntentId || null,
     createdAt: now,
     expiresAt,
     customExpiry: Boolean(!isTextOnly && hasCustomExpiry && expiresAt > 0),
-    status: isTextOnly ? "completed" : "pending", // pending | uploading | stored | completed
+    status: isTextOnly ? "completed" : "pending",
     transferState: isTextOnly ? "delivered" : "queued",
+    readByRecipientAt: null,
+    groupId: isGroupSend ? targetGroup.id : "",
+    groupName: isGroupSend ? normalizeGroupName(targetGroup.name || "") : "",
+    groupMembers: isGroupSend ? normalizeGroupMembers(targetGroup.members || []) : []
+  };
+
+  // ✅ Create + store intent even if receiver is offline
+  const intent = {
+    id: randomUUID(),
+    to,
+    ...baseIntent,
+    clientIntentId: clientIntentId || null,
     downloadToken: isTextOnly ? null : generateDownloadToken(),
-    readByRecipientAt: null
+    isGroupRecipientCopy: false
   };
   if (isTextOnly) {
     intent.stored = true;
@@ -3843,17 +4165,60 @@ if (data.type === "send_intent") {
 
   saveIntent(intent);
 
-  const receiverWs = online.get(to);
-  if (receiverWs) {
-    const safeIntent = intentForClient(intent);
-    if (isTextOnly) {
-      send(receiverWs, { type: "incoming_file", intent: safeIntent });
-    } else {
-      send(receiverWs, { type: "incoming_intent", intent: safeIntent });
+  const mirrorIntents = [];
+  if (isGroupSend) {
+    for (const recipientName of groupRecipients) {
+      const mirrorIntent = {
+        id: randomUUID(),
+        to: recipientName,
+        ...baseIntent,
+        clientIntentId: null,
+        downloadToken: isTextOnly ? null : generateDownloadToken(),
+        groupPrimaryIntentId: intent.id,
+        isGroupRecipientCopy: true
+      };
+      if (isTextOnly) {
+        mirrorIntent.stored = true;
+        mirrorIntent.storedFile = null;
+        mirrorIntent.storedBytes = 0;
+        mirrorIntent.plainStoredBytes = 0;
+        mirrorIntent.uploadedAt = now;
+        mirrorIntent.completedAt = now;
+      }
+      saveIntent(mirrorIntent);
+      mirrorIntents.push(mirrorIntent);
     }
-    try {
-      send(receiverWs, { type: "inbox", items: loadIntentsForUser(to) });
-    } catch {}
+    intent.groupMirrorIntentIds = mirrorIntents.map((entry) => entry.id);
+    saveIntent(intent);
+  }
+
+  if (isGroupSend) {
+    for (const mirrorIntent of mirrorIntents) {
+      const receiverWs = online.get(mirrorIntent.to);
+      if (!receiverWs) continue;
+      const safeIntent = intentForClient(mirrorIntent);
+      if (isTextOnly) {
+        send(receiverWs, { type: "incoming_file", intent: safeIntent });
+      } else {
+        send(receiverWs, { type: "incoming_intent", intent: safeIntent });
+      }
+      try {
+        send(receiverWs, { type: "inbox", items: loadIntentsForUser(mirrorIntent.to) });
+      } catch {}
+    }
+  } else {
+    const receiverWs = online.get(to);
+    if (receiverWs) {
+      const safeIntent = intentForClient(intent);
+      if (isTextOnly) {
+        send(receiverWs, { type: "incoming_file", intent: safeIntent });
+      } else {
+        send(receiverWs, { type: "incoming_intent", intent: safeIntent });
+      }
+      try {
+        send(receiverWs, { type: "inbox", items: loadIntentsForUser(to) });
+      } catch {}
+    }
   }
 
   emitTransferState(intent, intent.transferState || "queued", {
@@ -3869,11 +4234,17 @@ if (data.type === "send_intent") {
     type: "intent_ok",
     intentId: intent.id,
     clientIntentId: clientIntentId || null,
-    to,
+    to: isGroupSend ? ws.username : to,
+    groupId: isGroupSend ? intent.groupId : "",
+    groupName: isGroupSend ? intent.groupName : "",
     fileName: intent.fileName || "",
     downloadToken: intent.downloadToken || null,
-    receiverOnline: Boolean(receiverWs),
-    receiverClient: receiverWs?.client || null,
+    receiverOnline: isGroupSend
+      ? mirrorIntents.some((entry) => Boolean(online.get(entry.to)))
+      : Boolean(online.get(to)),
+    receiverClient: isGroupSend
+      ? null
+      : (online.get(to)?.client || null),
     expiresAt: intent.expiresAt,
     createdAt: intent.createdAt,
     isTextOnly,
