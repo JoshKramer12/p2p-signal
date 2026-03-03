@@ -44,6 +44,12 @@ const INTENT_UNLOCK_TTL_ALWAYS_MS = Math.max(
   Number(process.env.INTENT_UNLOCK_TTL_ALWAYS_MS || 2 * 60 * 1000)
 );
 const INTENT_UNLOCK_SECRET = String(process.env.INTENT_UNLOCK_SECRET || randomUUID() + randomUUID());
+const GUEST_TRANSFER_REQUEST_TTL_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.GUEST_TRANSFER_REQUEST_TTL_MS || 24 * 60 * 60 * 1000)
+);
+const GUEST_APP_BASE_URL = String(process.env.GUEST_APP_BASE_URL || "https://merm.fly.dev").trim();
+const GUEST_BRIDGE_SECRET = String(process.env.GUEST_BRIDGE_SECRET || "").trim();
 
 // username -> ws
 const online = new Map();
@@ -59,7 +65,7 @@ const intentListCacheByUser = new Map(); // username -> { ts, items }
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password,X-Merm-Unlock");
   res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition,Content-Range,Accept-Ranges,X-Merm-Unlock,X-Merm-Unlock-Exp");
 }
@@ -200,6 +206,50 @@ function parseHttpRange(rangeRaw = "", totalSize = 0) {
     start,
     end
   };
+}
+
+function readJsonBody(req, maxBytes = 128 * 1024) {
+  return new Promise((resolve, reject) => {
+    const limit = Math.max(1024, Number(maxBytes || 0));
+    const chunks = [];
+    let total = 0;
+    req.on("data", (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk || "");
+      total += buf.length;
+      if (total > limit) {
+        reject(Object.assign(new Error("Payload too large"), { status: 413 }));
+        try { req.destroy(); } catch {}
+        return;
+      }
+      chunks.push(buf);
+    });
+    req.on("error", (err) => reject(err));
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8").trim();
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(Object.assign(new Error("Invalid JSON"), { status: 400 }));
+      }
+    });
+  });
+}
+
+function isGuestBridgeAuthorized(req) {
+  if (!GUEST_BRIDGE_SECRET) return true;
+  const incoming = String(req.headers["x-merm-bridge-secret"] || "");
+  if (!incoming) return false;
+  const incomingHash = createHash("sha256").update(incoming).digest();
+  const expectedHash = createHash("sha256").update(GUEST_BRIDGE_SECRET).digest();
+  try {
+    return timingSafeEqual(incomingHash, expectedHash);
+  } catch {
+    return false;
+  }
 }
 
 function pruneArchiveIndexCache(maxEntries = 200) {
@@ -504,6 +554,55 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/" || url.pathname === "/health") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("ok");
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/guest-transfer/request") {
+      setCors(res);
+      if (!isGuestBridgeAuthorized(req)) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      let body = {};
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch (err) {
+        const status = Number(err?.status || 400);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Invalid request body") }));
+        return;
+      }
+
+      const targetUsername = String(body?.targetUsername || body?.recipientUsername || "").trim();
+      const queued = queueGuestTransferRequest({
+        targetUsername,
+        threadId: body?.threadId,
+        code: body?.code,
+        shareUrl: body?.shareUrl,
+        threadName: body?.threadName,
+        recipient: body?.recipient,
+        fromGuestDisplayName: body?.fromGuestDisplayName,
+        fromGuestSessionId: body?.fromGuestSessionId,
+        createdAt: body?.createdAt,
+        expiresAt: body?.expiresAt
+      });
+
+      if (!queued.ok) {
+        const status = String(queued.error || "").toLowerCase().includes("not found") ? 404 : 400;
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ ok: false, message: queued.error || "Could not create request" }));
+        return;
+      }
+
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({
+        ok: true,
+        targetUsername: queued.targetUsername,
+        requestId: queued.request?.id || "",
+        expiresAt: Number(queued.request?.expiresAt || 0)
+      }));
       return;
     }
 
@@ -817,6 +916,7 @@ const FILES_DIR = path.join(STORAGE_DIR, "files");
 const USERS_DIR = path.join(STORAGE_DIR, "users");
 const GROUPS_DIR = path.join(STORAGE_DIR, "groups");
 const PREVIEW_CACHE_DIR = path.join(STORAGE_DIR, "preview-cache");
+const GUEST_TRANSFER_REQUESTS_FILE = path.join(STORAGE_DIR, "guest-transfer-requests.json");
 
 function countUsers() {
   try {
@@ -2130,6 +2230,221 @@ function sendFriendRequestsUpdate(username) {
   });
 }
 
+function loadGuestTransferRequestsIndex() {
+  try {
+    if (!fs.existsSync(GUEST_TRANSFER_REQUESTS_FILE)) return {};
+    const parsed = JSON.parse(fs.readFileSync(GUEST_TRANSFER_REQUESTS_FILE, "utf8"));
+    if (!parsed || typeof parsed !== "object") return {};
+    const users = parsed.users && typeof parsed.users === "object" ? parsed.users : parsed;
+    const out = {};
+    Object.entries(users).forEach(([username, rawList]) => {
+      const key = String(username || "").trim();
+      if (!key) return;
+      out[key] = Array.isArray(rawList) ? rawList : [];
+    });
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+let guestTransferRequestsByUser = loadGuestTransferRequestsIndex();
+
+function saveGuestTransferRequestsIndex() {
+  const tmp = `${GUEST_TRANSFER_REQUESTS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ users: guestTransferRequestsByUser }, null, 2));
+  fs.renameSync(tmp, GUEST_TRANSFER_REQUESTS_FILE);
+}
+
+function userExistsCaseInsensitive(raw = "") {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  const direct = loadUser(value);
+  if (direct?.username) return String(direct.username || "").trim() || value;
+  const lower = value.toLowerCase();
+  try {
+    const files = fs.readdirSync(USERS_DIR).filter((file) => file.endsWith(".json"));
+    for (const file of files) {
+      const username = path.basename(file, ".json");
+      if (String(username || "").toLowerCase() === lower) {
+        return username;
+      }
+    }
+  } catch {}
+  return "";
+}
+
+function normalizeGuestTransferRequest(raw = {}, targetUsername = "") {
+  const target = String(targetUsername || raw?.targetUsername || "").trim();
+  const requestId = String(raw?.id || "").trim() || randomUUID();
+  const code = String(raw?.code || "").replace(/\D/g, "").slice(0, 6);
+  const threadId = String(raw?.threadId || "").trim().slice(0, 128);
+  const shareUrl = String(raw?.shareUrl || "").trim().slice(0, 2000);
+  if (!target || !code || !threadId || !shareUrl) return null;
+
+  const now = Date.now();
+  const createdAt = Number(raw?.createdAt || now) || now;
+  const expiresAtRaw = Number(raw?.expiresAt || (createdAt + GUEST_TRANSFER_REQUEST_TTL_MS));
+  const expiresAt = Number.isFinite(expiresAtRaw) ? Math.max(createdAt + 60 * 1000, expiresAtRaw) : (createdAt + GUEST_TRANSFER_REQUEST_TTL_MS);
+
+  return {
+    id: requestId,
+    targetUsername: target,
+    threadId,
+    code,
+    shareUrl,
+    threadName: String(raw?.threadName || "").trim().slice(0, 80),
+    recipient: String(raw?.recipient || "").trim().slice(0, 120),
+    fromGuestDisplayName: String(raw?.fromGuestDisplayName || "Guest").trim().slice(0, 60) || "Guest",
+    fromGuestSessionId: String(raw?.fromGuestSessionId || "").trim().slice(0, 120),
+    createdAt,
+    expiresAt
+  };
+}
+
+function pruneGuestTransferRequests() {
+  const now = Date.now();
+  let dirty = false;
+  Object.keys(guestTransferRequestsByUser).forEach((username) => {
+    const current = Array.isArray(guestTransferRequestsByUser[username]) ? guestTransferRequestsByUser[username] : [];
+    const next = current
+      .map((item) => normalizeGuestTransferRequest(item, username))
+      .filter((item) => item && Number(item.expiresAt || 0) > now);
+    if (!next.length) {
+      if (current.length) dirty = true;
+      delete guestTransferRequestsByUser[username];
+      return;
+    }
+    if (next.length !== current.length) dirty = true;
+    guestTransferRequestsByUser[username] = next;
+  });
+  if (dirty) {
+    saveGuestTransferRequestsIndex();
+  }
+}
+
+function listGuestTransferRequestsForUser(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return [];
+  pruneGuestTransferRequests();
+  const rows = Array.isArray(guestTransferRequestsByUser[name]) ? guestTransferRequestsByUser[name] : [];
+  return rows
+    .map((item) => normalizeGuestTransferRequest(item, name))
+    .filter(Boolean)
+    .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0));
+}
+
+function getUserDisplayName(username = "") {
+  const user = loadUser(username);
+  const profile = user?.profile || {};
+  const first = String(profile.firstName || "").trim();
+  const last = String(profile.lastName || "").trim();
+  const full = `${first} ${last}`.trim();
+  if (full) return full;
+  const legacy = String(profile.name || "").trim();
+  if (legacy) return legacy;
+  return String(username || "").trim() || "User";
+}
+
+function withGuestBaseUrl(urlPath = "") {
+  const raw = String(urlPath || "").trim();
+  if (!raw) return "";
+  try {
+    if (/^https?:\/\//i.test(raw)) {
+      return new URL(raw).toString();
+    }
+    if (!GUEST_APP_BASE_URL) return raw;
+    return new URL(raw, GUEST_APP_BASE_URL).toString();
+  } catch {
+    return raw;
+  }
+}
+
+function buildGuestOpenUrlForUser(request, username = "") {
+  const base = withGuestBaseUrl(request?.shareUrl || `/guest?code=${encodeURIComponent(String(request?.code || ""))}`);
+  if (!base) return "";
+  try {
+    const url = new URL(base);
+    if (!url.searchParams.get("name")) {
+      url.searchParams.set("name", getUserDisplayName(username));
+    }
+    return url.toString();
+  } catch {
+    return base;
+  }
+}
+
+function sendGuestTransferRequestsUpdate(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return false;
+  const ws = online.get(name);
+  if (!ws) return false;
+  return send(ws, {
+    type: "guest_transfer_requests",
+    incoming: listGuestTransferRequestsForUser(name)
+  });
+}
+
+function queueGuestTransferRequest(raw = {}) {
+  const target = userExistsCaseInsensitive(raw?.targetUsername || "");
+  if (!target) return { ok: false, error: "Recipient not found" };
+  const normalized = normalizeGuestTransferRequest(raw, target);
+  if (!normalized) return { ok: false, error: "Invalid request payload" };
+
+  const list = Array.isArray(guestTransferRequestsByUser[target]) ? guestTransferRequestsByUser[target] : [];
+  const existingIdx = list.findIndex((item) => String(item?.threadId || "") === normalized.threadId);
+  if (existingIdx >= 0) {
+    list[existingIdx] = {
+      ...list[existingIdx],
+      ...normalized,
+      createdAt: Number(list[existingIdx]?.createdAt || normalized.createdAt) || normalized.createdAt
+    };
+  } else {
+    list.push(normalized);
+  }
+  guestTransferRequestsByUser[target] = list
+    .map((item) => normalizeGuestTransferRequest(item, target))
+    .filter(Boolean)
+    .sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))
+    .slice(0, 200);
+  saveGuestTransferRequestsIndex();
+  sendGuestTransferRequestsUpdate(target);
+  return { ok: true, targetUsername: target, request: normalized };
+}
+
+function resolveGuestTransferRequestForUser(username = "", requestId = "", action = "") {
+  const name = String(username || "").trim();
+  const id = String(requestId || "").trim();
+  const decision = String(action || "").trim().toLowerCase();
+  if (!name || !id || !["accept", "decline"].includes(decision)) {
+    return { ok: false, error: "Invalid request" };
+  }
+  const list = Array.isArray(guestTransferRequestsByUser[name]) ? guestTransferRequestsByUser[name] : [];
+  const idx = list.findIndex((item) => String(item?.id || "") === id);
+  if (idx < 0) {
+    return { ok: false, error: "Request not found" };
+  }
+  const [request] = list.splice(idx, 1);
+  if (list.length) guestTransferRequestsByUser[name] = list;
+  else delete guestTransferRequestsByUser[name];
+  saveGuestTransferRequestsIndex();
+  sendGuestTransferRequestsUpdate(name);
+  return {
+    ok: true,
+    action: decision,
+    request,
+    openUrl: decision === "accept" ? buildGuestOpenUrlForUser(request, name) : ""
+  };
+}
+
+function clearGuestTransferRequestsForUser(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return;
+  if (!guestTransferRequestsByUser[name]) return;
+  delete guestTransferRequestsByUser[name];
+  saveGuestTransferRequestsIndex();
+}
+
 function friendsListPayload(userRecord) {
   const user = ensureUserShape(userRecord);
   return {
@@ -2321,7 +2636,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
   let data;
     try {
       data = JSON.parse(msg.toString());
-      if (!["ping", "inbox_request", "friends_list", "friend_requests", "groups_list", "typing"].includes(String(data?.type || ""))) {
+      if (!["ping", "inbox_request", "friends_list", "friend_requests", "guest_transfer_requests", "groups_list", "typing"].includes(String(data?.type || ""))) {
         console.log("📩 Message received:", data);
       }
     } catch {
@@ -2385,6 +2700,7 @@ if (data.type === "delete_account") {
   } catch (err) {
     console.error("❌ Failed to delete user file:", err);
   }
+  clearGuestTransferRequestsForUser(username);
 
   // Remove from online users (already removed above when this socket owns the session)
   online.delete(username);
@@ -2498,6 +2814,7 @@ if (!user.friends.includes(user.username)) {
   sendFriendsList(ws, u2);
   send(ws, { type: "profiles", profiles: loadProfiles(u2.friends || []) });
   send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests, declined: u2.declinedRequests });
+  send(ws, { type: "guest_transfer_requests", incoming: listGuestTransferRequestsForUser(username) });
   sendGroupsList(ws, username);
   broadcastFriendsListForUserAndFriends(username);
 
@@ -2624,6 +2941,7 @@ if (!user.friends.includes(user.username)) {
     outgoing: u2.outgoingRequests || [],
     declined: u2.declinedRequests || [],
   });
+  send(ws, { type: "guest_transfer_requests", incoming: listGuestTransferRequestsForUser(username) });
   sendGroupsList(ws, username);
   broadcastFriendsListForUserAndFriends(username);
 
@@ -2661,6 +2979,7 @@ if (data.type === "login") {
 
   const pending = loadIntentsForUser(name);
   send(ws, { type: "inbox", items: pending });
+  send(ws, { type: "guest_transfer_requests", incoming: listGuestTransferRequestsForUser(name) });
   broadcastFriendsListForUserAndFriends(name);
 
   return;
@@ -3490,6 +3809,31 @@ if (data.type === "groups_list") {
 
 if (data.type === "friend_requests") {
   sendFriendRequestsUpdate(ws.username);
+  return;
+}
+
+if (data.type === "guest_transfer_requests") {
+  sendGuestTransferRequestsUpdate(ws.username);
+  return;
+}
+
+if (data.type === "guest_transfer_request_respond") {
+  const requestId = String(data.requestId || "").trim();
+  const action = String(data.action || "").trim().toLowerCase();
+  if (!requestId) return send(ws, { type: "error", message: "Missing requestId" });
+  if (!["accept", "decline"].includes(action)) {
+    return send(ws, { type: "error", message: "Invalid response action" });
+  }
+  const resolved = resolveGuestTransferRequestForUser(ws.username, requestId, action);
+  if (!resolved.ok) {
+    return send(ws, { type: "error", message: resolved.error || "Could not resolve request" });
+  }
+  send(ws, {
+    type: "guest_transfer_request_responded",
+    requestId,
+    action,
+    openUrl: resolved.openUrl || ""
+  });
   return;
 }
 
