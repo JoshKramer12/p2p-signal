@@ -2291,6 +2291,33 @@ function userByEmailCaseInsensitive(raw = "") {
   return "";
 }
 
+function normalizePhoneDigits(raw = "") {
+  return String(raw || "").replace(/\D/g, "");
+}
+
+function userByPhone(raw = "") {
+  const targetDigits = normalizePhoneDigits(raw);
+  if (!targetDigits) return "";
+  try {
+    const files = fs.readdirSync(USERS_DIR).filter((file) => file.endsWith(".json"));
+    for (const file of files) {
+      const username = path.basename(file, ".json");
+      const u = loadUser(username);
+      const profile = u?.profile || {};
+      const localDigits = normalizePhoneDigits(profile?.phoneLocal || "");
+      const codeDigits = normalizePhoneDigits(profile?.phoneCountryCode || "");
+      const combined = `${codeDigits}${localDigits}`;
+      const fallback = normalizePhoneDigits(profile?.phone || "");
+      const fullDigits = combined || fallback;
+      if (!fullDigits) continue;
+      if (fullDigits === targetDigits || localDigits === targetDigits) {
+        return String(u?.username || username || "").trim();
+      }
+    }
+  } catch {}
+  return "";
+}
+
 function resolveGuestTransferTargetUsername(payload = {}) {
   const fromUsername = String(payload?.targetUsername || payload?.recipientUsername || "").trim();
   const directUser = userExistsCaseInsensitive(fromUsername);
@@ -2299,6 +2326,10 @@ function resolveGuestTransferTargetUsername(payload = {}) {
   const fromEmail = String(payload?.targetEmail || payload?.recipientEmail || "").trim().toLowerCase();
   const directEmail = userByEmailCaseInsensitive(fromEmail);
   if (directEmail) return directEmail;
+
+  const fromPhone = String(payload?.targetPhone || payload?.recipientPhone || "").trim();
+  const directPhone = userByPhone(fromPhone);
+  if (directPhone) return directPhone;
 
   const identifierRaw = String(payload?.targetIdentifier || payload?.recipient || "").trim();
   if (!identifierRaw) return "";
@@ -2316,8 +2347,15 @@ function resolveGuestTransferTargetUsername(payload = {}) {
   if (kind === "username") {
     return userExistsCaseInsensitive(identifier);
   }
+  if (kind === "phone") {
+    return userByPhone(identifier);
+  }
 
   if (identifier.startsWith("@")) identifier = identifier.slice(1);
+  if (/^\+?[\d\s().-]{7,}$/.test(identifier)) {
+    const phoneUser = userByPhone(identifier);
+    if (phoneUser) return phoneUser;
+  }
   if (identifier.includes("@")) {
     return userByEmailCaseInsensitive(identifier);
   }
@@ -2483,7 +2521,14 @@ function resolveGuestTransferRequestForUser(username = "", requestId = "", actio
     ok: true,
     action: decision,
     request,
-    openUrl: decision === "accept" ? buildGuestOpenUrlForUser(request, name) : ""
+    openUrl: decision === "accept" ? buildGuestOpenUrlForUser(request, name) : "",
+    threadId: String(request?.threadId || "").trim(),
+    code: String(request?.code || "").replace(/\D/g, "").slice(0, 6),
+    threadName: String(request?.threadName || "").trim(),
+    recipient: String(request?.recipient || "").trim(),
+    shareUrl: String(request?.shareUrl || "").trim(),
+    createdAt: Number(request?.createdAt || 0) || 0,
+    expiresAt: Number(request?.expiresAt || 0) || 0
   };
 }
 
@@ -3882,7 +3927,14 @@ if (data.type === "guest_transfer_request_respond") {
     type: "guest_transfer_request_responded",
     requestId,
     action,
-    openUrl: resolved.openUrl || ""
+    openUrl: resolved.openUrl || "",
+    threadId: resolved.threadId || "",
+    code: resolved.code || "",
+    threadName: resolved.threadName || "",
+    recipient: resolved.recipient || "",
+    shareUrl: resolved.shareUrl || "",
+    createdAt: Number(resolved.createdAt || 0) || 0,
+    expiresAt: Number(resolved.expiresAt || 0) || 0
   });
   return;
 }
