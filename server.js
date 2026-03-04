@@ -575,7 +575,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const targetUsername = String(body?.targetUsername || body?.recipientUsername || "").trim();
+      const targetUsername = resolveGuestTransferTargetUsername(body);
       const queued = queueGuestTransferRequest({
         targetUsername,
         threadId: body?.threadId,
@@ -2272,6 +2272,56 @@ function userExistsCaseInsensitive(raw = "") {
     }
   } catch {}
   return "";
+}
+
+function userByEmailCaseInsensitive(raw = "") {
+  const email = String(raw || "").trim().toLowerCase();
+  if (!email || !email.includes("@")) return "";
+  try {
+    const files = fs.readdirSync(USERS_DIR).filter((file) => file.endsWith(".json"));
+    for (const file of files) {
+      const username = path.basename(file, ".json");
+      const u = loadUser(username);
+      const profileEmail = String(u?.profile?.email || "").trim().toLowerCase();
+      if (profileEmail && profileEmail === email) {
+        return String(u?.username || username || "").trim();
+      }
+    }
+  } catch {}
+  return "";
+}
+
+function resolveGuestTransferTargetUsername(payload = {}) {
+  const fromUsername = String(payload?.targetUsername || payload?.recipientUsername || "").trim();
+  const directUser = userExistsCaseInsensitive(fromUsername);
+  if (directUser) return directUser;
+
+  const fromEmail = String(payload?.targetEmail || payload?.recipientEmail || "").trim().toLowerCase();
+  const directEmail = userByEmailCaseInsensitive(fromEmail);
+  if (directEmail) return directEmail;
+
+  const identifierRaw = String(payload?.targetIdentifier || payload?.recipient || "").trim();
+  if (!identifierRaw) return "";
+  let identifier = identifierRaw;
+  let kind = "";
+  const colon = identifierRaw.indexOf(":");
+  if (colon > 0) {
+    kind = identifierRaw.slice(0, colon).trim().toLowerCase();
+    identifier = identifierRaw.slice(colon + 1).trim();
+  }
+
+  if (kind === "email") {
+    return userByEmailCaseInsensitive(identifier);
+  }
+  if (kind === "username") {
+    return userExistsCaseInsensitive(identifier);
+  }
+
+  if (identifier.startsWith("@")) identifier = identifier.slice(1);
+  if (identifier.includes("@")) {
+    return userByEmailCaseInsensitive(identifier);
+  }
+  return userExistsCaseInsensitive(identifier);
 }
 
 function normalizeGuestTransferRequest(raw = {}, targetUsername = "") {
