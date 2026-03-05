@@ -53,6 +53,8 @@ const GUEST_BRIDGE_SECRET = String(process.env.GUEST_BRIDGE_SECRET || "").trim()
 
 // username -> ws
 const online = new Map();
+// username -> Set<ws> (multi-device support)
+const onlineSockets = new Map();
 
 // username -> [intent, intent, intent]
 const inboxes = new Map();
@@ -62,6 +64,81 @@ const activeTransfers = new Map();
 const archiveIndexCache = new Map(); // intentId -> { entries, archiveSize, archiveMtimeMs, cachedAt }
 const previewExtractJobs = new Map(); // cachePath -> Promise<void>
 const intentListCacheByUser = new Map(); // username -> { ts, items }
+
+function getOnlineSocketSet(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return null;
+  let set = onlineSockets.get(name);
+  if (!set) {
+    set = new Set();
+    onlineSockets.set(name, set);
+  }
+  return set;
+}
+
+function registerOnlineSocket(username = "", ws = null) {
+  const name = String(username || "").trim();
+  if (!name || !ws) return;
+  const set = getOnlineSocketSet(name);
+  set.add(ws);
+  online.set(name, ws);
+}
+
+function getOnlineSocketsForUser(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return [];
+  const set = onlineSockets.get(name);
+  if (!set || !set.size) return [];
+  const alive = [];
+  for (const sock of Array.from(set)) {
+    if (sock && sock.readyState === WebSocket.OPEN) {
+      alive.push(sock);
+    } else {
+      set.delete(sock);
+    }
+  }
+  if (!set.size) {
+    onlineSockets.delete(name);
+  }
+  return alive;
+}
+
+function isUserOnline(username = "") {
+  return getOnlineSocketsForUser(username).length > 0;
+}
+
+function sendToUser(username = "", payload = null, options = {}) {
+  const name = String(username || "").trim();
+  if (!name || !payload) return false;
+  const excludeWs = options?.excludeWs || null;
+  const sockets = getOnlineSocketsForUser(name);
+  let sent = false;
+  sockets.forEach((sock) => {
+    if (!sock || sock === excludeWs) return;
+    if (send(sock, payload)) sent = true;
+  });
+  return sent;
+}
+
+function unregisterOnlineSocket(username = "", ws = null) {
+  const name = String(username || "").trim();
+  if (!name || !ws) return false;
+  const set = onlineSockets.get(name);
+  if (set) {
+    set.delete(ws);
+    for (const sock of Array.from(set)) {
+      if (!sock || sock.readyState !== WebSocket.OPEN) set.delete(sock);
+    }
+    if (!set.size) onlineSockets.delete(name);
+  }
+  const current = online.get(name);
+  if (!current || current === ws || current.readyState !== WebSocket.OPEN) {
+    const replacement = getOnlineSocketsForUser(name)[0] || null;
+    if (replacement) online.set(name, replacement);
+    else online.delete(name);
+  }
+  return isUserOnline(name);
+}
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -1008,10 +1085,8 @@ function deleteIntentAndNotify(intent) {
   removePreviewCacheForIntent(intent.id);
   archiveIndexCache.delete(String(intent.id || ""));
 
-  const receiver = online.get(intent.to);
-  const sender = online.get(intent.from);
-  const senderOnline = Boolean(sender && sender.readyState === WebSocket.OPEN);
-  const receiverOnline = Boolean(receiver && receiver.readyState === WebSocket.OPEN);
+  const senderOnline = isUserOnline(intent.from);
+  const receiverOnline = isUserOnline(intent.to);
   const payload = {
     type: "intent_deleted",
     intentId: intent.id,
@@ -1021,8 +1096,8 @@ function deleteIntentAndNotify(intent) {
   };
   if (!senderOnline) queueIntentDeletionForUser(intent.from, payload);
   if (!receiverOnline) queueIntentDeletionForUser(intent.to, payload);
-  if (receiverOnline) send(receiver, payload);
-  if (senderOnline && sender !== receiver) send(sender, payload);
+  if (receiverOnline) sendToUser(intent.to, payload);
+  if (senderOnline) sendToUser(intent.from, payload);
 }
 
 function cleanupExpiredIntents() {
@@ -1786,10 +1861,8 @@ function emitTransferState(intent, state, extra = {}) {
     retryable: Boolean(extra.retryable),
     message: String(extra.message || "")
   };
-  const sender = intent?.from ? online.get(intent.from) : null;
-  const receiver = intent?.to ? online.get(intent.to) : null;
-  if (sender) send(sender, payload);
-  if (receiver && receiver !== sender) send(receiver, payload);
+  if (intent?.from) sendToUser(intent.from, payload);
+  if (intent?.to) sendToUser(intent.to, payload);
 }
 
 function updateIntentUploadCheckpoint(intent, sentBytes, options = {}) {
@@ -1826,9 +1899,8 @@ function maybeSendUploadProgress(t) {
   const plainSentBytes = uploadBytesToPlainBytes(t.intent, t.bytesSent);
   const plainTotalBytes = Number(t.intent?.fileSize || 0) || uploadBytesToPlainBytes(t.intent, totalBytes);
 
-  const receiverWs = online.get(t.intent.to);
-  if (receiverWs) {
-    send(receiverWs, {
+  if (isUserOnline(t.intent.to)) {
+    sendToUser(t.intent.to, {
       type: "incoming_progress",
       intentId: t.intent.id,
       bytesSent: plainSentBytes,
@@ -1868,10 +1940,8 @@ function resumeWsInbound(ws) {
 
 function notifyUploadFailed(intent, intentId, message) {
   const payload = { type: "upload_failed", intentId, message };
-  const sender = intent?.from ? online.get(intent.from) : null;
-  const receiver = intent?.to ? online.get(intent.to) : null;
-  if (sender) send(sender, payload);
-  if (receiver && receiver !== sender) send(receiver, payload);
+  if (intent?.from) sendToUser(intent.from, payload);
+  if (intent?.to) sendToUser(intent.to, payload);
 }
 
 function failActiveTransfer(intentId, message, options = {}) {
@@ -1956,14 +2026,15 @@ function finalizeGroupRecipientCopies(primaryIntent, options = {}) {
       plainTotalBytes: Number(mirror.fileSize || 0)
     });
 
-    const receiver = online.get(mirror.to);
-    if (!receiver) return;
-    send(receiver, { type: "incoming_file", intent: intentForClient(mirror) });
+    const sockets = getOnlineSocketsForUser(mirror.to);
+    if (!sockets.length) return;
+    sendToUser(mirror.to, { type: "incoming_file", intent: intentForClient(mirror) });
     try {
-      send(receiver, { type: "inbox", items: loadIntentsForUser(mirror.to) });
+      sendToUser(mirror.to, { type: "inbox", items: loadIntentsForUser(mirror.to) });
     } catch {}
-    if (receiver.client === "ios") {
-      send(receiver, { type: "prepare_transfer", intentId: mirror.id });
+    const iosSocket = sockets.find((sock) => String(sock?.client || "").toLowerCase() === "ios");
+    if (iosSocket) {
+      send(iosSocket, { type: "prepare_transfer", intentId: mirror.id });
     }
   });
 }
@@ -2133,8 +2204,9 @@ function sendGroupsList(ws, username = "") {
 function broadcastGroupsListToMembers(members = []) {
   const unique = normalizeGroupMembers(members);
   unique.forEach((name) => {
-    const memberWs = online.get(name);
-    if (memberWs) sendGroupsList(memberWs, name);
+    const sockets = getOnlineSocketsForUser(name);
+    if (!sockets.length) return;
+    sockets.forEach((sock) => sendGroupsList(sock, name));
   });
 }
 
@@ -2219,10 +2291,8 @@ function loadProfiles(usernames = []) {
 function sendFriendRequestsUpdate(username) {
   const u0 = loadUser(username);
   if (!u0) return;
-  const ws = online.get(username);
-  if (!ws) return;
   const u = ensureUserShape(u0);
-  send(ws, {
+  sendToUser(username, {
     type: "friend_requests",
     incoming: u.incomingRequests || [],
     outgoing: u.outgoingRequests || [],
@@ -2465,9 +2535,7 @@ function buildGuestOpenUrlForUser(request, username = "") {
 function sendGuestTransferRequestsUpdate(username = "") {
   const name = String(username || "").trim();
   if (!name) return false;
-  const ws = online.get(name);
-  if (!ws) return false;
-  return send(ws, {
+  return sendToUser(name, {
     type: "guest_transfer_requests",
     incoming: listGuestTransferRequestsForUser(name)
   });
@@ -2570,9 +2638,9 @@ function broadcastFriendsListForUserAndFriends(username) {
   const user = ensureUserShape(u0);
   const targets = new Set([name, ...(user.friends || [])]);
   targets.forEach((target) => {
-    const w = online.get(target);
-    if (!w) return;
-    sendFriendsList(w);
+    const sockets = getOnlineSocketsForUser(target);
+    if (!sockets.length) return;
+    sockets.forEach((sock) => sendFriendsList(sock));
   });
 }
 
@@ -2758,9 +2826,7 @@ if (data.type === "delete_account") {
 
   const affectedGroupMembers = removeUserFromGroups(username);
 
-  if (online.get(username) === ws) {
-    online.delete(username);
-  }
+  unregisterOnlineSocket(username, ws);
 
   // Mark as deleted in other users' lists
   try {
@@ -2778,9 +2844,9 @@ if (data.type === "delete_account") {
       u.declinedRequests = u.declinedRequests.filter(n => n !== username);
       saveUser(u);
 
-      const w = online.get(u.username);
-      if (w) {
-        sendFriendsList(w, u);
+      const sockets = getOnlineSocketsForUser(u.username);
+      if (sockets.length) {
+        sockets.forEach((sock) => sendFriendsList(sock, u));
         sendFriendRequestsUpdate(u.username);
       }
     }
@@ -2797,8 +2863,14 @@ if (data.type === "delete_account") {
   }
   clearGuestTransferRequestsForUser(username);
 
-  // Remove from online users (already removed above when this socket owns the session)
+  // Remove all active sessions for this account.
+  const userSockets = getOnlineSocketsForUser(username);
+  userSockets.forEach((sock) => {
+    try { sock.close(4002, "Account deleted"); } catch {}
+    unregisterOnlineSocket(username, sock);
+  });
   online.delete(username);
+  onlineSockets.delete(username);
   broadcastGroupsListToMembers(affectedGroupMembers);
 
   // Acknowledge + disconnect
@@ -2890,7 +2962,7 @@ if (!user.friends.includes(user.username)) {
 
   ws.username = username;
   ws.client = client;
-  online.set(username, ws);
+  registerOnlineSocket(username, ws);
 
   send(ws, {
     type: "login_ok",
@@ -2959,20 +3031,6 @@ if (!user.friends.includes(user.username)) {
   }
 
   // ───────────────────────────
-  // Enforce single active WS session
-  // ───────────────────────────
-  const prev = online.get(username);
-  if (prev && prev.readyState === WebSocket.OPEN) {
-    try {
-      send(prev, { type: "error", message: "Logged in elsewhere" });
-    } catch {}
-    try {
-      prev.close(4001, "Replaced by new login");
-    } catch {}
-  }
-  online.delete(username);
-
-  // ───────────────────────────
   // Bind user to this socket
   // ───────────────────────────
   ws.username = username;
@@ -2980,7 +3038,7 @@ if (!user.friends.includes(user.username)) {
   ws.tcpPort = Number(data.tcpPort || 0);
   ws.candidates = Array.isArray(data.candidates) ? data.candidates : [];
 
-  online.set(username, ws);
+  registerOnlineSocket(username, ws);
 
   // ───────────────────────────
   // Issue persistent session token
@@ -3323,9 +3381,6 @@ if (intentOnDisk?.stored) {
 
   if (!intent) return;
 
-  const sender = online.get(intent.from);
-  if (!sender) return;
-
   const transferMsg = {
     type: "start_transfer",
     intent,
@@ -3338,6 +3393,12 @@ if (intentOnDisk?.stored) {
   const t = activeTransfers.get(intent.id);
   if (!t || t.ended) {
     console.log("⚠️ No active upload for ready intent");
+    return;
+  }
+  const sender = t.senderWs && t.senderWs.readyState === WebSocket.OPEN ? t.senderWs : null;
+  if (!sender) {
+    console.log("⚠️ Sender socket is no longer available for live transfer");
+    failActiveTransfer(intent.id, "Sender disconnected", { deleteIntent: false, retryable: true });
     return;
   }
 
@@ -3401,10 +3462,8 @@ if (data.type === "typing") {
   const sender = ensureUserShape(loadUser(ws.username));
   if (!sender?.friends?.includes(to)) return;
 
-  const receiverWs = online.get(to);
-  if (!receiverWs || receiverWs.readyState !== WebSocket.OPEN) return;
-
-  send(receiverWs, {
+  if (!isUserOnline(to)) return;
+  sendToUser(to, {
     type: "typing",
     from: ws.username,
     isTyping: Boolean(data.isTyping),
@@ -3562,11 +3621,9 @@ if (data.type === "friend_request_accept") {
   const meUpdated = ensureUserShape(loadUser(ws.username));
   sendFriendsList(ws, meUpdated);
 
-  const otherWs = online.get(requester);
-  if (otherWs) {
-    const otherUpdated = ensureUserShape(loadUser(requester));
-    sendFriendsList(otherWs, otherUpdated);
-  }
+  const otherUpdated = ensureUserShape(loadUser(requester));
+  const requesterSockets = getOnlineSocketsForUser(requester);
+  requesterSockets.forEach((sock) => sendFriendsList(sock, otherUpdated));
 
   sendFriendRequestsUpdate(ws.username);
   sendFriendRequestsUpdate(requester);
@@ -3733,14 +3790,11 @@ if (data.type === "read_receipt") {
   }
 
   if (!updates.length) return;
-  const senderWs = online.get(friend);
-  if (senderWs) {
-    send(senderWs, {
-      type: "read_receipt",
-      from: ws.username,
-      intents: updates
-    });
-  }
+  sendToUser(friend, {
+    type: "read_receipt",
+    from: ws.username,
+    intents: updates
+  });
   updates.forEach((entry) => {
     const intent = loadIntent(entry.intentId);
     if (!intent) return;
@@ -4019,13 +4073,11 @@ if (data.type === "update_profile") {
   saveUser(user);
 
   // notify self + friends
-  send(ws, { type: "profile_update", username: ws.username, profile });
+  sendToUser(ws.username, { type: "profile_update", username: ws.username, profile });
   const friends = user.friends || [];
   friends.forEach((f) => {
-    const w = online.get(f);
-    if (w && w !== ws) {
-      send(w, { type: "profile_update", username: ws.username, profile });
-    }
+    if (!f || f === ws.username) return;
+    sendToUser(f, { type: "profile_update", username: ws.username, profile });
   });
   return;
 }
@@ -4043,11 +4095,9 @@ if (data.type === "add_friend") {
   const me = ensureUserShape(loadUser(ws.username));
   sendFriendsList(ws, me);
 
-  const otherWs = online.get(friend);
-  if (otherWs) {
-    const other = ensureUserShape(loadUser(friend));
-    sendFriendsList(otherWs, other);
-  }
+  const other = ensureUserShape(loadUser(friend));
+  const friendSockets = getOnlineSocketsForUser(friend);
+  friendSockets.forEach((sock) => sendFriendsList(sock, other));
 
   return;
 }
@@ -4350,20 +4400,21 @@ saveIntent(intent);
 
     // 🔔 IMPORTANT: notify recipient that file is now ready
     // 🔔 IMPORTANT: notify recipient that file is now ready
-const receiver = online.get(intent.to);
-if (!intent.groupId && receiver) {
+const receiverSockets = getOnlineSocketsForUser(intent.to);
+if (!intent.groupId && receiverSockets.length) {
   const safeIntent = intentForClient(intent);
-  send(receiver, {
+  sendToUser(intent.to, {
     type: "incoming_file",
     intent: safeIntent
   });
   try {
-    send(receiver, { type: "inbox", items: loadIntentsForUser(intent.to) });
+    sendToUser(intent.to, { type: "inbox", items: loadIntentsForUser(intent.to) });
   } catch {}
 
   // ✅ FIX 2: if recipient is iOS, immediately trigger TCP download
-  if (receiver.client === "ios") {
-    send(receiver, {
+  const iosSocket = receiverSockets.find((sock) => String(sock?.client || "").toLowerCase() === "ios");
+  if (iosSocket) {
+    send(iosSocket, {
       type: "prepare_transfer",
       intentId
     });
@@ -4531,15 +4582,17 @@ if (data.type === "send_intent") {
         existing.downloadToken = generateDownloadToken();
         saveIntent(existing);
       }
-      const receiverWs = online.get(existing.to);
-      if (receiverWs && !isGroupSend) {
+      const receiverOnline = isUserOnline(existing.to);
+      const receiverSockets = receiverOnline ? getOnlineSocketsForUser(existing.to) : [];
+      const receiverClient = receiverSockets[0]?.client || null;
+      if (receiverOnline && !isGroupSend) {
         const safeExistingIntent = intentForClient(existing);
         if (existing.isTextOnly || existing.messageType === "text") {
-          send(receiverWs, { type: "incoming_file", intent: safeExistingIntent });
+          sendToUser(existing.to, { type: "incoming_file", intent: safeExistingIntent });
         } else {
-          send(receiverWs, { type: "incoming_intent", intent: safeExistingIntent });
+          sendToUser(existing.to, { type: "incoming_intent", intent: safeExistingIntent });
         }
-        try { send(receiverWs, { type: "inbox", items: loadIntentsForUser(existing.to) }); } catch {}
+        try { sendToUser(existing.to, { type: "inbox", items: loadIntentsForUser(existing.to) }); } catch {}
       }
       return send(ws, {
         type: "intent_ok",
@@ -4548,8 +4601,8 @@ if (data.type === "send_intent") {
         to: existing.to,
         fileName: existing.fileName || "",
         downloadToken: existing.downloadToken || null,
-        receiverOnline: Boolean(receiverWs),
-        receiverClient: receiverWs?.client || null,
+        receiverOnline,
+        receiverClient,
         expiresAt: existing.expiresAt,
         createdAt: existing.createdAt,
         isTextOnly: Boolean(existing.isTextOnly || existing.messageType === "text"),
@@ -4640,29 +4693,27 @@ if (data.type === "send_intent") {
 
   if (isGroupSend) {
     for (const mirrorIntent of mirrorIntents) {
-      const receiverWs = online.get(mirrorIntent.to);
-      if (!receiverWs) continue;
+      if (!isUserOnline(mirrorIntent.to)) continue;
       const safeIntent = intentForClient(mirrorIntent);
       if (isTextOnly) {
-        send(receiverWs, { type: "incoming_file", intent: safeIntent });
+        sendToUser(mirrorIntent.to, { type: "incoming_file", intent: safeIntent });
       } else {
-        send(receiverWs, { type: "incoming_intent", intent: safeIntent });
+        sendToUser(mirrorIntent.to, { type: "incoming_intent", intent: safeIntent });
       }
       try {
-        send(receiverWs, { type: "inbox", items: loadIntentsForUser(mirrorIntent.to) });
+        sendToUser(mirrorIntent.to, { type: "inbox", items: loadIntentsForUser(mirrorIntent.to) });
       } catch {}
     }
   } else {
-    const receiverWs = online.get(to);
-    if (receiverWs) {
+    if (isUserOnline(to)) {
       const safeIntent = intentForClient(intent);
       if (isTextOnly) {
-        send(receiverWs, { type: "incoming_file", intent: safeIntent });
+        sendToUser(to, { type: "incoming_file", intent: safeIntent });
       } else {
-        send(receiverWs, { type: "incoming_intent", intent: safeIntent });
+        sendToUser(to, { type: "incoming_intent", intent: safeIntent });
       }
       try {
-        send(receiverWs, { type: "inbox", items: loadIntentsForUser(to) });
+        sendToUser(to, { type: "inbox", items: loadIntentsForUser(to) });
       } catch {}
     }
   }
@@ -4686,11 +4737,11 @@ if (data.type === "send_intent") {
     fileName: intent.fileName || "",
     downloadToken: intent.downloadToken || null,
     receiverOnline: isGroupSend
-      ? mirrorIntents.some((entry) => Boolean(online.get(entry.to)))
-      : Boolean(online.get(to)),
+      ? mirrorIntents.some((entry) => isUserOnline(entry.to))
+      : isUserOnline(to),
     receiverClient: isGroupSend
       ? null
-      : (online.get(to)?.client || null),
+      : (getOnlineSocketsForUser(to)[0]?.client || null),
     expiresAt: intent.expiresAt,
     createdAt: intent.createdAt,
     isTextOnly,
@@ -4741,16 +4792,13 @@ send(ws, {
 });
 
 // ✅ Notify sender if online
-const senderWs = online.get(intent.from);
-if (senderWs) {
-  send(senderWs, {
-    type: "intent_accepted_by_receiver",
-    intentId: intent.id,
-    to: intent.to,
-    fileName: intent.fileName,
-    fileSize: intent.fileSize,
-  });
-}
+sendToUser(intent.from, {
+  type: "intent_accepted_by_receiver",
+  intentId: intent.id,
+  to: intent.to,
+  fileName: intent.fileName,
+  fileSize: intent.fileSize,
+});
 
 return;
 
@@ -4811,9 +4859,12 @@ return send(ws, {
 
   ws.on("close", () => {
   const disconnectedUser = String(ws.username || "").trim();
-  if (disconnectedUser && online.get(disconnectedUser) === ws) {
-    online.delete(disconnectedUser);
-    broadcastFriendsListForUserAndFriends(disconnectedUser);
+  if (disconnectedUser) {
+    const wasOnline = isUserOnline(disconnectedUser);
+    const stillOnline = unregisterOnlineSocket(disconnectedUser, ws);
+    if (wasOnline !== stillOnline) {
+      broadcastFriendsListForUserAndFriends(disconnectedUser);
+    }
   }
 
   if (ws.currentUploadIntentId) {
