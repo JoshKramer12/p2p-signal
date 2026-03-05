@@ -4050,6 +4050,17 @@ if (data.type === "update_profile") {
 
   const user = ensureUserShape(u0);
   const profile = user.profile || {};
+  const sanitizePinnedContacts = (value) => {
+    const seen = new Set();
+    return (Array.isArray(value) ? value : [])
+      .map((item) => String(item || "").trim())
+      .filter((item) => {
+        if (!item || seen.has(item)) return false;
+        seen.add(item);
+        return true;
+      })
+      .slice(0, 500);
+  };
 
   const updates = data.profile || {};
   if (typeof updates.firstName === "string") profile.firstName = updates.firstName;
@@ -4059,6 +4070,9 @@ if (data.type === "update_profile") {
   if (typeof updates.phoneCountryCode === "string") profile.phoneCountryCode = updates.phoneCountryCode;
   if (typeof updates.phoneLocal === "string") profile.phoneLocal = updates.phoneLocal;
   if (typeof updates.avatarDataUrl === "string") profile.avatarDataUrl = updates.avatarDataUrl;
+  if (Array.isArray(updates.pinnedContacts)) {
+    profile.pinnedContacts = sanitizePinnedContacts(updates.pinnedContacts);
+  }
   if (updates.e2eePublicKeyJwk && typeof updates.e2eePublicKeyJwk === "object") {
     const jwk = updates.e2eePublicKeyJwk;
     const kty = String(jwk.kty || "").toUpperCase();
