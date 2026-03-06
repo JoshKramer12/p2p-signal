@@ -2210,6 +2210,70 @@ function broadcastGroupsListToMembers(members = []) {
   });
 }
 
+function emitGroupSystemMessage(group, actorUsername = "", text = "", createdAt = Date.now()) {
+  const g = groupForClient(group);
+  const actor = String(actorUsername || "").trim();
+  const messageText = String(text || "").trim().slice(0, 5000);
+  if (!g?.id || !actor || !messageText) return [];
+  const members = normalizeGroupMembers(g.members || []);
+  if (!members.length) return [];
+
+  const intentsByUser = new Map();
+  members.forEach((member) => {
+    const intent = {
+      id: randomUUID(),
+      from: actor,
+      to: member,
+      fileName: "",
+      fileSize: 0,
+      note: "",
+      text: messageText,
+      isTextOnly: true,
+      isSystemEvent: true,
+      messageType: "system",
+      encryption: null,
+      accessControl: null,
+      passwordProtected: false,
+      passwordMode: "once",
+      passwordHint: "",
+      uploadBytesExpected: 0,
+      createdAt,
+      expiresAt: 0,
+      customExpiry: false,
+      status: "completed",
+      transferState: "delivered",
+      readByRecipientAt: null,
+      groupId: g.id,
+      groupName: normalizeGroupName(g.name || ""),
+      groupMembers: normalizeGroupMembers(g.members || []),
+      clientIntentId: null,
+      downloadToken: null,
+      isGroupRecipientCopy: member !== actor,
+      stored: true,
+      storedFile: null,
+      storedBytes: 0,
+      plainStoredBytes: 0,
+      uploadedAt: createdAt,
+      completedAt: createdAt
+    };
+    saveIntent(intent);
+    intentsByUser.set(member, intent);
+  });
+
+  members.forEach((member) => {
+    if (!isUserOnline(member)) return;
+    const intent = intentsByUser.get(member);
+    if (intent) {
+      sendToUser(member, { type: "incoming_file", intent: intentForClient(intent) });
+    }
+    try {
+      sendToUser(member, { type: "inbox", items: loadIntentsForUser(member) });
+    } catch {}
+  });
+
+  return Array.from(intentsByUser.values());
+}
+
 function removeUserFromGroups(username = "") {
   const name = String(username || "").trim();
   if (!name) return [];
@@ -4015,9 +4079,14 @@ if (data.type === "group_create") {
     return send(ws, { type: "error", message: "Group limit is 64 members" });
   }
 
+  const groupName = normalizeGroupName(data.name || "");
+  if (!groupName) {
+    return send(ws, { type: "error", message: "Group name is required" });
+  }
+
   const group = {
     id: randomUUID(),
-    name: normalizeGroupName(data.name || ""),
+    name: groupName,
     createdBy: meName,
     members,
     createdAt: Date.now(),
@@ -4039,6 +4108,45 @@ if (data.type === "group_create") {
 
   broadcastGroupsListToMembers(members);
   return send(ws, { type: "group_created", group: groupForClient(group) });
+}
+
+if (data.type === "group_rename") {
+  const meName = String(ws.username || "").trim();
+  const groupId = String(data.groupId || "").trim();
+  const nextName = normalizeGroupName(data.name || "");
+  if (!meName) return send(ws, { type: "error", message: "Not logged in" });
+  if (!groupId) return send(ws, { type: "error", message: "Missing group id" });
+  if (!nextName) return send(ws, { type: "error", message: "Group name is required" });
+
+  const group = loadGroup(groupId);
+  if (!group) return send(ws, { type: "error", message: "Group not found" });
+  if (!group.members.includes(meName)) {
+    return send(ws, { type: "error", message: "You are not a member of this group" });
+  }
+
+  const prevName = normalizeGroupName(group.name || "");
+  if (prevName === nextName) {
+    return send(ws, { type: "group_renamed", group: groupForClient(group), renamedBy: meName });
+  }
+
+  group.name = nextName;
+  group.updatedAt = Date.now();
+  if (!saveGroup(group)) {
+    return send(ws, { type: "error", message: "Could not rename group" });
+  }
+
+  const systemText = `${meName} changed the chat name to ${nextName}`;
+  emitGroupSystemMessage(group, meName, systemText, group.updatedAt);
+  broadcastGroupsListToMembers(group.members);
+  group.members.forEach((member) => {
+    sendToUser(member, {
+      type: "group_renamed",
+      group: groupForClient(group),
+      renamedBy: meName,
+      text: systemText
+    });
+  });
+  return;
 }
 
 // =========================
