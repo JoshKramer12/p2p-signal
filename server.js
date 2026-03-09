@@ -50,6 +50,21 @@ const GUEST_TRANSFER_REQUEST_TTL_MS = Math.max(
 );
 const GUEST_APP_BASE_URL = String(process.env.GUEST_APP_BASE_URL || "https://merm.fly.dev").trim();
 const GUEST_BRIDGE_SECRET = String(process.env.GUEST_BRIDGE_SECRET || "").trim();
+const ADMIN_USERNAMES = new Set(
+  String(process.env.ADMIN_USERNAMES || "Josh")
+    .split(",")
+    .map((raw) => String(raw || "").trim().replace(/^@+/, "").toLowerCase())
+    .filter(Boolean)
+);
+
+function isAdminUsername(username = "") {
+  const normalized = String(username || "").trim().replace(/^@+/, "").toLowerCase();
+  return Boolean(normalized) && ADMIN_USERNAMES.has(normalized);
+}
+
+function isAdminSocket(ws = null) {
+  return Boolean(ws && isAdminUsername(ws.username));
+}
 
 // username -> ws
 const online = new Map();
@@ -1025,6 +1040,14 @@ function buildStatsPayload(username = "") {
     largestFiles: largestStoredFiles(100),
     allUsers: listUsersAlphabetical()
   };
+}
+
+function sendStatsSnapshot(ws = null) {
+  if (!isAdminSocket(ws)) return;
+  send(ws, {
+    type: "stats",
+    ...buildStatsPayload(ws.username)
+  });
 }
 
 
@@ -3026,6 +3049,7 @@ if (!user.friends.includes(user.username)) {
 
   ws.username = username;
   ws.client = client;
+  ws.isAdmin = isAdminUsername(username);
   registerOnlineSocket(username, ws);
 
   send(ws, {
@@ -3034,6 +3058,7 @@ if (!user.friends.includes(user.username)) {
     sessionToken: token,
     resumed: true,
     client: ws.client,
+    isAdmin: Boolean(ws.isAdmin),
   });
 
   const pending = loadIntentsForUser(username);
@@ -3099,6 +3124,7 @@ if (!user.friends.includes(user.username)) {
   // ───────────────────────────
   ws.username = username;
   ws.client = client;
+  ws.isAdmin = isAdminUsername(username);
   ws.tcpPort = Number(data.tcpPort || 0);
   ws.candidates = Array.isArray(data.candidates) ? data.candidates : [];
 
@@ -3130,6 +3156,7 @@ if (!user.friends.includes(user.username)) {
     publicIp: ws.publicIp,
     publicPort: ws.publicPort,
     client: ws.client,
+    isAdmin: Boolean(ws.isAdmin),
   });
 
   // ───────────────────────────
@@ -3181,6 +3208,7 @@ if (data.type === "login") {
 
   ws.username = name;
   ws.client = String(data.client || "unknown");
+  ws.isAdmin = isAdminUsername(name);
   ws.tcpPort = Number(data.tcpPort || 0);
   ws.candidates = Array.isArray(data.candidates) ? data.candidates : [];
 
@@ -3192,6 +3220,7 @@ if (data.type === "login") {
     publicIp: ws.publicIp,
     publicPort: ws.publicPort,
     client: ws.client,
+    isAdmin: Boolean(ws.isAdmin),
   });
 
   const pending = loadIntentsForUser(name);
@@ -3746,10 +3775,11 @@ if (data.type === "friend_request_clear_declined") {
 // 📊 STATS
 // =========================
 if (data.type === "stats") {
-  return send(ws, {
-    type: "stats",
-    ...buildStatsPayload(ws.username)
-  });
+  if (!isAdminSocket(ws)) {
+    return send(ws, { type: "error", message: "Forbidden" });
+  }
+  sendStatsSnapshot(ws);
+  return;
 }
 
 if (data.type === "storage_stats") {
@@ -3901,6 +3931,9 @@ if (data.type === "remove_friend") {
 // 🗑️ DELETE STORED FILE (ADMIN)
 // =========================
 if (data.type === "delete_file") {
+  if (!isAdminSocket(ws)) {
+    return send(ws, { type: "error", message: "Forbidden" });
+  }
   const storedFile = String(data.storedFile || "").trim();
   if (!storedFile) return send(ws, { type: "error", message: "Missing storedFile" });
 
@@ -3910,10 +3943,14 @@ if (data.type === "delete_file") {
     return send(ws, { type: "error", message: "Failed to delete file" });
   }
 
-  return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
+  sendStatsSnapshot(ws);
+  return;
 }
 
 if (data.type === "delete_files") {
+  if (!isAdminSocket(ws)) {
+    return send(ws, { type: "error", message: "Forbidden" });
+  }
   const storedFiles = Array.isArray(data.storedFiles) ? data.storedFiles : [];
   if (!storedFiles.length) return send(ws, { type: "error", message: "No files specified" });
 
@@ -3923,7 +3960,8 @@ if (data.type === "delete_files") {
     try { deleteStoredFileAndNotify(storedFile); } catch {}
   }
 
-  return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
+  sendStatsSnapshot(ws);
+  return;
 }
 
 if (data.type === "cancel_send") {
@@ -3971,7 +4009,8 @@ if (data.type === "cancel_send") {
   });
   deleteIntentAndNotify(intent);
   send(ws, { type: "cancel_send_ok", intentId, status: "canceled" });
-  return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
+  sendStatsSnapshot(ws);
+  return;
 }
 
 if (data.type === "delete_message_everyone") {
@@ -3999,7 +4038,8 @@ if (data.type === "delete_message_everyone") {
 
   deleteIntentAndNotify(intent);
 
-  return send(ws, { type: "stats", ...buildStatsPayload(ws.username) });
+  sendStatsSnapshot(ws);
+  return;
 }
 
 // =========================
