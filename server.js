@@ -56,6 +56,7 @@ const ADMIN_USERNAMES = new Set(
     .map((raw) => String(raw || "").trim().replace(/^@+/, "").toLowerCase())
     .filter(Boolean)
 );
+const CHAT_STATE_MAX_KEYS = Math.max(128, Number(process.env.CHAT_STATE_MAX_KEYS || 2000));
 
 function isAdminUsername(username = "") {
   const normalized = String(username || "").trim().replace(/^@+/, "").toLowerCase();
@@ -1971,12 +1972,17 @@ function failActiveTransfer(intentId, message, options = {}) {
   if (!intentId) return null;
   const t = activeTransfers.get(intentId);
   const intent = t?.intent || loadIntent(intentId);
-  const preservePartial = Boolean(options.preservePartial);
+  const preservePartial = options.preservePartial !== false;
+  const deleteIntent = options.deleteIntent === true;
+  const notify = options.notify !== false;
+  const suppressState = options.suppressState === true;
+  const retryable = options.retryable != null ? Boolean(options.retryable) : preservePartial;
+  const discardPartial = Boolean(options.discardPartial);
   const bytesUploaded = Number(t?.bytesSent || 0);
 
   try { t?.tcp?.destroy(); } catch {}
   try { t?.writeStream?.destroy(); } catch {}
-  if (!preservePartial && t?.mode === "offline" && t?.filePath) {
+  if ((discardPartial || !preservePartial) && t?.mode === "offline" && t?.filePath) {
     try { if (fs.existsSync(t.filePath)) fs.unlinkSync(t.filePath); } catch {}
   }
 
@@ -1986,7 +1992,7 @@ function failActiveTransfer(intentId, message, options = {}) {
 
   activeTransfers.delete(intentId);
 
-  if (intent && preservePartial && options.suppressState !== true) {
+  if (intent && preservePartial && !suppressState) {
     updateIntentUploadCheckpoint(intent, bytesUploaded, {
       status: "uploading",
       transferState: "uploading"
@@ -1996,24 +2002,31 @@ function failActiveTransfer(intentId, message, options = {}) {
       totalBytes: resolveUploadExpectedBytes(intent),
       plainSentBytes: uploadBytesToPlainBytes(intent, bytesUploaded),
       plainTotalBytes: Number(intent.fileSize || 0),
-      retryable: true,
+      retryable,
       message: String(message || "Transfer paused")
     });
-  } else if (intent && options.suppressState !== true) {
+  } else if (intent && !suppressState) {
+    intent.stored = false;
+    intent.storedBytes = Math.max(0, bytesUploaded);
+    intent.plainStoredBytes = uploadBytesToPlainBytes(intent, intent.storedBytes);
+    intent.status = "failed";
+    intent.transferState = "failed";
+    intent.updatedAt = Date.now();
+    try { saveIntent(intent); } catch {}
     emitTransferState(intent, "failed", {
       sentBytes: bytesUploaded,
       totalBytes: resolveUploadExpectedBytes(intent),
       plainSentBytes: uploadBytesToPlainBytes(intent, bytesUploaded),
       plainTotalBytes: Number(intent.fileSize || 0),
-      retryable: Boolean(options.retryable),
+      retryable,
       message: String(message || "Upload failed")
     });
   }
 
-  if (intent && options.notify !== false && !preservePartial) {
+  if (intent && notify && !preservePartial) {
     notifyUploadFailed(intent, intentId, message);
   }
-  if (intent && options.deleteIntent !== false) {
+  if (intent && deleteIntent) {
     deleteIntentAndNotify(intent);
   }
   return intent || null;
@@ -2294,6 +2307,13 @@ function emitGroupSystemMessage(group, actorUsername = "", text = "", createdAt 
     } catch {}
   });
 
+  const chatKey = groupChatKey(g.id);
+  if (chatKey) {
+    members.forEach((member) => {
+      touchUserChatOrder(member, chatKey);
+    });
+  }
+
   return Array.from(intentsByUser.values());
 }
 
@@ -2311,10 +2331,17 @@ function removeUserFromGroups(username = "") {
     const id = path.basename(file, ".json");
     const group = loadGroup(id);
     if (!group || !group.members.includes(name)) return;
+    const groupKey = groupChatKey(group.id);
+    if (groupKey) {
+      removeChatKeyFromUserState(name, groupKey);
+    }
     const nextMembers = group.members.filter((member) => member !== name);
     if (nextMembers.length < 2) {
       try { fs.unlinkSync(groupFile(group.id)); } catch {}
       nextMembers.forEach((member) => {
+        if (groupKey) {
+          removeChatKeyFromUserState(member, groupKey);
+        }
         const u0 = loadUser(member);
         if (!u0) return;
         const u = ensureUserShape(u0);
@@ -2363,7 +2390,206 @@ function ensureUserShape(u) {
   if (!u.groups) u.groups = [];
   if (!Array.isArray(u.groups)) u.groups = [];
   if (!u.profile) u.profile = {};
+  if (!u.chatState || typeof u.chatState !== "object" || Array.isArray(u.chatState)) u.chatState = {};
+  if (!Array.isArray(u.chatState.order)) u.chatState.order = [];
+  if (!Array.isArray(u.chatState.manualUnread)) u.chatState.manualUnread = [];
+  if (!Array.isArray(u.chatState.pins)) {
+    const fallbackPins = Array.isArray(u.profile?.pinnedContacts) ? u.profile.pinnedContacts : [];
+    u.chatState.pins = fallbackPins;
+  }
+  if (!Number.isFinite(Number(u.chatState.version))) u.chatState.version = 1;
+  if (!Number.isFinite(Number(u.chatState.updatedAt))) u.chatState.updatedAt = Date.now();
+
+  u.chatState.order = sanitizeChatStateKeys(u.chatState.order);
+  u.chatState.manualUnread = sanitizeChatStateKeys(u.chatState.manualUnread);
+  u.chatState.pins = sanitizeChatStateKeys(u.chatState.pins);
+  u.chatState.version = Math.max(1, Math.floor(Number(u.chatState.version || 1)));
+  u.chatState.updatedAt = Math.max(0, Math.floor(Number(u.chatState.updatedAt || Date.now())));
+
+  const profilePins = sanitizeChatStateKeys(u.profile?.pinnedContacts || []);
+  if (!profilePins.length && u.chatState.pins.length) {
+    u.profile.pinnedContacts = u.chatState.pins.slice();
+  } else if (profilePins.length && !u.chatState.pins.length) {
+    u.chatState.pins = profilePins.slice();
+  } else if (profilePins.length && u.chatState.pins.length && !sameStringList(profilePins, u.chatState.pins)) {
+    // chatState is the authoritative source for multi-device sync.
+    u.profile.pinnedContacts = u.chatState.pins.slice();
+  } else if (!profilePins.length && !u.chatState.pins.length) {
+    u.profile.pinnedContacts = [];
+  }
   return u;
+}
+
+function sameStringList(a = [], b = []) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (String(a[i] || "") !== String(b[i] || "")) return false;
+  }
+  return true;
+}
+
+function groupChatKey(groupId = "") {
+  const id = String(groupId || "").trim();
+  if (!id) return "";
+  return `group:${id}`;
+}
+
+function normalizeChatStateKey(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  if (/^group:/i.test(raw)) {
+    const id = raw.slice(6).trim();
+    return id ? `group:${id}` : "";
+  }
+  if (raw.includes(":")) return "";
+  return raw;
+}
+
+function sanitizeChatStateKeys(list = []) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const key = normalizeChatStateKey(raw);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(key);
+    if (out.length >= CHAT_STATE_MAX_KEYS) break;
+  }
+  return out;
+}
+
+function buildAllowedChatKeysForUser(userRecord = null) {
+  const user = ensureUserShape(userRecord || {});
+  const allowed = new Set();
+  const name = String(user.username || "").trim();
+  if (name) allowed.add(name);
+  (Array.isArray(user.friends) ? user.friends : []).forEach((friend) => {
+    const key = normalizeChatStateKey(friend);
+    if (key) allowed.add(key);
+  });
+  (Array.isArray(user.groups) ? user.groups : []).forEach((groupId) => {
+    const key = groupChatKey(groupId);
+    if (key) allowed.add(key);
+  });
+  return allowed;
+}
+
+function filterChatKeysForUser(userRecord = null, list = []) {
+  const user = ensureUserShape(userRecord || {});
+  const allowed = buildAllowedChatKeysForUser(user);
+  return sanitizeChatStateKeys(list).filter((key) => allowed.has(key));
+}
+
+function chatStateForClient(userRecord = null) {
+  const user = ensureUserShape(userRecord || {});
+  const state = user.chatState || {};
+  return {
+    version: Math.max(1, Math.floor(Number(state.version || 1))),
+    updatedAt: Math.max(0, Math.floor(Number(state.updatedAt || Date.now()))),
+    order: filterChatKeysForUser(user, state.order || []),
+    manualUnread: filterChatKeysForUser(user, state.manualUnread || []),
+    pins: filterChatKeysForUser(user, state.pins || [])
+  };
+}
+
+function saveAndBroadcastChatState(userRecord = null, options = {}) {
+  const user = ensureUserShape(userRecord || {});
+  const state = chatStateForClient(user);
+  user.chatState = {
+    ...state
+  };
+  if (!user.profile || typeof user.profile !== "object") user.profile = {};
+  user.profile.pinnedContacts = state.pins.slice();
+  saveUser(user);
+  if (options.broadcast !== false) {
+    sendToUser(user.username, { type: "chat_state", state });
+  }
+  return { user, state };
+}
+
+function updateUserChatState(username = "", mutator = null, options = {}) {
+  const name = String(username || "").trim();
+  if (!name || typeof mutator !== "function") return null;
+  const u0 = loadUser(name);
+  if (!u0) return null;
+  const user = ensureUserShape(u0);
+  const prev = chatStateForClient(user);
+  const draft = {
+    order: prev.order.slice(),
+    manualUnread: prev.manualUnread.slice(),
+    pins: prev.pins.slice()
+  };
+  const changedByMutator = Boolean(mutator(draft, user));
+
+  draft.order = filterChatKeysForUser(user, draft.order);
+  draft.manualUnread = filterChatKeysForUser(user, draft.manualUnread);
+  draft.pins = filterChatKeysForUser(user, draft.pins);
+
+  const changed = changedByMutator ||
+    !sameStringList(prev.order, draft.order) ||
+    !sameStringList(prev.manualUnread, draft.manualUnread) ||
+    !sameStringList(prev.pins, draft.pins);
+
+  if (!changed) {
+    return { changed: false, user, state: prev };
+  }
+
+  const next = {
+    version: Math.max(1, Number(prev.version || 1)) + 1,
+    updatedAt: Date.now(),
+    order: draft.order.slice(),
+    manualUnread: draft.manualUnread.slice(),
+    pins: draft.pins.slice()
+  };
+  user.chatState = next;
+  if (!user.profile || typeof user.profile !== "object") user.profile = {};
+  user.profile.pinnedContacts = next.pins.slice();
+  saveUser(user);
+  if (options.broadcast !== false) {
+    sendToUser(name, { type: "chat_state", state: next });
+  }
+  return { changed: true, user, state: next };
+}
+
+function touchUserChatOrder(username = "", chatKey = "") {
+  const key = normalizeChatStateKey(chatKey);
+  if (!key) return null;
+  return updateUserChatState(username, (draft) => {
+    draft.order = [key, ...draft.order.filter((entry) => entry !== key)];
+    return true;
+  });
+}
+
+function removeChatKeyFromUserState(username = "", chatKey = "") {
+  const key = normalizeChatStateKey(chatKey);
+  if (!key) return null;
+  return updateUserChatState(username, (draft) => {
+    const nextOrder = draft.order.filter((entry) => entry !== key);
+    const nextUnread = draft.manualUnread.filter((entry) => entry !== key);
+    const nextPins = draft.pins.filter((entry) => entry !== key);
+    const changed = nextOrder.length !== draft.order.length ||
+      nextUnread.length !== draft.manualUnread.length ||
+      nextPins.length !== draft.pins.length;
+    draft.order = nextOrder;
+    draft.manualUnread = nextUnread;
+    draft.pins = nextPins;
+    return changed;
+  });
+}
+
+function broadcastInboxSnapshot(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return false;
+  const sockets = getOnlineSocketsForUser(name);
+  if (!sockets.length) return false;
+  let items = [];
+  try {
+    items = loadIntentsForUser(name);
+  } catch {
+    items = [];
+  }
+  return sendToUser(name, { type: "inbox", items });
 }
 
 function loadProfiles(usernames = []) {
@@ -2701,7 +2927,8 @@ function friendsListPayload(userRecord) {
     type: "friends_list",
     friends: user.friends || [],
     deletedFriends: user.deletedFriends || [],
-    onlineUsers: Array.from(online.keys())
+    onlineUsers: Array.from(online.keys()),
+    chatState: chatStateForClient(user)
   };
 }
 
@@ -2712,7 +2939,13 @@ function sendFriendsList(ws, userRecord = null) {
     user = loadUser(ws.username);
   }
   if (!user) {
-    return send(ws, { type: "friends_list", friends: [], deletedFriends: [], onlineUsers: Array.from(online.keys()) });
+    return send(ws, {
+      type: "friends_list",
+      friends: [],
+      deletedFriends: [],
+      onlineUsers: Array.from(online.keys()),
+      chatState: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [] }
+    });
   }
   return send(ws, friendsListPayload(user));
 }
@@ -2824,7 +3057,11 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
     const incomingLen = msg.length;
     if (t.bytesSent + incomingLen > t.bytesExpected) {
       console.log("❌ Too many bytes for intent", intentId);
-      failActiveTransfer(intentId, "Upload exceeded expected size");
+      failActiveTransfer(intentId, "Upload exceeded expected size", {
+        preservePartial: false,
+        deleteIntent: false,
+        retryable: true
+      });
       ws.currentUploadIntentId = null;
       return send(ws, { type: "error", message: "Upload exceeded expected size" });
     }
@@ -3019,6 +3256,13 @@ if (data.type === "auth_signup") {
   declinedRequests: [],
   profile,
   createdAt: Date.now(),
+  chatState: {
+    version: 1,
+    updatedAt: Date.now(),
+    order: [username],
+    manualUnread: [],
+    pins: [username]
+  },
   sessionTokens: [],
 };
 
@@ -3072,6 +3316,7 @@ if (!user.friends.includes(user.username)) {
   send(ws, { type: "friend_requests", incoming: u2.incomingRequests, outgoing: u2.outgoingRequests, declined: u2.declinedRequests });
   send(ws, { type: "guest_transfer_requests", incoming: listGuestTransferRequestsForUser(username) });
   sendGroupsList(ws, username);
+  send(ws, { type: "chat_state", state: chatStateForClient(u2) });
   broadcastFriendsListForUserAndFriends(username);
 
   return;
@@ -3187,6 +3432,7 @@ if (!user.friends.includes(user.username)) {
   });
   send(ws, { type: "guest_transfer_requests", incoming: listGuestTransferRequestsForUser(username) });
   sendGroupsList(ws, username);
+  send(ws, { type: "chat_state", state: chatStateForClient(u2) });
   broadcastFriendsListForUserAndFriends(username);
 
   return;
@@ -3806,6 +4052,105 @@ if (data.type === "inbox_request") {
   return send(ws, { type: "inbox", items });
 }
 
+if (data.type === "chat_state_request") {
+  const u0 = loadUser(ws.username);
+  if (!u0) {
+    return send(ws, {
+      type: "chat_state",
+      state: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [] }
+    });
+  }
+  const user = ensureUserShape(u0);
+  saveUser(user);
+  return send(ws, { type: "chat_state", state: chatStateForClient(user) });
+}
+
+if (data.type === "chat_state_update") {
+  const u0 = loadUser(ws.username);
+  if (!u0) return send(ws, { type: "error", message: "User not found" });
+  const updatesRaw = data.updates && typeof data.updates === "object"
+    ? data.updates
+    : (data.state && typeof data.state === "object" ? data.state : {});
+
+  const result = updateUserChatState(ws.username, (draft, user) => {
+    const allowed = buildAllowedChatKeysForUser(user);
+    let changed = false;
+
+    if (Array.isArray(updatesRaw.pins)) {
+      const pins = sanitizeChatStateKeys(updatesRaw.pins).filter((key) => allowed.has(key));
+      if (!sameStringList(draft.pins, pins)) {
+        draft.pins = pins;
+        changed = true;
+      }
+    }
+
+    if (Array.isArray(updatesRaw.manualUnread)) {
+      const manual = sanitizeChatStateKeys(updatesRaw.manualUnread).filter((key) => allowed.has(key));
+      if (!sameStringList(draft.manualUnread, manual)) {
+        draft.manualUnread = manual;
+        changed = true;
+      }
+    }
+
+    if (Array.isArray(updatesRaw.order)) {
+      const order = sanitizeChatStateKeys(updatesRaw.order).filter((key) => allowed.has(key));
+      if (!sameStringList(draft.order, order)) {
+        draft.order = order;
+        changed = true;
+      }
+    }
+
+    const touchKey = normalizeChatStateKey(updatesRaw.touchChatKey || "");
+    if (touchKey && allowed.has(touchKey)) {
+      const nextOrder = [touchKey, ...draft.order.filter((entry) => entry !== touchKey)];
+      if (!sameStringList(draft.order, nextOrder)) {
+        draft.order = nextOrder;
+        changed = true;
+      }
+    }
+
+    if (updatesRaw.markUnread && typeof updatesRaw.markUnread === "object") {
+      const markKey = normalizeChatStateKey(updatesRaw.markUnread.chatKey || "");
+      const unread = Boolean(updatesRaw.markUnread.unread);
+      if (markKey && allowed.has(markKey)) {
+        const has = draft.manualUnread.includes(markKey);
+        if (unread && !has) {
+          draft.manualUnread.push(markKey);
+          changed = true;
+        } else if (!unread && has) {
+          draft.manualUnread = draft.manualUnread.filter((entry) => entry !== markKey);
+          changed = true;
+        }
+      }
+    }
+
+    if (Array.isArray(updatesRaw.removeKeys)) {
+      const removeSet = new Set(sanitizeChatStateKeys(updatesRaw.removeKeys));
+      if (removeSet.size) {
+        const nextOrder = draft.order.filter((entry) => !removeSet.has(entry));
+        const nextUnread = draft.manualUnread.filter((entry) => !removeSet.has(entry));
+        const nextPins = draft.pins.filter((entry) => !removeSet.has(entry));
+        if (!sameStringList(draft.order, nextOrder) ||
+            !sameStringList(draft.manualUnread, nextUnread) ||
+            !sameStringList(draft.pins, nextPins)) {
+          draft.order = nextOrder;
+          draft.manualUnread = nextUnread;
+          draft.pins = nextPins;
+          changed = true;
+        }
+      }
+    }
+
+    return changed;
+  });
+
+  if (!result) return send(ws, { type: "error", message: "Could not update chat state" });
+  if (!result.changed) {
+    return send(ws, { type: "chat_state", state: result.state });
+  }
+  return send(ws, { type: "chat_state_ack", version: Number(result.state?.version || 1) });
+}
+
 if (data.type === "intent_access_request") {
   const intentId = String(data.intentId || "").trim();
   if (!intentId) {
@@ -3889,6 +4234,12 @@ if (data.type === "read_receipt") {
     from: ws.username,
     intents: updates
   });
+  sendToUser(ws.username, {
+    type: "read_receipt_sync",
+    friend,
+    intents: updates
+  });
+  broadcastInboxSnapshot(ws.username);
   updates.forEach((entry) => {
     const intent = loadIntent(entry.intentId);
     if (!intent) return;
@@ -3920,6 +4271,7 @@ if (data.type === "remove_friend") {
   me.outgoingRequests = (me.outgoingRequests || []).filter(n => n !== target);
   me.declinedRequests = (me.declinedRequests || []).filter(n => n !== target);
   saveUser(me);
+  removeChatKeyFromUserState(ws.username, target);
 
   sendFriendsList(ws, me);
   sendFriendRequestsUpdate(ws.username);
@@ -4135,6 +4487,7 @@ if (data.type === "group_create") {
   if (!saveGroup(group)) {
     return send(ws, { type: "error", message: "Could not create group" });
   }
+  const createdGroupChatKey = groupChatKey(group.id);
 
   members.forEach((member) => {
     const u0 = loadUser(member);
@@ -4143,6 +4496,9 @@ if (data.type === "group_create") {
     if (!u.groups.includes(group.id)) {
       u.groups.push(group.id);
       saveUser(u);
+    }
+    if (createdGroupChatKey) {
+      touchUserChatOrder(member, createdGroupChatKey);
     }
   });
 
@@ -4295,10 +4651,6 @@ if (intent.from !== ws.username) {
   ws.currentUploadIntentId = null;
   return send(ws, { type: "error", message: "Not sender" });
 }
-if (intent.stored && intent.storedFile && String(intent.transferState || "") !== "uploading") {
-  ws.currentUploadIntentId = null;
-  return send(ws, { type: "error", message: "File already uploaded", intentId });
-}
 
 const expectedBytes = resolveUploadExpectedBytes(intent);
 if (!Number.isFinite(expectedBytes) || expectedBytes <= 0) {
@@ -4310,15 +4662,43 @@ if (size !== expectedBytes) {
   return send(ws, { type: "error", message: "Upload size does not match intent", intentId });
 }
 
+if (intent.stored && intent.storedFile && String(intent.transferState || "") !== "uploading") {
+  ws.currentUploadIntentId = null;
+  return send(ws, {
+    type: "upload_ok",
+    intentId,
+    resumeFrom: expectedBytes,
+    bytesExpected: expectedBytes,
+    plainBytesExpected: Number(intent.fileSize || 0),
+    alreadyStored: true
+  });
+}
+
 const existingTransfer = activeTransfers.get(intentId);
 if (existingTransfer && existingTransfer.senderWs && existingTransfer.senderWs !== ws) {
   ws.currentUploadIntentId = null;
   return send(ws, { type: "error", message: "Another upload is already active for this file", intentId });
 }
 if (existingTransfer && existingTransfer.senderWs === ws) {
-  try { existingTransfer.writeStream?.destroy(); } catch {}
-  try { existingTransfer.tcp?.destroy(); } catch {}
-  activeTransfers.delete(intentId);
+  if (existingTransfer.mode === "live" && !existingTransfer.tcp) {
+    ws.currentUploadIntentId = intentId;
+    return send(ws, {
+      type: "error",
+      intentId,
+      retryable: true,
+      message: "Upload is waiting for receiver readiness"
+    });
+  }
+  ws.currentUploadIntentId = intentId;
+  const resumeFrom = Math.max(0, Math.min(Number(existingTransfer.bytesSent || 0), expectedBytes));
+  return send(ws, {
+    type: "upload_ok",
+    intentId,
+    resumeFrom,
+    bytesExpected: expectedBytes,
+    plainBytesExpected: Number(intent.fileSize || 0),
+    resumedExisting: true
+  });
 }
 
   // Always set current upload ID first (race-safe for binary frames)
@@ -4467,7 +4847,22 @@ if (data.type === "upload_end") {
   const t = activeTransfers.get(intentId);
   if (!t) {
     ws.currentUploadIntentId = null;
-    return send(ws, { type: "error", message: "No active transfer for upload_end" });
+    const intent = loadIntent(intentId);
+    if (!intent) {
+      return send(ws, { type: "error", message: "Intent not found", intentId });
+    }
+    if (intent.from !== ws.username) {
+      return send(ws, { type: "error", message: "Not sender", intentId });
+    }
+    if (intent.stored && intent.storedFile) {
+      return send(ws, { type: "upload_done", intentId, alreadyStored: true });
+    }
+    return send(ws, {
+      type: "error",
+      intentId,
+      retryable: true,
+      message: "Upload not active yet. Retrying from latest checkpoint is safe."
+    });
   }
 
   console.log(`✅ upload_end (${t.bytesSent}/${t.bytesExpected})`);
@@ -4756,6 +5151,18 @@ if (data.type === "send_intent") {
         }
         try { sendToUser(existing.to, { type: "inbox", items: loadIntentsForUser(existing.to) }); } catch {}
       }
+      if (isGroupSend) {
+        const gKey = groupChatKey(existing.groupId || requestedGroupId || "");
+        if (gKey) {
+          const members = targetGroup?.members?.length ? targetGroup.members : (existing.groupMembers || []);
+          normalizeGroupMembers(members).forEach((member) => {
+            touchUserChatOrder(member, gKey);
+          });
+        }
+      } else {
+        touchUserChatOrder(ws.username, existing.to);
+        touchUserChatOrder(existing.to, ws.username);
+      }
       return send(ws, {
         type: "intent_ok",
         intentId: existing.id,
@@ -4878,6 +5285,18 @@ if (data.type === "send_intent") {
         sendToUser(to, { type: "inbox", items: loadIntentsForUser(to) });
       } catch {}
     }
+  }
+
+  if (isGroupSend) {
+    const groupKey = groupChatKey(targetGroup?.id || "");
+    if (groupKey) {
+      [ws.username, ...groupRecipients].forEach((member) => {
+        touchUserChatOrder(member, groupKey);
+      });
+    }
+  } else {
+    touchUserChatOrder(ws.username, to);
+    touchUserChatOrder(to, ws.username);
   }
 
   emitTransferState(intent, intent.transferState || "queued", {
