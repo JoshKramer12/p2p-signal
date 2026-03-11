@@ -57,6 +57,7 @@ const ADMIN_USERNAMES = new Set(
     .filter(Boolean)
 );
 const CHAT_STATE_MAX_KEYS = Math.max(128, Number(process.env.CHAT_STATE_MAX_KEYS || 2000));
+const QUICK_CHATS_MAX_ITEMS = Math.max(50, Number(process.env.QUICK_CHATS_MAX_ITEMS || 500));
 
 function isAdminUsername(username = "") {
   const normalized = String(username || "").trim().replace(/^@+/, "").toLowerCase();
@@ -2417,6 +2418,29 @@ function ensureUserShape(u) {
   } else if (!profilePins.length && !u.chatState.pins.length) {
     u.profile.pinnedContacts = [];
   }
+
+  const legacyQuickChats = Array.isArray(u.quickChats) ? u.quickChats : [];
+  if (!u.quickChatsState || typeof u.quickChatsState !== "object" || Array.isArray(u.quickChatsState)) {
+    u.quickChatsState = {};
+  }
+  if (!Array.isArray(u.quickChatsState.chats)) {
+    u.quickChatsState.chats = legacyQuickChats;
+  }
+  if (!Array.isArray(u.quickChatsState.pins)) {
+    u.quickChatsState.pins = [];
+  }
+  if (!Number.isFinite(Number(u.quickChatsState.version))) {
+    u.quickChatsState.version = 1;
+  }
+  if (!Number.isFinite(Number(u.quickChatsState.updatedAt))) {
+    u.quickChatsState.updatedAt = Date.now();
+  }
+  u.quickChatsState.chats = sanitizeQuickChatEntries(u.quickChatsState.chats);
+  u.quickChatsState.pins = sanitizeQuickChatPinKeys(u.quickChatsState.pins, u.quickChatsState.chats);
+  u.quickChatsState.version = Math.max(1, Math.floor(Number(u.quickChatsState.version || 1)));
+  u.quickChatsState.updatedAt = Math.max(0, Math.floor(Number(u.quickChatsState.updatedAt || Date.now())));
+  // Keep legacy key for backwards compatibility with older deployments.
+  u.quickChats = u.quickChatsState.chats.slice();
   return u;
 }
 
@@ -2425,6 +2449,86 @@ function sameStringList(a = [], b = []) {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i += 1) {
     if (String(a[i] || "") !== String(b[i] || "")) return false;
+  }
+  return true;
+}
+
+function quickChatKeyFromId(threadId = "") {
+  const id = String(threadId || "").trim();
+  return id ? `quick:${id}` : "";
+}
+
+function normalizeQuickChatCode(value = "") {
+  return String(value || "").replace(/\D/g, "").slice(0, 6);
+}
+
+function normalizeQuickChatEntry(entry = null) {
+  if (!entry || typeof entry !== "object") return null;
+  const id = String(entry.id || "").trim().slice(0, 128);
+  if (!id) return null;
+  const code = normalizeQuickChatCode(entry.code || "");
+  if (!code) return null;
+  const createdAtRaw = Number(entry.createdAt || entry.lastActivityAt || 0);
+  const createdAt = Number.isFinite(createdAtRaw) && createdAtRaw > 0 ? Math.floor(createdAtRaw) : Date.now();
+  const expiresAtRaw = Number(entry.expiresAt || 0);
+  const expiresAt = Number.isFinite(expiresAtRaw) && expiresAtRaw > 0 ? Math.floor(expiresAtRaw) : 0;
+  return {
+    id,
+    code,
+    name: String(entry.name || "").trim().slice(0, 80),
+    recipient: String(entry.recipient || "").trim().slice(0, 120),
+    createdAt,
+    expiresAt
+  };
+}
+
+function sanitizeQuickChatEntries(list = []) {
+  const now = Date.now();
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(list) ? list : []) {
+    const entry = normalizeQuickChatEntry(raw);
+    if (!entry) continue;
+    if (entry.expiresAt > 0 && entry.expiresAt <= now) continue;
+    if (seen.has(entry.id)) continue;
+    seen.add(entry.id);
+    out.push(entry);
+    if (out.length >= QUICK_CHATS_MAX_ITEMS) break;
+  }
+  out.sort((a, b) => Number(b?.createdAt || 0) - Number(a?.createdAt || 0));
+  return out;
+}
+
+function sanitizeQuickChatPinKeys(list = [], chats = []) {
+  const chatIds = new Set((Array.isArray(chats) ? chats : []).map((entry) => String(entry?.id || "").trim()).filter(Boolean));
+  const seen = new Set();
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const key = String(raw || "").trim();
+    if (!/^quick:/i.test(key)) continue;
+    const normalized = quickChatKeyFromId(key.slice(6));
+    if (!normalized || seen.has(normalized)) continue;
+    const id = normalized.slice(6);
+    if (!chatIds.has(id)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+    if (out.length >= QUICK_CHATS_MAX_ITEMS) break;
+  }
+  return out;
+}
+
+function sameQuickChatEntries(a = [], b = []) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i] || {};
+    const right = b[i] || {};
+    if (String(left.id || "") !== String(right.id || "")) return false;
+    if (String(left.code || "") !== String(right.code || "")) return false;
+    if (String(left.name || "") !== String(right.name || "")) return false;
+    if (String(left.recipient || "") !== String(right.recipient || "")) return false;
+    if (Number(left.createdAt || 0) !== Number(right.createdAt || 0)) return false;
+    if (Number(left.expiresAt || 0) !== Number(right.expiresAt || 0)) return false;
   }
   return true;
 }
@@ -2484,10 +2588,15 @@ function filterChatKeysForUser(userRecord = null, list = []) {
 function chatStateForClient(userRecord = null) {
   const user = ensureUserShape(userRecord || {});
   const state = user.chatState || {};
+  const allowed = Array.from(buildAllowedChatKeysForUser(user));
+  const baseOrder = filterChatKeysForUser(user, state.order || []);
+  const missing = allowed
+    .filter((key) => !baseOrder.includes(key))
+    .sort((a, b) => String(a || "").localeCompare(String(b || ""), undefined, { sensitivity: "base" }));
   return {
     version: Math.max(1, Math.floor(Number(state.version || 1))),
     updatedAt: Math.max(0, Math.floor(Number(state.updatedAt || Date.now()))),
-    order: filterChatKeysForUser(user, state.order || []),
+    order: [...baseOrder, ...missing],
     manualUnread: filterChatKeysForUser(user, state.manualUnread || []),
     pins: filterChatKeysForUser(user, state.pins || [])
   };
@@ -2548,6 +2657,58 @@ function updateUserChatState(username = "", mutator = null, options = {}) {
   saveUser(user);
   if (options.broadcast !== false) {
     sendToUser(name, { type: "chat_state", state: next });
+  }
+  return { changed: true, user, state: next };
+}
+
+function quickChatsStateForClient(userRecord = null) {
+  const user = ensureUserShape(userRecord || {});
+  const state = user.quickChatsState || {};
+  const chats = sanitizeQuickChatEntries(state.chats || user.quickChats || []);
+  const pins = sanitizeQuickChatPinKeys(state.pins || [], chats);
+  return {
+    version: Math.max(1, Math.floor(Number(state.version || 1))),
+    updatedAt: Math.max(0, Math.floor(Number(state.updatedAt || Date.now()))),
+    chats,
+    pins
+  };
+}
+
+function updateUserQuickChatsState(username = "", mutator = null, options = {}) {
+  const name = String(username || "").trim();
+  if (!name || typeof mutator !== "function") return null;
+  const u0 = loadUser(name);
+  if (!u0) return null;
+  const user = ensureUserShape(u0);
+  const prev = quickChatsStateForClient(user);
+  const draft = {
+    chats: prev.chats.map((entry) => ({ ...entry })),
+    pins: prev.pins.slice()
+  };
+  const changedByMutator = Boolean(mutator(draft, user));
+
+  draft.chats = sanitizeQuickChatEntries(draft.chats);
+  draft.pins = sanitizeQuickChatPinKeys(draft.pins, draft.chats);
+
+  const changed = changedByMutator ||
+    !sameQuickChatEntries(prev.chats, draft.chats) ||
+    !sameStringList(prev.pins, draft.pins);
+
+  if (!changed) {
+    return { changed: false, user, state: prev };
+  }
+
+  const next = {
+    version: Math.max(1, Number(prev.version || 1)) + 1,
+    updatedAt: Date.now(),
+    chats: draft.chats,
+    pins: draft.pins
+  };
+  user.quickChatsState = next;
+  user.quickChats = next.chats.slice();
+  saveUser(user);
+  if (options.broadcast !== false) {
+    sendToUser(name, { type: "quick_chats", state: next });
   }
   return { changed: true, user, state: next };
 }
@@ -2928,7 +3089,8 @@ function friendsListPayload(userRecord) {
     friends: user.friends || [],
     deletedFriends: user.deletedFriends || [],
     onlineUsers: Array.from(online.keys()),
-    chatState: chatStateForClient(user)
+    chatState: chatStateForClient(user),
+    quickChats: quickChatsStateForClient(user)
   };
 }
 
@@ -2944,7 +3106,8 @@ function sendFriendsList(ws, userRecord = null) {
       friends: [],
       deletedFriends: [],
       onlineUsers: Array.from(online.keys()),
-      chatState: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [] }
+      chatState: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [] },
+      quickChats: { version: 1, updatedAt: Date.now(), chats: [], pins: [] }
     });
   }
   return send(ws, friendsListPayload(user));
@@ -3123,7 +3286,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
   let data;
     try {
       data = JSON.parse(msg.toString());
-      if (!["ping", "inbox_request", "friends_list", "friend_requests", "guest_transfer_requests", "groups_list", "typing"].includes(String(data?.type || ""))) {
+      if (!["ping", "inbox_request", "friends_list", "friend_requests", "guest_transfer_requests", "groups_list", "typing", "chat_state_request", "chat_state_update", "quick_chats_request", "quick_chats_update"].includes(String(data?.type || ""))) {
         console.log("📩 Message received:", data);
       }
     } catch {
@@ -3263,6 +3426,12 @@ if (data.type === "auth_signup") {
     manualUnread: [],
     pins: [username]
   },
+  quickChatsState: {
+    version: 1,
+    updatedAt: Date.now(),
+    chats: [],
+    pins: []
+  },
   sessionTokens: [],
 };
 
@@ -3317,6 +3486,7 @@ if (!user.friends.includes(user.username)) {
   send(ws, { type: "guest_transfer_requests", incoming: listGuestTransferRequestsForUser(username) });
   sendGroupsList(ws, username);
   send(ws, { type: "chat_state", state: chatStateForClient(u2) });
+  send(ws, { type: "quick_chats", state: quickChatsStateForClient(u2) });
   broadcastFriendsListForUserAndFriends(username);
 
   return;
@@ -3433,6 +3603,7 @@ if (!user.friends.includes(user.username)) {
   send(ws, { type: "guest_transfer_requests", incoming: listGuestTransferRequestsForUser(username) });
   sendGroupsList(ws, username);
   send(ws, { type: "chat_state", state: chatStateForClient(u2) });
+  send(ws, { type: "quick_chats", state: quickChatsStateForClient(u2) });
   broadcastFriendsListForUserAndFriends(username);
 
   return;
@@ -4149,6 +4320,86 @@ if (data.type === "chat_state_update") {
     return send(ws, { type: "chat_state", state: result.state });
   }
   return send(ws, { type: "chat_state_ack", version: Number(result.state?.version || 1) });
+}
+
+if (data.type === "quick_chats_request") {
+  const u0 = loadUser(ws.username);
+  if (!u0) {
+    return send(ws, {
+      type: "quick_chats",
+      state: { version: 1, updatedAt: Date.now(), chats: [], pins: [] }
+    });
+  }
+  const user = ensureUserShape(u0);
+  saveUser(user);
+  return send(ws, { type: "quick_chats", state: quickChatsStateForClient(user) });
+}
+
+if (data.type === "quick_chats_update") {
+  const u0 = loadUser(ws.username);
+  if (!u0) return send(ws, { type: "error", message: "User not found" });
+  const updatesRaw = data.updates && typeof data.updates === "object"
+    ? data.updates
+    : (data.state && typeof data.state === "object" ? data.state : {});
+
+  const result = updateUserQuickChatsState(ws.username, (draft) => {
+    let changed = false;
+
+    if (Array.isArray(updatesRaw.replace)) {
+      const next = sanitizeQuickChatEntries(updatesRaw.replace);
+      if (!sameQuickChatEntries(draft.chats, next)) {
+        draft.chats = next;
+        changed = true;
+      }
+    }
+
+    const upsertEntry = normalizeQuickChatEntry(updatesRaw.upsert || null);
+    if (upsertEntry) {
+      const idx = draft.chats.findIndex((entry) => String(entry?.id || "") === upsertEntry.id);
+      if (idx >= 0) {
+        const merged = { ...draft.chats[idx], ...upsertEntry };
+        if (!sameQuickChatEntries([draft.chats[idx]], [merged])) {
+          draft.chats[idx] = merged;
+          changed = true;
+        }
+      } else {
+        draft.chats.unshift(upsertEntry);
+        changed = true;
+      }
+    }
+
+    const removeIds = new Set(
+      [
+        String(updatesRaw.removeId || "").trim(),
+        ...((Array.isArray(updatesRaw.removeIds) ? updatesRaw.removeIds : []).map((raw) => String(raw || "").trim()))
+      ].filter(Boolean)
+    );
+    if (removeIds.size) {
+      const nextChats = draft.chats.filter((entry) => !removeIds.has(String(entry?.id || "").trim()));
+      const nextPins = draft.pins.filter((key) => !removeIds.has(String(key || "").trim().replace(/^quick:/i, "")));
+      if (!sameQuickChatEntries(nextChats, draft.chats) || !sameStringList(nextPins, draft.pins)) {
+        draft.chats = nextChats;
+        draft.pins = nextPins;
+        changed = true;
+      }
+    }
+
+    if (Array.isArray(updatesRaw.pins)) {
+      const nextPins = sanitizeQuickChatPinKeys(updatesRaw.pins, draft.chats);
+      if (!sameStringList(draft.pins, nextPins)) {
+        draft.pins = nextPins;
+        changed = true;
+      }
+    }
+
+    return changed;
+  });
+
+  if (!result) return send(ws, { type: "error", message: "Could not update quick chats" });
+  if (!result.changed) {
+    return send(ws, { type: "quick_chats", state: result.state });
+  }
+  return send(ws, { type: "quick_chats_ack", version: Number(result.state?.version || 1) });
 }
 
 if (data.type === "intent_access_request") {
