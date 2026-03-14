@@ -192,6 +192,10 @@ function contentTypeForName(name = "") {
     ".mp3": "audio/mpeg",
     ".wav": "audio/wav",
     ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".flac": "audio/flac",
     ".zip": "application/zip",
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -1593,6 +1597,28 @@ function extractIntentUnlockFromRequest(req, url) {
   return "";
 }
 
+function extractIntentSenderSessionTokenFromRequest(req, url) {
+  const headerRaw = req?.headers?.["x-merm-session"];
+  const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+  if (headerValue != null) {
+    return String(headerValue || "").trim();
+  }
+  const fromQuery = url?.searchParams?.get("st");
+  if (fromQuery != null) return String(fromQuery || "").trim();
+  return "";
+}
+
+function isIntentSenderBypassAuthorized(intent, sessionToken = "") {
+  if (!isIntentPasswordProtected(intent)) return false;
+  const token = String(sessionToken || "").trim();
+  if (!token) return false;
+  const senderUsername = String(intent?.from || "").trim();
+  if (!senderUsername) return false;
+  const senderUser = loadUser(senderUsername);
+  if (!senderUser || !Array.isArray(senderUser.sessionTokens)) return false;
+  return senderUser.sessionTokens.includes(token);
+}
+
 function verifyIntentPassword(intent, providedPassword = "") {
   if (!isIntentPasswordProtected(intent)) {
     return { ok: true };
@@ -1622,6 +1648,16 @@ function verifyIntentPassword(intent, providedPassword = "") {
 
 function enforceIntentPasswordGate(req, res, url, intent) {
   if (!isIntentPasswordProtected(intent)) return true;
+
+  const senderSessionToken = extractIntentSenderSessionTokenFromRequest(req, url);
+  if (isIntentSenderBypassAuthorized(intent, senderSessionToken)) {
+    const minted = generateIntentUnlockToken(intent, getIntentPasswordMode(intent));
+    if (minted?.token) {
+      res.setHeader("X-Merm-Unlock", minted.token);
+      res.setHeader("X-Merm-Unlock-Exp", String(Number(minted.exp || 0)));
+    }
+    return true;
+  }
 
   const unlockToken = extractIntentUnlockFromRequest(req, url);
   if (unlockToken) {
