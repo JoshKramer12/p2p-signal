@@ -4465,6 +4465,9 @@ if (data.type === "intent_access_request") {
     intent: {
       id: intent.id,
       intentId: intent.id,
+      from: String(intent.from || ""),
+      to: String(intent.to || ""),
+      groupId: String(intent.groupId || ""),
       fileName: intent.fileName || "",
       fileSize: Number(intent.fileSize || 0),
       uploadBytesExpected: Number(intent.uploadBytesExpected || intent.fileSize || 0),
