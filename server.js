@@ -5331,7 +5331,8 @@ if (data.type === "send_intent") {
   const uploadBytesExpected = normalizeUploadBytesExpected(data.uploadBytesExpected, fileSize);
   const note = typeof data.note === "string" ? data.note.trim().slice(0, 500) : "";
   const text = typeof data.text === "string" ? data.text.trim().slice(0, 5000) : "";
-  const isTextOnly = Boolean(data.isTextOnly) || (!!text && !fileName && !fileSize);
+  const plainText = typeof data.plainText === "string" ? data.plainText.trim().slice(0, 5000) : "";
+  const isTextOnly = Boolean(data.isTextOnly) || ((!!text || !!plainText) && !fileName && !fileSize);
   const clientIntentId = String(data.clientIntentId || "").trim();
   const now = Date.now();
   const rawExpiresAt = Number(data.expiresAt || 0);
@@ -5362,7 +5363,7 @@ if (data.type === "send_intent") {
   }
 
   if (isTextOnly) {
-    if (!text) {
+    if (!text && !plainText) {
       return send(ws, { type: "error", message: "Message cannot be empty" });
     }
     if (data.accessControl) {
@@ -5453,7 +5454,7 @@ if (data.type === "send_intent") {
         touchUserChatOrder(ws.username, existing.to);
         touchUserChatOrder(existing.to, ws.username);
       }
-      return send(ws, {
+    return send(ws, {
         type: "intent_ok",
         intentId: existing.id,
         clientIntentId,
@@ -5466,6 +5467,7 @@ if (data.type === "send_intent") {
         createdAt: existing.createdAt,
         isTextOnly: Boolean(existing.isTextOnly || existing.messageType === "text"),
         text: existing.text || "",
+        plainText: existing.plainText || "",
         fileSize: Number(existing.fileSize || 0),
         uploadBytesExpected: Number(existing.uploadBytesExpected || existing.fileSize || 0),
         encryption: existing.encryption || null,
@@ -5484,6 +5486,7 @@ if (data.type === "send_intent") {
     fileSize: isTextOnly ? 0 : fileSize,
     note: isTextOnly ? "" : note,
     text: isTextOnly ? text : "",
+    plainText: isTextOnly ? (plainText || (!encryption ? text : "")) : "",
     isTextOnly,
     messageType: isTextOnly ? "text" : "file",
     encryption: encryption || null,
@@ -5617,6 +5620,7 @@ if (data.type === "send_intent") {
     createdAt: intent.createdAt,
     isTextOnly,
     text: intent.text || "",
+    plainText: intent.plainText || "",
     fileSize: Number(intent.fileSize || 0),
     uploadBytesExpected: Number(intent.uploadBytesExpected || intent.fileSize || 0),
     encryption: intent.encryption || null,
