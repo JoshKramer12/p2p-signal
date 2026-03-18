@@ -160,8 +160,69 @@ function unregisterOnlineSocket(username = "", ws = null) {
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password,X-Merm-Unlock,X-Merm-Session");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password,X-Merm-Unlock,X-Merm-Session,X-Merm-Username");
   res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition,Content-Range,Accept-Ranges,X-Merm-Unlock,X-Merm-Unlock-Exp");
+}
+
+function extractSessionTokenFromRequest(req, url) {
+  const headerRaw = req?.headers?.["x-merm-session"];
+  const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+  if (headerValue != null) return String(headerValue || "").trim();
+  const queryValue = url?.searchParams?.get("sessionToken");
+  if (queryValue != null) return String(queryValue || "").trim();
+  return "";
+}
+
+function extractUsernameFromRequest(req, url) {
+  const headerRaw = req?.headers?.["x-merm-username"];
+  const headerValue = Array.isArray(headerRaw) ? headerRaw[0] : headerRaw;
+  if (headerValue != null) return String(headerValue || "").trim();
+  const queryValue = url?.searchParams?.get("username");
+  if (queryValue != null) return String(queryValue || "").trim();
+  return "";
+}
+
+function verifyAccountSession(username = "", sessionToken = "") {
+  const name = String(username || "").trim();
+  const token = String(sessionToken || "").trim();
+  if (!name || !token) return null;
+  const user = loadUser(name);
+  if (!user || !Array.isArray(user.sessionTokens)) return null;
+  if (!user.sessionTokens.includes(token)) return null;
+  return ensureUserShape(user);
+}
+
+function intentChatKeyForUser(intent = {}, username = "") {
+  const name = String(username || "").trim();
+  if (!name || !intent || typeof intent !== "object") return "";
+  const groupId = String(intent.groupId || "").trim();
+  if (groupId) return groupChatKey(groupId);
+  const from = String(intent.from || "").trim();
+  const to = String(intent.to || "").trim();
+  if (from === name) return to || from;
+  if (to === name) return from || to;
+  return from || to || "";
+}
+
+function countUnreadChatsForUser(username = "", userRecord = null) {
+  const name = String(username || "").trim();
+  if (!name) return 0;
+  const user = ensureUserShape(userRecord || loadUser(name) || {});
+  const unreadChatKeys = new Set(
+    filterChatKeysForUser(user, user?.chatState?.manualUnread || [])
+  );
+  const intents = loadIntentsForUser(name);
+  intents.forEach((intent) => {
+    if (!intent || typeof intent !== "object") return;
+    const to = String(intent.to || "").trim();
+    if (to !== name) return;
+    if (intent.isSystemEvent || String(intent.messageType || "").toLowerCase() === "system") return;
+    const readAt = Number(intent.readByRecipientAt || intent.recipientReadAt || intent.readAt || 0);
+    if (Number.isFinite(readAt) && readAt > 0) return;
+    const key = intentChatKeyForUser(intent, name);
+    if (key) unreadChatKeys.add(key);
+  });
+  return unreadChatKeys.size;
 }
 
 function contentTypeForName(name = "") {
@@ -652,6 +713,35 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/" || url.pathname === "/health") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("ok");
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/account/badge") {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const unreadChats = countUnreadChatsForUser(username, user);
+      const pendingRequests = countPendingRequestsForUser(username);
+      const guestTransferRequests = listGuestTransferRequestsForUser(username).length;
+      const total = Math.max(0, unreadChats + pendingRequests + guestTransferRequests);
+
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        badge: {
+          total,
+          unreadChats,
+          pendingRequests,
+          guestTransferRequests
+        }
+      }));
       return;
     }
 
@@ -5578,6 +5668,21 @@ if (data.type === "send_intent") {
         sendToUser(to, { type: "inbox", items: loadIntentsForUser(to) });
       } catch {}
     }
+  }
+
+  // Keep all sender devices fully in sync (web + app) without waiting for polling.
+  // For self-send (to === sender), sender already receives the regular recipient push above.
+  const shouldBroadcastSenderDevices = isGroupSend || to !== ws.username;
+  if (shouldBroadcastSenderDevices && isUserOnline(ws.username)) {
+    const senderIntent = intentForClient(intent);
+    if (isTextOnly) {
+      sendToUser(ws.username, { type: "incoming_file", intent: senderIntent });
+    } else {
+      sendToUser(ws.username, { type: "incoming_intent", intent: senderIntent });
+    }
+    try {
+      sendToUser(ws.username, { type: "inbox", items: loadIntentsForUser(ws.username) });
+    } catch {}
   }
 
   if (isGroupSend) {
