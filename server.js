@@ -2,8 +2,9 @@
 //test
 
 const http = require("http");
+const http2 = require("http2");
 const WebSocket = require("ws");
-const { randomUUID, createHash, createHmac, timingSafeEqual } = require("crypto");
+const { randomUUID, createHash, createHmac, timingSafeEqual, createSign } = require("crypto");
 const net = require("net");
 const yauzl = require("yauzl");
 
@@ -58,6 +59,17 @@ const ADMIN_USERNAMES = new Set(
 );
 const CHAT_STATE_MAX_KEYS = Math.max(128, Number(process.env.CHAT_STATE_MAX_KEYS || 2000));
 const QUICK_CHATS_MAX_ITEMS = Math.max(50, Number(process.env.QUICK_CHATS_MAX_ITEMS || 500));
+const PUSH_DEVICE_MAX_PER_USER = Math.max(1, Number(process.env.PUSH_DEVICE_MAX_PER_USER || 8));
+const MAX_SESSION_TOKENS = Math.max(8, Number(process.env.MAX_SESSION_TOKENS || 40));
+const APNS_TEAM_ID = String(process.env.APNS_TEAM_ID || "").trim();
+const APNS_KEY_ID = String(process.env.APNS_KEY_ID || "").trim();
+const APNS_TOPIC = String(process.env.APNS_TOPIC || process.env.APNS_BUNDLE_ID || "test.P2PTest").trim();
+const APNS_PRIVATE_KEY = String(process.env.APNS_PRIVATE_KEY || "").replace(/\\n/g, "\n").trim();
+const APNS_USE_SANDBOX = String(process.env.APNS_USE_SANDBOX || "1").trim() !== "0";
+const APNS_HOST_SANDBOX = "https://api.sandbox.push.apple.com";
+const APNS_HOST_PRODUCTION = "https://api.push.apple.com";
+const APNS_DEFAULT_HOST = APNS_USE_SANDBOX ? APNS_HOST_SANDBOX : APNS_HOST_PRODUCTION;
+const APNS_ENABLED = Boolean(APNS_TEAM_ID && APNS_KEY_ID && APNS_TOPIC && APNS_PRIVATE_KEY);
 
 function isAdminUsername(username = "") {
   const normalized = String(username || "").trim().replace(/^@+/, "").toLowerCase();
@@ -137,6 +149,368 @@ function sendToUser(username = "", payload = null, options = {}) {
   return sent;
 }
 
+function base64UrlEncode(input) {
+  const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input || ""), "utf8");
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+let apnsJwtCache = { token: "", expiresAtMs: 0 };
+const apnsClients = new Map(); // host -> { client, healthy }
+
+function closeApnsClient(host = "") {
+  const target = String(host || "").trim();
+  if (target) {
+    const existing = apnsClients.get(target);
+    if (!existing?.client) {
+      apnsClients.delete(target);
+      return;
+    }
+    try { existing.client.close(); } catch {}
+    try { existing.client.destroy(); } catch {}
+    apnsClients.delete(target);
+    return;
+  }
+  Array.from(apnsClients.keys()).forEach((key) => closeApnsClient(key));
+}
+
+function buildApnsJwt() {
+  if (!APNS_ENABLED) return "";
+  const nowMs = Date.now();
+  if (apnsJwtCache.token && nowMs < apnsJwtCache.expiresAtMs) {
+    return apnsJwtCache.token;
+  }
+  const nowSec = Math.floor(nowMs / 1000);
+  const header = base64UrlEncode(JSON.stringify({ alg: "ES256", kid: APNS_KEY_ID }));
+  const payload = base64UrlEncode(JSON.stringify({ iss: APNS_TEAM_ID, iat: nowSec }));
+  const signingInput = `${header}.${payload}`;
+  const signer = createSign("SHA256");
+  signer.update(signingInput);
+  signer.end();
+  const signature = signer.sign(APNS_PRIVATE_KEY);
+  const token = `${signingInput}.${base64UrlEncode(signature)}`;
+  apnsJwtCache = {
+    token,
+    expiresAtMs: nowMs + (50 * 60 * 1000) // Apple allows up to 60 minutes; refresh a bit earlier.
+  };
+  return token;
+}
+
+function apnsHostForEnvironment(environment = "") {
+  const normalized = normalizePushEnvironment(environment || (APNS_USE_SANDBOX ? "sandbox" : "production"));
+  return normalized === "production" ? APNS_HOST_PRODUCTION : APNS_HOST_SANDBOX;
+}
+
+function getApnsClient(host = APNS_DEFAULT_HOST) {
+  if (!APNS_ENABLED) return null;
+  const target = String(host || APNS_DEFAULT_HOST).trim() || APNS_DEFAULT_HOST;
+  const existing = apnsClients.get(target);
+  if (existing?.client && existing.healthy) return existing.client;
+  closeApnsClient(target);
+  const client = http2.connect(target);
+  const state = { client, healthy: true };
+  apnsClients.set(target, state);
+  client.on("error", () => {
+    state.healthy = false;
+    closeApnsClient(target);
+  });
+  client.on("goaway", () => {
+    state.healthy = false;
+    closeApnsClient(target);
+  });
+  client.on("close", () => {
+    state.healthy = false;
+  });
+  return client;
+}
+
+function normalizePushDeviceToken(value = "") {
+  const token = String(value || "").replace(/[<>\s]/g, "").trim().toLowerCase();
+  return /^[a-f0-9]{64,256}$/.test(token) ? token : "";
+}
+
+function normalizePushEnvironment(value = "") {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "prod" || raw === "production") return "production";
+  return "sandbox";
+}
+
+function normalizePushDevices(list = []) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(list) ? list : []) {
+    const token = normalizePushDeviceToken(raw?.token || raw?.deviceToken || raw);
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    out.push({
+      token,
+      platform: String(raw?.platform || "ios").trim().slice(0, 32) || "ios",
+      bundleId: String(raw?.bundleId || APNS_TOPIC).trim().slice(0, 128) || APNS_TOPIC,
+      environment: normalizePushEnvironment(raw?.environment || (APNS_USE_SANDBOX ? "sandbox" : "production")),
+      updatedAt: Number(raw?.updatedAt || Date.now()) || Date.now(),
+      lastSuccessAt: Number(raw?.lastSuccessAt || 0) || 0,
+      failureCount: Math.max(0, Number(raw?.failureCount || 0) || 0),
+      disabled: Boolean(raw?.disabled)
+    });
+    if (out.length >= PUSH_DEVICE_MAX_PER_USER) break;
+  }
+  return out;
+}
+
+function userDisplayName(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return "";
+  const user = loadUser(name);
+  const profile = user?.profile || {};
+  const first = String(profile.firstName || "").trim();
+  const last = String(profile.lastName || "").trim();
+  const full = [first, last].filter(Boolean).join(" ").trim();
+  if (full) return full;
+  const legacy = String(profile.name || "").trim();
+  if (legacy) return legacy;
+  return name;
+}
+
+function updateUserPushDevices(username = "", mutator = null) {
+  const name = String(username || "").trim();
+  if (!name || typeof mutator !== "function") return { ok: false, changed: false, devices: [] };
+  const raw = loadUser(name);
+  if (!raw) return { ok: false, changed: false, devices: [] };
+  const user = ensureUserShape(raw);
+  const draft = normalizePushDevices(user.pushDevices || []);
+  const changed = Boolean(mutator(draft, user));
+  if (!changed) return { ok: true, changed: false, devices: draft };
+  user.pushDevices = normalizePushDevices(draft);
+  saveUser(user);
+  return { ok: true, changed: true, devices: user.pushDevices.slice() };
+}
+
+function upsertUserPushDevice(username = "", payload = {}) {
+  const name = String(username || "").trim();
+  const token = normalizePushDeviceToken(payload?.deviceToken || payload?.token || "");
+  if (!name || !token) return { ok: false, changed: false, devices: [] };
+  const now = Date.now();
+  return updateUserPushDevices(name, (draft) => {
+    const idx = draft.findIndex((entry) => entry.token === token);
+    const next = {
+      token,
+      platform: "ios",
+      bundleId: String(payload?.bundleId || APNS_TOPIC).trim().slice(0, 128) || APNS_TOPIC,
+      environment: normalizePushEnvironment(payload?.environment || (APNS_USE_SANDBOX ? "sandbox" : "production")),
+      updatedAt: now,
+      lastSuccessAt: idx >= 0 ? Number(draft[idx]?.lastSuccessAt || 0) : 0,
+      failureCount: 0,
+      disabled: false
+    };
+    if (idx >= 0) draft.splice(idx, 1);
+    draft.unshift(next);
+    while (draft.length > PUSH_DEVICE_MAX_PER_USER) draft.pop();
+    return true;
+  });
+}
+
+function removeUserPushDevice(username = "", deviceToken = "") {
+  const name = String(username || "").trim();
+  const token = normalizePushDeviceToken(deviceToken);
+  if (!name || !token) return { ok: false, changed: false, devices: [] };
+  return updateUserPushDevices(name, (draft) => {
+    const next = draft.filter((entry) => entry.token !== token);
+    if (next.length === draft.length) return false;
+    draft.splice(0, draft.length, ...next);
+    return true;
+  });
+}
+
+function markUserPushDeviceResult(username = "", token = "", { ok = false, disable = false } = {}) {
+  const name = String(username || "").trim();
+  const normalizedToken = normalizePushDeviceToken(token);
+  if (!name || !normalizedToken) return;
+  updateUserPushDevices(name, (draft) => {
+    const idx = draft.findIndex((entry) => entry.token === normalizedToken);
+    if (idx < 0) return false;
+    const current = draft[idx] || {};
+    const next = { ...current };
+    if (ok) {
+      next.failureCount = 0;
+      next.lastSuccessAt = Date.now();
+      next.disabled = false;
+    } else {
+      next.failureCount = Math.max(0, Number(current.failureCount || 0)) + 1;
+      if (disable) next.disabled = true;
+    }
+    draft[idx] = next;
+    return true;
+  });
+}
+
+function isPermanentApnsFailure(result = {}) {
+  const status = Number(result?.status || 0) || 0;
+  const reason = String(result?.reason || "");
+  if ([400, 410].includes(status)) {
+    return ["BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "TopicDisallowed"].includes(reason);
+  }
+  return ["BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "TopicDisallowed"].includes(reason);
+}
+
+function isTransientApnsFailure(result = {}) {
+  const status = Number(result?.status || 0) || 0;
+  const reason = String(result?.reason || "");
+  if (status === 0 || status === 429 || status >= 500) return true;
+  return [
+    "TooManyRequests",
+    "InternalServerError",
+    "ServiceUnavailable",
+    "Shutdown",
+    "IdleTimeout",
+    "ExpiredProviderToken"
+  ].includes(reason);
+}
+
+function waitMs(ms = 0) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms || 0))));
+}
+
+function sendApnsToDevice({ token, topic, payload, host = "" }) {
+  return new Promise((resolve) => {
+    if (!APNS_ENABLED) {
+      resolve({ ok: false, status: 0, reason: "apns-disabled" });
+      return;
+    }
+    const targetHost = String(host || APNS_DEFAULT_HOST).trim() || APNS_DEFAULT_HOST;
+    const client = getApnsClient(targetHost);
+    const jwt = buildApnsJwt();
+    if (!client || !jwt) {
+      resolve({ ok: false, status: 0, reason: "apns-unavailable" });
+      return;
+    }
+
+    const req = client.request({
+      ":method": "POST",
+      ":path": `/3/device/${token}`,
+      "apns-topic": topic || APNS_TOPIC,
+      "apns-push-type": "alert",
+      "apns-priority": "10",
+      "authorization": `bearer ${jwt}`
+    });
+
+    let status = 0;
+    let responseBody = "";
+    req.setEncoding("utf8");
+    req.on("response", (headers) => {
+      status = Number(headers?.[":status"] || 0) || 0;
+    });
+    req.on("data", (chunk) => {
+      responseBody += String(chunk || "");
+    });
+    req.on("error", () => {
+      resolve({ ok: false, status: 0, reason: "request-error" });
+    });
+    req.on("end", () => {
+      if (status === 200) {
+        resolve({ ok: true, status, reason: "" });
+        return;
+      }
+      let reason = "";
+      try {
+        const parsed = JSON.parse(responseBody || "{}");
+        reason = String(parsed?.reason || "");
+      } catch {}
+      resolve({ ok: false, status, reason, host: targetHost });
+    });
+
+    req.end(JSON.stringify(payload || {}));
+  });
+}
+
+function queuePushNotificationForUser(username = "", payload = {}) {
+  if (!APNS_ENABLED) return false;
+  const name = String(username || "").trim();
+  if (!name) return false;
+  const user = loadUser(name);
+  if (!user) return false;
+  const devices = normalizePushDevices(ensureUserShape(user).pushDevices || [])
+    .filter((entry) => !entry.disabled && String(entry.platform || "").toLowerCase() === "ios");
+  if (!devices.length) return false;
+
+  const unreadChats = countUnreadChatsForUser(name, user);
+  const pendingRequests = countPendingRequestsForUser(name);
+  const guestTransferRequests = listGuestTransferRequestsForUser(name).length;
+  const badgeCount = Math.max(0, unreadChats + pendingRequests + guestTransferRequests);
+
+  const title = String(payload?.title || "Merm").trim().slice(0, 120) || "Merm";
+  const body = String(payload?.body || "You have a new message.").trim().slice(0, 220) || "You have a new message.";
+  const intentId = String(payload?.intentId || "").trim();
+  const chatKey = String(payload?.chatKey || "").trim();
+  const sender = String(payload?.sender || "").trim();
+  const groupId = String(payload?.groupId || "").trim();
+
+  const apnsPayload = {
+    aps: {
+      alert: { title, body },
+      badge: badgeCount,
+      sound: "default",
+      "content-available": 1
+    },
+    merm: {
+      intentId,
+      chatKey,
+      sender,
+      groupId
+    }
+  };
+
+  setImmediate(async () => {
+    for (const device of devices) {
+      const token = normalizePushDeviceToken(device.token);
+      if (!token) continue;
+      const topic = String(device.bundleId || APNS_TOPIC).trim() || APNS_TOPIC;
+      const preferredHost = apnsHostForEnvironment(device.environment);
+      const alternateHost = preferredHost === APNS_HOST_PRODUCTION ? APNS_HOST_SANDBOX : APNS_HOST_PRODUCTION;
+
+      let result = await sendApnsToDevice({
+        token,
+        topic,
+        payload: apnsPayload,
+        host: preferredHost
+      });
+
+      if (!result.ok && isTransientApnsFailure(result)) {
+        let attempt = 0;
+        while (!result.ok && isTransientApnsFailure(result) && attempt < 3) {
+          attempt += 1;
+          await waitMs(220 * Math.pow(2, attempt - 1));
+          result = await sendApnsToDevice({
+            token,
+            topic,
+            payload: apnsPayload,
+            host: preferredHost
+          });
+        }
+      }
+
+      // If device environment was stale/mismatched, try the other APNs host once.
+      if (!result.ok && isPermanentApnsFailure(result) && String(result?.reason || "") === "BadDeviceToken") {
+        const retryOtherHost = await sendApnsToDevice({
+          token,
+          topic,
+          payload: apnsPayload,
+          host: alternateHost
+        });
+        if (retryOtherHost.ok) {
+          result = retryOtherHost;
+        }
+      }
+
+      if (result.ok) {
+        markUserPushDeviceResult(name, token, { ok: true });
+        continue;
+      }
+      const disable = isPermanentApnsFailure(result);
+      markUserPushDeviceResult(name, token, { ok: false, disable });
+    }
+  });
+  return true;
+}
+
 function unregisterOnlineSocket(username = "", ws = null) {
   const name = String(username || "").trim();
   if (!name || !ws) return false;
@@ -186,10 +560,14 @@ function verifyAccountSession(username = "", sessionToken = "") {
   const name = String(username || "").trim();
   const token = String(sessionToken || "").trim();
   if (!name || !token) return null;
-  const user = loadUser(name);
-  if (!user || !Array.isArray(user.sessionTokens)) return null;
-  if (!user.sessionTokens.includes(token)) return null;
-  return ensureUserShape(user);
+  const raw = loadUser(name);
+  if (!raw) return null;
+  const user = ensureUserShape(raw);
+  if (!Array.isArray(user.sessionTokens) || !user.sessionTokens.includes(token)) return null;
+  if (touchUserSessionToken(user, token)) {
+    saveUser(user);
+  }
+  return user;
 }
 
 function intentChatKeyForUser(intent = {}, username = "") {
@@ -741,6 +1119,84 @@ const server = http.createServer(async (req, res) => {
           pendingRequests,
           guestTransferRequests
         }
+      }));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/account/push/register") {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      let body = {};
+      try {
+        body = await readJsonBody(req, 16 * 1024);
+      } catch (err) {
+        const status = Number(err?.status || 400);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Invalid request body") }));
+        return;
+      }
+
+      const deviceToken = normalizePushDeviceToken(body?.deviceToken || "");
+      if (!deviceToken) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Missing or invalid device token" }));
+        return;
+      }
+
+      const result = upsertUserPushDevice(username, {
+        deviceToken,
+        bundleId: String(body?.bundleId || APNS_TOPIC).trim() || APNS_TOPIC,
+        environment: normalizePushEnvironment(body?.environment || (APNS_USE_SANDBOX ? "sandbox" : "production"))
+      });
+      const refreshed = loadUser(username);
+      const devices = normalizePushDevices(refreshed?.pushDevices || []);
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        apnsConfigured: APNS_ENABLED,
+        registered: Boolean(result?.ok),
+        deviceCount: devices.length
+      }));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/account/push/unregister") {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      let body = {};
+      try {
+        body = await readJsonBody(req, 16 * 1024);
+      } catch {}
+      const deviceToken = normalizePushDeviceToken(body?.deviceToken || "");
+      if (!deviceToken) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Missing or invalid device token" }));
+        return;
+      }
+
+      removeUserPushDevice(username, deviceToken);
+      const refreshed = loadUser(username);
+      const devices = normalizePushDevices(refreshed?.pushDevices || []);
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        deviceCount: devices.length
       }));
       return;
     }
@@ -2517,6 +2973,10 @@ function ensureUserShape(u) {
   if (!u.groups) u.groups = [];
   if (!Array.isArray(u.groups)) u.groups = [];
   if (!u.profile) u.profile = {};
+  if (!Array.isArray(u.sessionTokens)) u.sessionTokens = [];
+  u.sessionTokens = sanitizeSessionTokens(u.sessionTokens);
+  if (!Array.isArray(u.pushDevices)) u.pushDevices = [];
+  u.pushDevices = normalizePushDevices(u.pushDevices);
   if (!u.chatState || typeof u.chatState !== "object" || Array.isArray(u.chatState)) u.chatState = {};
   if (!Array.isArray(u.chatState.order)) u.chatState.order = [];
   if (!Array.isArray(u.chatState.manualUnread)) u.chatState.manualUnread = [];
@@ -2568,6 +3028,37 @@ function ensureUserShape(u) {
   // Keep legacy key for backwards compatibility with older deployments.
   u.quickChats = u.quickChatsState.chats.slice();
   return u;
+}
+
+function sanitizeSessionTokens(list = []) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const token = String(raw || "").trim();
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+  }
+  if (out.length > MAX_SESSION_TOKENS) {
+    return out.slice(-MAX_SESSION_TOKENS);
+  }
+  return out;
+}
+
+function touchUserSessionToken(user = null, sessionToken = "") {
+  if (!user || typeof user !== "object") return false;
+  const token = String(sessionToken || "").trim();
+  if (!token) return false;
+  const current = sanitizeSessionTokens(Array.isArray(user.sessionTokens) ? user.sessionTokens : []);
+  const without = current.filter((entry) => entry !== token);
+  without.push(token);
+  const next = sanitizeSessionTokens(without);
+  if (sameStringList(current, next)) {
+    user.sessionTokens = current;
+    return false;
+  }
+  user.sessionTokens = next;
+  return true;
 }
 
 function sameStringList(a = [], b = []) {
@@ -3165,6 +3656,16 @@ function queueGuestTransferRequest(raw = {}) {
     .slice(0, 200);
   saveGuestTransferRequestsIndex();
   sendGuestTransferRequestsUpdate(target);
+  const guestName = String(normalized?.fromGuestDisplayName || "").trim() || "Guest";
+  const threadLabel = String(normalized?.threadName || "").trim() || "Quick transfer";
+  queuePushNotificationForUser(target, {
+    title: "Merm",
+    body: `${guestName} sent a quick transfer request (${threadLabel}).`,
+    intentId: String(normalized?.id || "").trim(),
+    chatKey: `quick:${String(normalized?.threadId || "").trim()}`,
+    sender: guestName,
+    groupId: ""
+  });
   return { ok: true, targetUsername: target, request: normalized };
 }
 
@@ -3573,10 +4074,11 @@ if (data.type === "auth_resume") {
   const token = String(data.sessionToken || "");
   const client = String(data.client || "unknown");
 
-  const user = loadUser(username);
+  const user = ensureUserShape(loadUser(username));
   if (!user || !user.sessionTokens?.includes(token)) {
     return send(ws, { type: "error", message: "Session expired" });
   }
+  touchUserSessionToken(user, token);
 
   // ✅ Upgrade old accounts: ensure self is in friends list
 user.friends = Array.isArray(user.friends) ? user.friends : [];
@@ -3680,10 +4182,7 @@ if (!user.friends.includes(user.username)) {
     ? user.sessionTokens
     : [];
 
-  user.sessionTokens.push(token);
-
-  // Keep only the last 5 tokens (prevents unbounded growth)
-  user.sessionTokens = user.sessionTokens.slice(-5);
+  touchUserSessionToken(user, token);
 
   saveUser(user);
 
@@ -5643,6 +6142,27 @@ if (data.type === "send_intent") {
     saveIntent(intent);
   }
 
+  const buildPushPayloadForIntent = (intentRecord = {}) => {
+    const senderUsername = String(intentRecord?.from || "").trim();
+    const senderLabel = userDisplayName(senderUsername) || senderUsername || "New message";
+    const isTextMessage = Boolean(intentRecord?.isTextOnly || String(intentRecord?.messageType || "").toLowerCase() === "text");
+    const previewText = String(intentRecord?.plainText || intentRecord?.text || "").trim().replace(/\s+/g, " ");
+    const fileLabel = String(intentRecord?.fileName || "").trim();
+    const body = isTextMessage
+      ? (previewText || "New message")
+      : (fileLabel ? `Sent ${fileLabel}` : "Sent a file");
+    return {
+      title: senderLabel,
+      body: body.slice(0, 220),
+      intentId: String(intentRecord?.id || "").trim(),
+      chatKey: String(intentRecord?.groupId || "").trim()
+        ? groupChatKey(intentRecord.groupId)
+        : senderUsername,
+      sender: senderUsername,
+      groupId: String(intentRecord?.groupId || "").trim()
+    };
+  };
+
   if (isGroupSend) {
     for (const mirrorIntent of mirrorIntents) {
       if (!isUserOnline(mirrorIntent.to)) continue;
@@ -5656,6 +6176,9 @@ if (data.type === "send_intent") {
         sendToUser(mirrorIntent.to, { type: "inbox", items: loadIntentsForUser(mirrorIntent.to) });
       } catch {}
     }
+    mirrorIntents.forEach((mirrorIntent) => {
+      queuePushNotificationForUser(mirrorIntent.to, buildPushPayloadForIntent(mirrorIntent));
+    });
   } else {
     if (isUserOnline(to)) {
       const safeIntent = intentForClient(intent);
@@ -5667,6 +6190,9 @@ if (data.type === "send_intent") {
       try {
         sendToUser(to, { type: "inbox", items: loadIntentsForUser(to) });
       } catch {}
+    }
+    if (to !== ws.username) {
+      queuePushNotificationForUser(to, buildPushPayloadForIntent(intent));
     }
   }
 
@@ -5868,7 +6394,21 @@ setInterval(cleanupOrphanStoredFiles, 60 * 60 * 1000);
 setInterval(cleanupPreviewCache, 60 * 60 * 1000);
 setInterval(cleanupStalledTransfers, TRANSFER_SWEEP_INTERVAL_MS);
 
+process.on("SIGINT", () => {
+  closeApnsClient();
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  closeApnsClient();
+  process.exit(0);
+});
+
 server.listen(PORT, () => {
   console.log(`✅ Signaling server running on port ${PORT}`);
+  if (APNS_ENABLED) {
+    console.log(`🔔 APNs push enabled (${APNS_USE_SANDBOX ? "sandbox" : "production"}) for topic ${APNS_TOPIC}`);
+  } else {
+    console.log("🔕 APNs push disabled (missing APNS_TEAM_ID / APNS_KEY_ID / APNS_PRIVATE_KEY / APNS_TOPIC)");
+  }
 
 });
