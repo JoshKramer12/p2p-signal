@@ -29,12 +29,16 @@ const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CA
 const REQUIRE_E2EE = String(process.env.REQUIRE_E2EE || "0") !== "0";
 const OFFLINE_UPLOAD_STREAM_HWM_BYTES = Math.max(
   1024 * 1024,
-  Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 64 * 1024 * 1024)
+  Number(process.env.OFFLINE_UPLOAD_STREAM_HWM_BYTES || 16 * 1024 * 1024)
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
   256 * 1024,
-  Number(process.env.UPLOAD_CHECKPOINT_EVERY_BYTES || 2 * 1024 * 1024)
+  Number(process.env.UPLOAD_CHECKPOINT_EVERY_BYTES || 8 * 1024 * 1024)
+);
+const UPLOAD_CHECKPOINT_MIN_INTERVAL_MS = Math.max(
+  250,
+  Number(process.env.UPLOAD_CHECKPOINT_MIN_INTERVAL_MS || 2500)
 );
 const INTENT_UNLOCK_TTL_ONCE_MS = Math.max(
   60 * 1000,
@@ -2492,11 +2496,12 @@ function maybeSendUploadProgress(t) {
   const now = Date.now();
   if (!t.lastProgressTs) t.lastProgressTs = 0;
   if (!t.lastProgressBytes) t.lastProgressBytes = 0;
+  if (!t.lastCheckpointTs) t.lastCheckpointTs = 0;
 
   const shouldSend =
-    now - t.lastProgressTs > 1000 ||
+    now - t.lastProgressTs > 450 ||
     t.bytesSent === t.bytesExpected ||
-    t.bytesSent - t.lastProgressBytes > 32 * 1024 * 1024;
+    t.bytesSent - t.lastProgressBytes > 8 * 1024 * 1024;
 
   if (!shouldSend) return;
 
@@ -2522,8 +2527,11 @@ function maybeSendUploadProgress(t) {
     plainTotalBytes
   });
 
-  if (!t.lastCheckpointBytes || (t.bytesSent - t.lastCheckpointBytes) >= UPLOAD_CHECKPOINT_EVERY_BYTES || t.bytesSent === totalBytes) {
+  const checkpointDueByBytes = !t.lastCheckpointBytes || (t.bytesSent - t.lastCheckpointBytes) >= UPLOAD_CHECKPOINT_EVERY_BYTES;
+  const checkpointDueByTime = now - t.lastCheckpointTs >= UPLOAD_CHECKPOINT_MIN_INTERVAL_MS;
+  if ((checkpointDueByBytes && checkpointDueByTime) || t.bytesSent === totalBytes) {
     t.lastCheckpointBytes = t.bytesSent;
+    t.lastCheckpointTs = now;
     updateIntentUploadCheckpoint(t.intent, t.bytesSent, {
       status: "uploading",
       transferState: "uploading"
@@ -2551,6 +2559,106 @@ function notifyUploadFailed(intent, intentId, message) {
   if (intent?.to) sendToUser(intent.to, payload);
 }
 
+function clearTransferAutoFinalizeTimer(t = null) {
+  if (!t || !t.autoFinalizeTimer) return;
+  try { clearTimeout(t.autoFinalizeTimer); } catch {}
+  t.autoFinalizeTimer = null;
+}
+
+function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
+  if (!intentId || !t || t.mode !== "offline") return false;
+  if (t.finalizing) return true;
+  if (!t.writeStream) return false;
+
+  t.finalizing = true;
+  clearTransferAutoFinalizeTimer(t);
+
+  const ws = senderWs || t.senderWs || null;
+  const finishIntent = () => {
+    activeTransfers.delete(intentId);
+    if (ws?.currentUploadIntentId === intentId) {
+      ws.currentUploadIntentId = null;
+    }
+
+    let intent;
+    try {
+      const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
+      intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
+      intent.stored = true;
+      intent.storedBytes = t.bytesExpected;
+      intent.plainStoredBytes = uploadBytesToPlainBytes(intent, t.bytesExpected);
+      intent.status = "stored";
+      intent.transferState = "delivered";
+      intent.uploadedAt = Date.now();
+      saveIntent(intent);
+    } catch (err) {
+      console.error("❌ Failed to finalize intent after upload:", err);
+      if (ws) {
+        send(ws, { type: "upload_failed", intentId, message: "Server failed finalizing upload" });
+      }
+      return;
+    }
+
+    const receiverSockets = getOnlineSocketsForUser(intent.to);
+    if (!intent.groupId && receiverSockets.length) {
+      const safeIntent = intentForClient(intent);
+      sendToUser(intent.to, {
+        type: "incoming_file",
+        intent: safeIntent
+      });
+      try {
+        sendToUser(intent.to, { type: "inbox", items: loadIntentsForUser(intent.to) });
+      } catch {}
+
+      const iosSocket = receiverSockets.find((sock) => String(sock?.client || "").toLowerCase() === "ios");
+      if (iosSocket) {
+        send(iosSocket, {
+          type: "prepare_transfer",
+          intentId
+        });
+      }
+    }
+
+    if (intent.groupId) {
+      finalizeGroupRecipientCopies(intent, {
+        storedBytes: Number(intent.storedBytes || t.bytesExpected || 0),
+        totalBytes: Number(t.bytesExpected || resolveUploadExpectedBytes(intent) || 0),
+        uploadedAt: intent.uploadedAt
+      });
+    }
+
+    emitTransferState(intent, "delivered", {
+      sentBytes: Number(intent.storedBytes || t.bytesExpected || 0),
+      totalBytes: Number(t.bytesExpected || resolveUploadExpectedBytes(intent) || 0),
+      plainSentBytes: Number(intent.plainStoredBytes || intent.fileSize || 0),
+      plainTotalBytes: Number(intent.fileSize || 0)
+    });
+
+    if (ws) {
+      send(ws, { type: "upload_done", intentId, autoFinalized: Boolean(options?.auto) });
+    }
+  };
+
+  try {
+    if (ws?.currentUploadIntentId === intentId) {
+      ws.currentUploadIntentId = null;
+    }
+    t.writeStream.end(() => finishIntent());
+  } catch {
+    t.finalizing = false;
+    activeTransfers.delete(intentId);
+    if (ws?.currentUploadIntentId === intentId) {
+      ws.currentUploadIntentId = null;
+    }
+    if (ws) {
+      send(ws, { type: "error", message: "Failed to finalize stored file" });
+    }
+    return false;
+  }
+
+  return true;
+}
+
 function failActiveTransfer(intentId, message, options = {}) {
   if (!intentId) return null;
   const t = activeTransfers.get(intentId);
@@ -2562,6 +2670,7 @@ function failActiveTransfer(intentId, message, options = {}) {
   const retryable = options.retryable != null ? Boolean(options.retryable) : preservePartial;
   const discardPartial = Boolean(options.discardPartial);
   const bytesUploaded = Number(t?.bytesSent || 0);
+  clearTransferAutoFinalizeTimer(t);
 
   try { t?.tcp?.destroy(); } catch {}
   try { t?.writeStream?.destroy(); } catch {}
@@ -3871,6 +3980,19 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
       if (t.bytesSent >= t.nextLogBytes) {
         console.log(`💾 Stored ${t.bytesSent}/${t.bytesExpected} bytes`);
         t.nextLogBytes += 64 * 1024 * 1024;
+      }
+
+      // Safety net: if all bytes arrived but upload_end is lost,
+      // finalize automatically so large uploads never stay stuck.
+      if (t.bytesSent === t.bytesExpected && !t.finalizing && !t.autoFinalizeTimer) {
+        t.autoFinalizeTimer = setTimeout(() => {
+          const current = activeTransfers.get(intentId);
+          if (!current || current !== t) return;
+          if (current.mode !== "offline" || current.finalizing) return;
+          if (current.bytesSent !== current.bytesExpected) return;
+          console.warn(`ℹ️ Auto-finalizing upload_end for ${intentId}`);
+          finalizeOfflineTransfer(intentId, current, ws, { auto: true });
+        }, 1200);
       }
       return;
     }
@@ -5765,6 +5887,7 @@ if (data.type === "upload_end") {
 
   // LIVE MODE: close TCP and HARD RESET upload state
 if (t.mode === "live") {
+  clearTransferAutoFinalizeTimer(t);
   try { t.tcp?.end(); } catch {}
 
   // 🔥 CRITICAL: clear upload association BEFORE anything else
@@ -5800,87 +5923,8 @@ if (t.mode === "live") {
 }
 
 
-  // OFFLINE MODE: close the file stream and only then ack upload_done
-  // OFFLINE MODE: finalize file, update intent, notify receiver
 if (t.mode === "offline") {
-  const done = () => {
-    activeTransfers.delete(intentId);
-    ws.currentUploadIntentId = null;
-
-    let intent;
-    try {
-      const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
-      intent = JSON.parse(fs.readFileSync(intentFile, "utf8"));
-intent.stored = true;
-intent.storedBytes = t.bytesExpected;
-intent.plainStoredBytes = uploadBytesToPlainBytes(intent, t.bytesExpected);
-intent.status = "stored";
-intent.transferState = "delivered";
-intent.uploadedAt = Date.now();
-saveIntent(intent);
-
-    } catch (err) {
-      console.error("❌ Failed to finalize intent after upload:", err);
-      send(ws, { type: "upload_failed", intentId, message: "Server failed finalizing upload" });
-      return;
-    }
-    //test
-
-    // 🔔 IMPORTANT: notify recipient that file is now ready
-    // 🔔 IMPORTANT: notify recipient that file is now ready
-const receiverSockets = getOnlineSocketsForUser(intent.to);
-if (!intent.groupId && receiverSockets.length) {
-  const safeIntent = intentForClient(intent);
-  sendToUser(intent.to, {
-    type: "incoming_file",
-    intent: safeIntent
-  });
-  try {
-    sendToUser(intent.to, { type: "inbox", items: loadIntentsForUser(intent.to) });
-  } catch {}
-
-  // ✅ FIX 2: if recipient is iOS, immediately trigger TCP download
-  const iosSocket = receiverSockets.find((sock) => String(sock?.client || "").toLowerCase() === "ios");
-  if (iosSocket) {
-    send(iosSocket, {
-      type: "prepare_transfer",
-      intentId
-    });
-  }
-}
-
-if (intent.groupId) {
-  finalizeGroupRecipientCopies(intent, {
-    storedBytes: Number(intent.storedBytes || t.bytesExpected || 0),
-    totalBytes: Number(t.bytesExpected || resolveUploadExpectedBytes(intent) || 0),
-    uploadedAt: intent.uploadedAt
-  });
-}
-
-emitTransferState(intent, "delivered", {
-  sentBytes: Number(intent.storedBytes || t.bytesExpected || 0),
-  totalBytes: Number(t.bytesExpected || resolveUploadExpectedBytes(intent) || 0),
-  plainSentBytes: Number(intent.plainStoredBytes || intent.fileSize || 0),
-  plainTotalBytes: Number(intent.fileSize || 0)
-});
-
-
-    // ✅ acknowledge sender (iOS)
-    send(ws, { type: "upload_done", intentId });
-  };
-
-  try {
-  // Prevent any further binary frames from being associated with this intent
-  ws.currentUploadIntentId = null;
-
-  t.writeStream.end(() => done());
-} catch {
-
-    activeTransfers.delete(intentId);
-    ws.currentUploadIntentId = null;
-    return send(ws, { type: "error", message: "Failed to finalize stored file" });
-  }
-
+  finalizeOfflineTransfer(intentId, t, ws, { auto: false });
   return;
 }
 
