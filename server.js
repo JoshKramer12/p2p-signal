@@ -3656,16 +3656,8 @@ function queueGuestTransferRequest(raw = {}) {
     .slice(0, 200);
   saveGuestTransferRequestsIndex();
   sendGuestTransferRequestsUpdate(target);
-  const guestName = String(normalized?.fromGuestDisplayName || "").trim() || "Guest";
-  const threadLabel = String(normalized?.threadName || "").trim() || "Quick transfer";
-  queuePushNotificationForUser(target, {
-    title: "Merm",
-    body: `${guestName} sent a quick transfer request (${threadLabel}).`,
-    intentId: String(normalized?.id || "").trim(),
-    chatKey: `quick:${String(normalized?.threadId || "").trim()}`,
-    sender: guestName,
-    groupId: ""
-  });
+  // Push banners are reserved for real message/file delivery intents.
+  // Quick-transfer request rows update in-app via websocket + badge only.
   return { ok: true, targetUsername: target, request: normalized };
 }
 
