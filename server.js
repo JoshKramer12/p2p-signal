@@ -1675,6 +1675,7 @@ function deleteIntentAndNotify(intent) {
 
   const senderOnline = isUserOnline(intent.from);
   const receiverOnline = isUserOnline(intent.to);
+  const suppressRecipientNotice = isIntentDeliveryHeld(intent);
   const payload = {
     type: "intent_deleted",
     intentId: intent.id,
@@ -1683,8 +1684,8 @@ function deleteIntentAndNotify(intent) {
     to: intent.to
   };
   if (!senderOnline) queueIntentDeletionForUser(intent.from, payload);
-  if (!receiverOnline) queueIntentDeletionForUser(intent.to, payload);
-  if (receiverOnline) sendToUser(intent.to, payload);
+  if (!receiverOnline && !suppressRecipientNotice) queueIntentDeletionForUser(intent.to, payload);
+  if (receiverOnline && !suppressRecipientNotice) sendToUser(intent.to, payload);
   if (senderOnline) sendToUser(intent.from, payload);
 }
 
@@ -2281,6 +2282,52 @@ function loadIntent(intentId) {
   }
 }
 
+function isIntentDeliveryHeld(intent = null) {
+  if (!intent || typeof intent !== "object") return false;
+  const isText = Boolean(intent.isTextOnly || String(intent.messageType || "").toLowerCase() === "text");
+  if (isText) return false;
+  const silent = Boolean(intent.silentPreupload || intent.deliveryHold);
+  if (!silent) return false;
+  const releasedAt = Number(intent.releasedAt || 0);
+  return !(Number.isFinite(releasedAt) && releasedAt > 0);
+}
+
+function markIntentReleased(intent = null, releasedAt = Date.now()) {
+  if (!intent || typeof intent !== "object") return false;
+  const ts = Number(releasedAt || Date.now()) || Date.now();
+  intent.silentPreupload = false;
+  intent.deliveryHold = false;
+  intent.releasedAt = ts;
+  intent.updatedAt = ts;
+  return true;
+}
+
+function buildPushPayloadForIntent(intentRecord = {}) {
+  const senderUsername = String(intentRecord?.from || "").trim();
+  const senderLabel = userDisplayName(senderUsername) || senderUsername || "New message";
+  const isTextMessage = Boolean(
+    intentRecord?.isTextOnly ||
+    String(intentRecord?.messageType || "").toLowerCase() === "text"
+  );
+  const previewText = String(intentRecord?.plainText || intentRecord?.text || "")
+    .trim()
+    .replace(/\s+/g, " ");
+  const fileLabel = String(intentRecord?.fileName || "").trim();
+  const body = isTextMessage
+    ? (previewText || "New message")
+    : (fileLabel ? `Sent ${fileLabel}` : "Sent a file");
+  return {
+    title: senderLabel,
+    body: body.slice(0, 220),
+    intentId: String(intentRecord?.id || "").trim(),
+    chatKey: String(intentRecord?.groupId || "").trim()
+      ? groupChatKey(intentRecord.groupId)
+      : senderUsername,
+    sender: senderUsername,
+    groupId: String(intentRecord?.groupId || "").trim()
+  };
+}
+
 function generateSessionToken() {
   return randomUUID() + randomUUID();
 }
@@ -2318,6 +2365,7 @@ function loadIntentsForUser(username) {
     const isParticipant = intent.to === key || intent.from === key;
     if (!isParticipant) continue;
     if (intent?.isGroupRecipientCopy && intent.from === key && intent.to !== key) continue;
+    if (isIntentDeliveryHeld(intent)) continue;
     if (!intent.downloadToken && !(intent.isTextOnly || intent.messageType === "text")) {
         intent.downloadToken = generateDownloadToken();
         const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
@@ -2458,14 +2506,17 @@ function uploadBytesToPlainBytes(intent, uploadBytes) {
 
 function emitTransferState(intent, state, extra = {}) {
   if (!intent || !intent.id) return;
+  const deliveryHeld = isIntentDeliveryHeld(intent);
   const normalizedState = String(state || "").trim() || "queued";
   const payload = {
     type: "transfer_state",
     intentId: intent.id,
     from: intent.from,
     to: intent.to,
+    groupId: String(intent.groupId || ""),
     state: normalizedState,
     at: Date.now(),
+    deliveryHeld,
     sentBytes: Number(extra.sentBytes || 0),
     totalBytes: Number(extra.totalBytes || resolveUploadExpectedBytes(intent) || 0),
     plainSentBytes: Number(
@@ -2482,7 +2533,7 @@ function emitTransferState(intent, state, extra = {}) {
     message: String(extra.message || "")
   };
   if (intent?.from) sendToUser(intent.from, payload);
-  if (intent?.to) sendToUser(intent.to, payload);
+  if (intent?.to && !deliveryHeld) sendToUser(intent.to, payload);
 }
 
 function updateIntentUploadCheckpoint(intent, sentBytes, options = {}) {
@@ -2520,7 +2571,7 @@ function maybeSendUploadProgress(t) {
   const plainSentBytes = uploadBytesToPlainBytes(t.intent, t.bytesSent);
   const plainTotalBytes = Number(t.intent?.fileSize || 0) || uploadBytesToPlainBytes(t.intent, totalBytes);
 
-  if (isUserOnline(t.intent.to)) {
+  if (!isIntentDeliveryHeld(t.intent) && isUserOnline(t.intent.to)) {
     sendToUser(t.intent.to, {
       type: "incoming_progress",
       intentId: t.intent.id,
@@ -2563,9 +2614,9 @@ function resumeWsInbound(ws) {
 }
 
 function notifyUploadFailed(intent, intentId, message) {
-  const payload = { type: "upload_failed", intentId, message };
+  const payload = { type: "upload_failed", intentId, message, deliveryHeld: isIntentDeliveryHeld(intent) };
   if (intent?.from) sendToUser(intent.from, payload);
-  if (intent?.to) sendToUser(intent.to, payload);
+  if (intent?.to && !isIntentDeliveryHeld(intent)) sendToUser(intent.to, payload);
 }
 
 function clearTransferAutoFinalizeTimer(t = null) {
@@ -2609,7 +2660,7 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
     }
 
     const receiverSockets = getOnlineSocketsForUser(intent.to);
-    if (!intent.groupId && receiverSockets.length) {
+    if (!intent.groupId && receiverSockets.length && !isIntentDeliveryHeld(intent)) {
       const safeIntent = intentForClient(intent);
       sendToUser(intent.to, {
         type: "incoming_file",
@@ -2644,7 +2695,12 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
     });
 
     if (ws) {
-      send(ws, { type: "upload_done", intentId, autoFinalized: Boolean(options?.auto) });
+      send(ws, {
+        type: "upload_done",
+        intentId,
+        autoFinalized: Boolean(options?.auto),
+        deliveryHeld: isIntentDeliveryHeld(intent)
+      });
     }
   };
 
@@ -2765,6 +2821,7 @@ function finalizeGroupRecipientCopies(primaryIntent, options = {}) {
 
     const sockets = getOnlineSocketsForUser(mirror.to);
     if (!sockets.length) return;
+    if (isIntentDeliveryHeld(mirror)) return;
     sendToUser(mirror.to, { type: "incoming_file", intent: intentForClient(mirror) });
     try {
       sendToUser(mirror.to, { type: "inbox", items: loadIntentsForUser(mirror.to) });
@@ -5861,7 +5918,12 @@ if (data.type === "upload_end") {
       return send(ws, { type: "error", message: "Not sender", intentId });
     }
     if (intent.stored && intent.storedFile) {
-      return send(ws, { type: "upload_done", intentId, alreadyStored: true });
+      return send(ws, {
+        type: "upload_done",
+        intentId,
+        alreadyStored: true,
+        deliveryHeld: isIntentDeliveryHeld(intent)
+      });
     }
     return send(ws, {
       type: "error",
@@ -5931,7 +5993,7 @@ if (t.mode === "live") {
     }
   }
 
-  send(ws, { type: "upload_done", intentId });
+  send(ws, { type: "upload_done", intentId, deliveryHeld: isIntentDeliveryHeld(t.intent) });
   return;
 }
 
@@ -5945,7 +6007,11 @@ if (t.mode === "offline") {
   // fallback
   activeTransfers.delete(intentId);
   ws.currentUploadIntentId = null;
-  return send(ws, { type: "upload_done", intentId });
+  return send(ws, {
+    type: "upload_done",
+    intentId,
+    deliveryHeld: Boolean(t.intent ? isIntentDeliveryHeld(t.intent) : false)
+  });
 }
 
 
@@ -5972,6 +6038,7 @@ if (data.type === "send_intent") {
   const plainText = typeof data.plainText === "string" ? data.plainText.trim().slice(0, 5000) : "";
   const isTextOnly = Boolean(data.isTextOnly) || ((!!text || !!plainText) && !fileName && !fileSize);
   const clientIntentId = String(data.clientIntentId || "").trim();
+  const silentPreupload = Boolean(data.silentPreupload) && !isTextOnly;
   const now = Date.now();
   const rawExpiresAt = Number(data.expiresAt || 0);
   const hasCustomExpiry = Number.isFinite(rawExpiresAt) && rawExpiresAt > 0;
@@ -6071,7 +6138,8 @@ if (data.type === "send_intent") {
       const receiverOnline = isUserOnline(existing.to);
       const receiverSockets = receiverOnline ? getOnlineSocketsForUser(existing.to) : [];
       const receiverClient = receiverSockets[0]?.client || null;
-      if (receiverOnline && !isGroupSend) {
+      const existingHeld = isIntentDeliveryHeld(existing);
+      if (receiverOnline && !isGroupSend && !existingHeld) {
         const safeExistingIntent = intentForClient(existing);
         if (existing.isTextOnly || existing.messageType === "text") {
           sendToUser(existing.to, { type: "incoming_file", intent: safeExistingIntent });
@@ -6082,15 +6150,17 @@ if (data.type === "send_intent") {
       }
       if (isGroupSend) {
         const gKey = groupChatKey(existing.groupId || requestedGroupId || "");
-        if (gKey) {
+        if (gKey && !existingHeld) {
           const members = targetGroup?.members?.length ? targetGroup.members : (existing.groupMembers || []);
           normalizeGroupMembers(members).forEach((member) => {
             touchUserChatOrder(member, gKey);
           });
         }
       } else {
-        touchUserChatOrder(ws.username, existing.to);
-        touchUserChatOrder(existing.to, ws.username);
+        if (!existingHeld) {
+          touchUserChatOrder(ws.username, existing.to);
+          touchUserChatOrder(existing.to, ws.username);
+        }
       }
     return send(ws, {
         type: "intent_ok",
@@ -6113,6 +6183,7 @@ if (data.type === "send_intent") {
         passwordMode: getIntentPasswordMode(existing),
         passwordHint: String(existing.passwordHint || ""),
         customExpiry: hasIntentCustomExpiry(existing),
+        deliveryHeld: existingHeld,
         transferState: existing.transferState || (existing.readByRecipientAt ? "read" : (existing.stored ? "delivered" : "queued"))
       });
     }
@@ -6134,6 +6205,9 @@ if (data.type === "send_intent") {
     passwordHint: passwordHint || "",
     uploadBytesExpected: isTextOnly ? 0 : uploadBytesExpected,
     createdAt: now,
+    releasedAt: silentPreupload ? 0 : now,
+    silentPreupload,
+    deliveryHold: silentPreupload,
     expiresAt,
     customExpiry: Boolean(!isTextOnly && hasCustomExpiry && expiresAt > 0),
     status: isTextOnly ? "completed" : "pending",
@@ -6191,63 +6265,48 @@ if (data.type === "send_intent") {
     saveIntent(intent);
   }
 
-  const buildPushPayloadForIntent = (intentRecord = {}) => {
-    const senderUsername = String(intentRecord?.from || "").trim();
-    const senderLabel = userDisplayName(senderUsername) || senderUsername || "New message";
-    const isTextMessage = Boolean(intentRecord?.isTextOnly || String(intentRecord?.messageType || "").toLowerCase() === "text");
-    const previewText = String(intentRecord?.plainText || intentRecord?.text || "").trim().replace(/\s+/g, " ");
-    const fileLabel = String(intentRecord?.fileName || "").trim();
-    const body = isTextMessage
-      ? (previewText || "New message")
-      : (fileLabel ? `Sent ${fileLabel}` : "Sent a file");
-    return {
-      title: senderLabel,
-      body: body.slice(0, 220),
-      intentId: String(intentRecord?.id || "").trim(),
-      chatKey: String(intentRecord?.groupId || "").trim()
-        ? groupChatKey(intentRecord.groupId)
-        : senderUsername,
-      sender: senderUsername,
-      groupId: String(intentRecord?.groupId || "").trim()
-    };
-  };
+  const intentHeld = isIntentDeliveryHeld(intent);
 
   if (isGroupSend) {
-    for (const mirrorIntent of mirrorIntents) {
-      if (!isUserOnline(mirrorIntent.to)) continue;
-      const safeIntent = intentForClient(mirrorIntent);
-      if (isTextOnly) {
-        sendToUser(mirrorIntent.to, { type: "incoming_file", intent: safeIntent });
-      } else {
-        sendToUser(mirrorIntent.to, { type: "incoming_intent", intent: safeIntent });
+    if (!intentHeld) {
+      for (const mirrorIntent of mirrorIntents) {
+        if (!isUserOnline(mirrorIntent.to)) continue;
+        const safeIntent = intentForClient(mirrorIntent);
+        if (isTextOnly) {
+          sendToUser(mirrorIntent.to, { type: "incoming_file", intent: safeIntent });
+        } else {
+          sendToUser(mirrorIntent.to, { type: "incoming_intent", intent: safeIntent });
+        }
+        try {
+          sendToUser(mirrorIntent.to, { type: "inbox", items: loadIntentsForUser(mirrorIntent.to) });
+        } catch {}
       }
-      try {
-        sendToUser(mirrorIntent.to, { type: "inbox", items: loadIntentsForUser(mirrorIntent.to) });
-      } catch {}
+      mirrorIntents.forEach((mirrorIntent) => {
+        queuePushNotificationForUser(mirrorIntent.to, buildPushPayloadForIntent(mirrorIntent));
+      });
     }
-    mirrorIntents.forEach((mirrorIntent) => {
-      queuePushNotificationForUser(mirrorIntent.to, buildPushPayloadForIntent(mirrorIntent));
-    });
   } else {
-    if (isUserOnline(to)) {
-      const safeIntent = intentForClient(intent);
-      if (isTextOnly) {
-        sendToUser(to, { type: "incoming_file", intent: safeIntent });
-      } else {
-        sendToUser(to, { type: "incoming_intent", intent: safeIntent });
+    if (!intentHeld) {
+      if (isUserOnline(to)) {
+        const safeIntent = intentForClient(intent);
+        if (isTextOnly) {
+          sendToUser(to, { type: "incoming_file", intent: safeIntent });
+        } else {
+          sendToUser(to, { type: "incoming_intent", intent: safeIntent });
+        }
+        try {
+          sendToUser(to, { type: "inbox", items: loadIntentsForUser(to) });
+        } catch {}
       }
-      try {
-        sendToUser(to, { type: "inbox", items: loadIntentsForUser(to) });
-      } catch {}
-    }
-    if (to !== ws.username) {
-      queuePushNotificationForUser(to, buildPushPayloadForIntent(intent));
+      if (to !== ws.username) {
+        queuePushNotificationForUser(to, buildPushPayloadForIntent(intent));
+      }
     }
   }
 
   // Keep all sender devices fully in sync (web + app) without waiting for polling.
   // For self-send (to === sender), sender already receives the regular recipient push above.
-  const shouldBroadcastSenderDevices = isGroupSend || to !== ws.username;
+  const shouldBroadcastSenderDevices = !intentHeld && (isGroupSend || to !== ws.username);
   if (shouldBroadcastSenderDevices && isUserOnline(ws.username)) {
     const senderIntent = intentForClient(intent);
     if (isTextOnly) {
@@ -6260,25 +6319,27 @@ if (data.type === "send_intent") {
     } catch {}
   }
 
-  if (isGroupSend) {
+  if (!intentHeld && isGroupSend) {
     const groupKey = groupChatKey(targetGroup?.id || "");
     if (groupKey) {
       [ws.username, ...groupRecipients].forEach((member) => {
         touchUserChatOrder(member, groupKey);
       });
     }
-  } else {
+  } else if (!intentHeld) {
     touchUserChatOrder(ws.username, to);
     touchUserChatOrder(to, ws.username);
   }
 
-  emitTransferState(intent, intent.transferState || "queued", {
-    sentBytes: Number(intent.storedBytes || 0),
-    totalBytes: resolveUploadExpectedBytes(intent),
-    plainSentBytes: Number(intent.plainStoredBytes || 0),
-    plainTotalBytes: Number(intent.fileSize || 0),
-    retryable: false
-  });
+  if (!intentHeld) {
+    emitTransferState(intent, intent.transferState || "queued", {
+      sentBytes: Number(intent.storedBytes || 0),
+      totalBytes: resolveUploadExpectedBytes(intent),
+      plainSentBytes: Number(intent.plainStoredBytes || 0),
+      plainTotalBytes: Number(intent.fileSize || 0),
+      retryable: false
+    });
+  }
 
   // ✅ Always acknowledge sender
   return send(ws, {
@@ -6308,7 +6369,183 @@ if (data.type === "send_intent") {
     passwordMode: getIntentPasswordMode(intent),
     passwordHint: String(intent.passwordHint || ""),
     customExpiry: hasIntentCustomExpiry(intent),
+    deliveryHeld: intentHeld,
     transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued"))
+  });
+}
+
+
+if (data.type === "release_preupload") {
+  const intentId = String(data.intentId || "").trim();
+  const requestId = String(data.requestId || "").trim();
+  const failRelease = (message = "Could not release preupload") => {
+    return send(ws, {
+      type: "release_preupload_error",
+      requestId,
+      intentId,
+      message: String(message || "Could not release preupload")
+    });
+  };
+
+  if (!intentId) {
+    return failRelease("Missing intentId");
+  }
+
+  const primaryIntent = loadIntent(intentId);
+  if (!primaryIntent) {
+    return failRelease("Intent not found");
+  }
+  if (primaryIntent.from !== ws.username) {
+    return failRelease("Not authorized");
+  }
+  if (primaryIntent.isTextOnly || String(primaryIntent.messageType || "").toLowerCase() === "text") {
+    return failRelease("Only file intents can be released");
+  }
+
+  const now = Date.now();
+  const requestedName = String(data.fileName || "").trim();
+  const nextFileName = requestedName ? safeBasename(requestedName) : String(primaryIntent.fileName || "");
+  if (!nextFileName) {
+    return failRelease("Missing file name");
+  }
+  const nextNote = typeof data.note === "string"
+    ? data.note.trim().slice(0, 500)
+    : String(primaryIntent.note || "");
+
+  const rawExpiresAt = Number(data.expiresAt || 0);
+  const hasCustomExpiry = Number.isFinite(rawExpiresAt) && rawExpiresAt > 0;
+  const nextExpiresAt = hasCustomExpiry ? sanitizeIntentExpiresAt(rawExpiresAt, now) : 0;
+
+  const hasAccessControlUpdate = Object.prototype.hasOwnProperty.call(data || {}, "accessControl");
+  const sanitizedAccessControl = sanitizeIntentAccessControl(data.accessControl || null, false);
+  if (hasAccessControlUpdate && data.accessControl && !sanitizedAccessControl) {
+    return failRelease("Invalid password protection payload");
+  }
+
+  const finalAccessControl = hasAccessControlUpdate
+    ? (sanitizedAccessControl || null)
+    : (primaryIntent.accessControl || null);
+  const finalPasswordHint = sanitizeIntentPasswordHint(
+    data.passwordHint,
+    false,
+    finalAccessControl
+  );
+  const finalPasswordMode = finalAccessControl
+    ? normalizeIntentPasswordMode(finalAccessControl.unlockMode || finalAccessControl.passwordMode || "once", "once")
+    : "once";
+
+  const intentsToUpdate = [primaryIntent];
+  if (String(primaryIntent.groupId || "").trim()) {
+    const mirrorIds = Array.isArray(primaryIntent.groupMirrorIntentIds)
+      ? primaryIntent.groupMirrorIntentIds
+      : [];
+    mirrorIds.forEach((mirrorId) => {
+      const mirror = loadIntent(String(mirrorId || "").trim());
+      if (!mirror) return;
+      if (mirror.from !== ws.username) return;
+      intentsToUpdate.push(mirror);
+    });
+  }
+
+  const updatedIntents = [];
+  for (const intent of intentsToUpdate) {
+    const heldBefore = isIntentDeliveryHeld(intent);
+    if (heldBefore) {
+      markIntentReleased(intent, now);
+    } else {
+      intent.updatedAt = now;
+      intent.releasedAt = Number(intent.releasedAt || now) || now;
+      intent.silentPreupload = false;
+      intent.deliveryHold = false;
+    }
+
+    intent.fileName = nextFileName;
+    intent.note = nextNote;
+    intent.expiresAt = nextExpiresAt;
+    intent.customExpiry = Boolean(nextExpiresAt > 0);
+    intent.accessControl = finalAccessControl
+      ? JSON.parse(JSON.stringify(finalAccessControl))
+      : null;
+    intent.passwordProtected = Boolean(finalAccessControl);
+    intent.passwordMode = finalPasswordMode;
+    intent.passwordHint = finalAccessControl ? finalPasswordHint : "";
+    intent.updatedAt = now;
+    saveIntent(intent);
+    updatedIntents.push({ intent, heldBefore });
+  }
+
+  const releasedNow = updatedIntents.some((entry) => Boolean(entry.heldBefore));
+
+  if (releasedNow) {
+    for (const { intent, heldBefore } of updatedIntents) {
+      if (!heldBefore) continue;
+
+      const to = String(intent.to || "").trim();
+      if (!to || to === ws.username) continue;
+
+      if (isUserOnline(to)) {
+        const safeIntent = intentForClient(intent);
+        if (intent.stored) {
+          sendToUser(to, { type: "incoming_file", intent: safeIntent });
+        } else {
+          sendToUser(to, { type: "incoming_intent", intent: safeIntent });
+        }
+        try {
+          sendToUser(to, { type: "inbox", items: loadIntentsForUser(to) });
+        } catch {}
+      }
+
+      queuePushNotificationForUser(to, buildPushPayloadForIntent(intent));
+    }
+
+    if (String(primaryIntent.groupId || "").trim()) {
+      const gKey = groupChatKey(primaryIntent.groupId);
+      if (gKey) {
+        const touched = new Set([ws.username]);
+        updatedIntents.forEach(({ intent }) => {
+          const to = String(intent.to || "").trim();
+          if (to) touched.add(to);
+        });
+        touched.forEach((member) => touchUserChatOrder(member, gKey));
+      }
+    } else {
+      const to = String(primaryIntent.to || "").trim();
+      if (to) {
+        touchUserChatOrder(ws.username, to);
+        touchUserChatOrder(to, ws.username);
+      }
+    }
+  }
+
+  try {
+    sendToUser(ws.username, { type: "inbox", items: loadIntentsForUser(ws.username) });
+  } catch {}
+
+  const primaryAfter = loadIntent(intentId) || primaryIntent;
+  emitTransferState(primaryAfter, String(primaryAfter.transferState || (primaryAfter.stored ? "delivered" : "queued")), {
+    sentBytes: Number(primaryAfter.storedBytes || 0),
+    totalBytes: Number(resolveUploadExpectedBytes(primaryAfter) || primaryAfter.uploadBytesExpected || primaryAfter.fileSize || 0),
+    plainSentBytes: Number(primaryAfter.plainStoredBytes || uploadBytesToPlainBytes(primaryAfter, Number(primaryAfter.storedBytes || 0))),
+    plainTotalBytes: Number(primaryAfter.fileSize || 0),
+    retryable: false
+  });
+
+  return send(ws, {
+    type: "release_preupload_ok",
+    requestId,
+    intentId: primaryAfter.id,
+    to: String(primaryAfter.to || ""),
+    groupId: String(primaryAfter.groupId || ""),
+    released: releasedNow,
+    alreadyReleased: !releasedNow,
+    transferState: String(primaryAfter.transferState || (primaryAfter.stored ? "delivered" : "queued")),
+    deliveryHeld: isIntentDeliveryHeld(primaryAfter),
+    stored: Boolean(primaryAfter.stored),
+    expiresAt: Number(primaryAfter.expiresAt || 0),
+    customExpiry: Boolean(primaryAfter.customExpiry),
+    passwordProtected: isIntentPasswordProtected(primaryAfter),
+    passwordMode: getIntentPasswordMode(primaryAfter),
+    passwordHint: String(primaryAfter.passwordHint || "")
   });
 }
 
