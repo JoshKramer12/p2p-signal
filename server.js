@@ -373,7 +373,7 @@ function waitMs(ms = 0) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms || 0))));
 }
 
-function sendApnsToDevice({ token, topic, payload, host = "" }) {
+function sendApnsToDevice({ token, topic, payload, host = "", collapseId = "" }) {
   return new Promise((resolve) => {
     if (!APNS_ENABLED) {
       resolve({ ok: false, status: 0, reason: "apns-disabled" });
@@ -387,14 +387,18 @@ function sendApnsToDevice({ token, topic, payload, host = "" }) {
       return;
     }
 
-    const req = client.request({
+    const headers = {
       ":method": "POST",
       ":path": `/3/device/${token}`,
       "apns-topic": topic || APNS_TOPIC,
       "apns-push-type": "alert",
       "apns-priority": "10",
       "authorization": `bearer ${jwt}`
-    });
+    };
+    const collapse = String(collapseId || "").trim();
+    if (collapse) headers["apns-collapse-id"] = collapse.slice(0, 64);
+
+    const req = client.request(headers);
 
     let status = 0;
     let responseBody = "";
@@ -452,7 +456,8 @@ function queuePushNotificationForUser(username = "", payload = {}) {
       alert: { title, body },
       badge: badgeCount,
       sound: "default",
-      "content-available": 1
+      "content-available": 1,
+      "thread-id": chatKey || sender || "merm"
     },
     merm: {
       intentId,
@@ -463,6 +468,7 @@ function queuePushNotificationForUser(username = "", payload = {}) {
   };
 
   setImmediate(async () => {
+    const pushEventId = (intentId || `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`).slice(0, 64);
     for (const device of devices) {
       const token = normalizePushDeviceToken(device.token);
       if (!token) continue;
@@ -474,7 +480,8 @@ function queuePushNotificationForUser(username = "", payload = {}) {
         token,
         topic,
         payload: apnsPayload,
-        host: preferredHost
+        host: preferredHost,
+        collapseId: pushEventId
       });
 
       if (!result.ok && isTransientApnsFailure(result)) {
@@ -486,7 +493,8 @@ function queuePushNotificationForUser(username = "", payload = {}) {
             token,
             topic,
             payload: apnsPayload,
-            host: preferredHost
+            host: preferredHost,
+            collapseId: pushEventId
           });
         }
       }
@@ -497,7 +505,8 @@ function queuePushNotificationForUser(username = "", payload = {}) {
           token,
           topic,
           payload: apnsPayload,
-          host: alternateHost
+          host: alternateHost,
+          collapseId: pushEventId
         });
         if (retryOtherHost.ok) {
           result = retryOtherHost;
