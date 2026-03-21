@@ -3452,8 +3452,12 @@ function touchUserChatOrder(username = "", chatKey = "") {
   const key = normalizeChatStateKey(chatKey);
   if (!key) return null;
   return updateUserChatState(username, (draft) => {
-    draft.order = [key, ...draft.order.filter((entry) => entry !== key)];
-    return true;
+    const nextOrder = [key, ...draft.order.filter((entry) => entry !== key)];
+    const changed = !sameStringList(draft.order, nextOrder);
+    if (changed) {
+      draft.order = nextOrder;
+    }
+    return changed;
   });
 }
 
