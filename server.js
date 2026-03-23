@@ -63,6 +63,8 @@ const ADMIN_USERNAMES = new Set(
 );
 const CHAT_STATE_MAX_KEYS = Math.max(128, Number(process.env.CHAT_STATE_MAX_KEYS || 2000));
 const QUICK_CHATS_MAX_ITEMS = Math.max(50, Number(process.env.QUICK_CHATS_MAX_ITEMS || 500));
+const CHAT_STATE_MAX_NICKNAMES = Math.max(64, Number(process.env.CHAT_STATE_MAX_NICKNAMES || 1000));
+const CHAT_STATE_MAX_ALIASES = Math.max(64, Number(process.env.CHAT_STATE_MAX_ALIASES || 1000));
 const FILE_HOLDER_MAX_ITEMS = Math.max(20, Number(process.env.FILE_HOLDER_MAX_ITEMS || 200));
 const FILE_HOLDER_MAX_FILE_BYTES = Math.max(
   1024 * 1024,
@@ -3362,12 +3364,26 @@ function ensureUserShape(u) {
     const fallbackPins = Array.isArray(u.profile?.pinnedContacts) ? u.profile.pinnedContacts : [];
     u.chatState.pins = fallbackPins;
   }
+  if (!u.chatState.nicknames || typeof u.chatState.nicknames !== "object" || Array.isArray(u.chatState.nicknames)) {
+    const legacyNicknames = u.profile?.contactNicknames;
+    u.chatState.nicknames = (legacyNicknames && typeof legacyNicknames === "object" && !Array.isArray(legacyNicknames))
+      ? { ...legacyNicknames }
+      : {};
+  }
+  if (!u.chatState.chatAliases || typeof u.chatState.chatAliases !== "object" || Array.isArray(u.chatState.chatAliases)) {
+    const legacyAliases = u.profile?.chatAliases;
+    u.chatState.chatAliases = (legacyAliases && typeof legacyAliases === "object" && !Array.isArray(legacyAliases))
+      ? { ...legacyAliases }
+      : {};
+  }
   if (!Number.isFinite(Number(u.chatState.version))) u.chatState.version = 1;
   if (!Number.isFinite(Number(u.chatState.updatedAt))) u.chatState.updatedAt = Date.now();
 
   u.chatState.order = sanitizeChatStateKeys(u.chatState.order);
   u.chatState.manualUnread = sanitizeChatStateKeys(u.chatState.manualUnread);
   u.chatState.pins = sanitizeChatStateKeys(u.chatState.pins);
+  u.chatState.nicknames = sanitizeContactNicknamesMap(u.chatState.nicknames, u);
+  u.chatState.chatAliases = sanitizeChatAliasesMap(u.chatState.chatAliases, u);
   u.chatState.version = Math.max(1, Math.floor(Number(u.chatState.version || 1)));
   u.chatState.updatedAt = Math.max(0, Math.floor(Number(u.chatState.updatedAt || Date.now())));
 
@@ -3382,6 +3398,8 @@ function ensureUserShape(u) {
   } else if (!profilePins.length && !u.chatState.pins.length) {
     u.profile.pinnedContacts = [];
   }
+  u.profile.contactNicknames = { ...(u.chatState.nicknames || {}) };
+  u.profile.chatAliases = { ...(u.chatState.chatAliases || {}) };
 
   const legacyQuickChats = Array.isArray(u.quickChats) ? u.quickChats : [];
   if (!u.quickChatsState || typeof u.quickChatsState !== "object" || Array.isArray(u.quickChatsState)) {
@@ -3574,6 +3592,51 @@ function sanitizeChatStateKeys(list = []) {
   return out;
 }
 
+function sanitizeContactNicknamesMap(map = {}, userRecord = null) {
+  const user = (userRecord && typeof userRecord === "object") ? userRecord : {};
+  const me = String(user.username || "").trim().toLowerCase();
+  const friendsSet = new Set((Array.isArray(user.friends) ? user.friends : []).map((friend) => String(friend || "").trim()).filter(Boolean));
+  const out = {};
+  const entries = (map && typeof map === "object" && !Array.isArray(map)) ? Object.entries(map) : [];
+  for (const [rawUser, rawNickname] of entries) {
+    const username = String(rawUser || "").trim();
+    if (!username) continue;
+    if (username.toLowerCase() === me) continue;
+    if (!friendsSet.has(username)) continue;
+    const nickname = String(rawNickname || "").trim().slice(0, 80);
+    if (!nickname) continue;
+    out[username] = nickname;
+    if (Object.keys(out).length >= CHAT_STATE_MAX_NICKNAMES) break;
+  }
+  return out;
+}
+
+function sanitizeChatAliasesMap(map = {}, userRecord = null) {
+  const user = (userRecord && typeof userRecord === "object") ? userRecord : {};
+  const allowed = new Set();
+  const name = String(user.username || "").trim();
+  if (name) allowed.add(name);
+  (Array.isArray(user.friends) ? user.friends : []).forEach((friend) => {
+    const key = normalizeChatStateKey(friend);
+    if (key) allowed.add(key);
+  });
+  (Array.isArray(user.groups) ? user.groups : []).forEach((groupId) => {
+    const key = groupChatKey(groupId);
+    if (key) allowed.add(key);
+  });
+  const out = {};
+  const entries = (map && typeof map === "object" && !Array.isArray(map)) ? Object.entries(map) : [];
+  for (const [rawKey, rawAlias] of entries) {
+    const key = normalizeChatStateKey(rawKey);
+    if (!key || !allowed.has(key)) continue;
+    const alias = String(rawAlias || "").trim().slice(0, 80);
+    if (!alias) continue;
+    out[key] = alias;
+    if (Object.keys(out).length >= CHAT_STATE_MAX_ALIASES) break;
+  }
+  return out;
+}
+
 function buildAllowedChatKeysForUser(userRecord = null) {
   const user = ensureUserShape(userRecord || {});
   const allowed = new Set();
@@ -3609,7 +3672,9 @@ function chatStateForClient(userRecord = null) {
     updatedAt: Math.max(0, Math.floor(Number(state.updatedAt || Date.now()))),
     order: [...baseOrder, ...missing],
     manualUnread: filterChatKeysForUser(user, state.manualUnread || []),
-    pins: filterChatKeysForUser(user, state.pins || [])
+    pins: filterChatKeysForUser(user, state.pins || []),
+    nicknames: sanitizeContactNicknamesMap(state.nicknames || {}, user),
+    chatAliases: sanitizeChatAliasesMap(state.chatAliases || {}, user)
   };
 }
 
@@ -3621,6 +3686,8 @@ function saveAndBroadcastChatState(userRecord = null, options = {}) {
   };
   if (!user.profile || typeof user.profile !== "object") user.profile = {};
   user.profile.pinnedContacts = state.pins.slice();
+  user.profile.contactNicknames = { ...(state.nicknames || {}) };
+  user.profile.chatAliases = { ...(state.chatAliases || {}) };
   saveUser(user);
   if (options.broadcast !== false) {
     sendToUser(user.username, { type: "chat_state", state });
@@ -3638,18 +3705,24 @@ function updateUserChatState(username = "", mutator = null, options = {}) {
   const draft = {
     order: prev.order.slice(),
     manualUnread: prev.manualUnread.slice(),
-    pins: prev.pins.slice()
+    pins: prev.pins.slice(),
+    nicknames: { ...(prev.nicknames || {}) },
+    chatAliases: { ...(prev.chatAliases || {}) }
   };
   const changedByMutator = Boolean(mutator(draft, user));
 
   draft.order = filterChatKeysForUser(user, draft.order);
   draft.manualUnread = filterChatKeysForUser(user, draft.manualUnread);
   draft.pins = filterChatKeysForUser(user, draft.pins);
+  draft.nicknames = sanitizeContactNicknamesMap(draft.nicknames || {}, user);
+  draft.chatAliases = sanitizeChatAliasesMap(draft.chatAliases || {}, user);
 
   const changed = changedByMutator ||
     !sameStringList(prev.order, draft.order) ||
     !sameStringList(prev.manualUnread, draft.manualUnread) ||
-    !sameStringList(prev.pins, draft.pins);
+    !sameStringList(prev.pins, draft.pins) ||
+    JSON.stringify(prev.nicknames || {}) !== JSON.stringify(draft.nicknames || {}) ||
+    JSON.stringify(prev.chatAliases || {}) !== JSON.stringify(draft.chatAliases || {});
 
   if (!changed) {
     return { changed: false, user, state: prev };
@@ -3660,11 +3733,15 @@ function updateUserChatState(username = "", mutator = null, options = {}) {
     updatedAt: Date.now(),
     order: draft.order.slice(),
     manualUnread: draft.manualUnread.slice(),
-    pins: draft.pins.slice()
+    pins: draft.pins.slice(),
+    nicknames: { ...(draft.nicknames || {}) },
+    chatAliases: { ...(draft.chatAliases || {}) }
   };
   user.chatState = next;
   if (!user.profile || typeof user.profile !== "object") user.profile = {};
   user.profile.pinnedContacts = next.pins.slice();
+  user.profile.contactNicknames = { ...(next.nicknames || {}) };
+  user.profile.chatAliases = { ...(next.chatAliases || {}) };
   saveUser(user);
   if (options.broadcast !== false) {
     sendToUser(name, { type: "chat_state", state: next });
@@ -4284,7 +4361,7 @@ function sendFriendsList(ws, userRecord = null) {
       friends: [],
       deletedFriends: [],
       onlineUsers: Array.from(online.keys()),
-      chatState: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [] },
+      chatState: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [], nicknames: {}, chatAliases: {} },
       quickChats: { version: 1, updatedAt: Date.now(), chats: [], pins: [] },
       fileHolder: { version: 1, updatedAt: Date.now(), items: [] }
     });
@@ -5436,7 +5513,7 @@ if (data.type === "chat_state_request") {
   if (!u0) {
     return send(ws, {
       type: "chat_state",
-      state: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [] }
+      state: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [], nicknames: {}, chatAliases: {} }
     });
   }
   const user = ensureUserShape(u0);
@@ -5479,6 +5556,22 @@ if (data.type === "chat_state_update") {
       }
     }
 
+    if (updatesRaw.nicknames && typeof updatesRaw.nicknames === "object" && !Array.isArray(updatesRaw.nicknames)) {
+      const nicknames = sanitizeContactNicknamesMap(updatesRaw.nicknames, user);
+      if (JSON.stringify(draft.nicknames || {}) !== JSON.stringify(nicknames || {})) {
+        draft.nicknames = nicknames;
+        changed = true;
+      }
+    }
+
+    if (updatesRaw.chatAliases && typeof updatesRaw.chatAliases === "object" && !Array.isArray(updatesRaw.chatAliases)) {
+      const aliases = sanitizeChatAliasesMap(updatesRaw.chatAliases, user);
+      if (JSON.stringify(draft.chatAliases || {}) !== JSON.stringify(aliases || {})) {
+        draft.chatAliases = aliases;
+        changed = true;
+      }
+    }
+
     const touchKey = normalizeChatStateKey(updatesRaw.touchChatKey || "");
     if (touchKey && allowed.has(touchKey)) {
       const nextOrder = [touchKey, ...draft.order.filter((entry) => entry !== touchKey)];
@@ -5509,12 +5602,22 @@ if (data.type === "chat_state_update") {
         const nextOrder = draft.order.filter((entry) => !removeSet.has(entry));
         const nextUnread = draft.manualUnread.filter((entry) => !removeSet.has(entry));
         const nextPins = draft.pins.filter((entry) => !removeSet.has(entry));
+        const nextAliases = { ...(draft.chatAliases || {}) };
+        removeSet.forEach((key) => { delete nextAliases[key]; });
+        const nextNicknames = { ...(draft.nicknames || {}) };
+        removeSet.forEach((key) => {
+          if (!String(key || "").includes(":")) delete nextNicknames[key];
+        });
         if (!sameStringList(draft.order, nextOrder) ||
             !sameStringList(draft.manualUnread, nextUnread) ||
-            !sameStringList(draft.pins, nextPins)) {
+            !sameStringList(draft.pins, nextPins) ||
+            JSON.stringify(draft.chatAliases || {}) !== JSON.stringify(nextAliases || {}) ||
+            JSON.stringify(draft.nicknames || {}) !== JSON.stringify(nextNicknames || {})) {
           draft.order = nextOrder;
           draft.manualUnread = nextUnread;
           draft.pins = nextPins;
+          draft.chatAliases = nextAliases;
+          draft.nicknames = nextNicknames;
           changed = true;
         }
       }
