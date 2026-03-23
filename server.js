@@ -63,6 +63,11 @@ const ADMIN_USERNAMES = new Set(
 );
 const CHAT_STATE_MAX_KEYS = Math.max(128, Number(process.env.CHAT_STATE_MAX_KEYS || 2000));
 const QUICK_CHATS_MAX_ITEMS = Math.max(50, Number(process.env.QUICK_CHATS_MAX_ITEMS || 500));
+const FILE_HOLDER_MAX_ITEMS = Math.max(20, Number(process.env.FILE_HOLDER_MAX_ITEMS || 200));
+const FILE_HOLDER_MAX_FILE_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.FILE_HOLDER_MAX_FILE_BYTES || 20 * 1024 * 1024 * 1024)
+);
 const PUSH_DEVICE_MAX_PER_USER = Math.max(1, Number(process.env.PUSH_DEVICE_MAX_PER_USER || 8));
 const MAX_SESSION_TOKENS = Math.max(8, Number(process.env.MAX_SESSION_TOKENS || 40));
 const APNS_TEAM_ID = String(process.env.APNS_TEAM_ID || "").trim();
@@ -789,6 +794,84 @@ function readJsonBody(req, maxBytes = 128 * 1024) {
   });
 }
 
+function streamRequestBodyToFile(req, outputPath, maxBytes = FILE_HOLDER_MAX_FILE_BYTES) {
+  return new Promise((resolve, reject) => {
+    const limit = Math.max(1024, Number(maxBytes || FILE_HOLDER_MAX_FILE_BYTES || 0));
+    const tmpPath = `${outputPath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const ws = fs.createWriteStream(tmpPath, { flags: "w", mode: 0o644 });
+    let total = 0;
+    let settled = false;
+
+    const cleanup = () => {
+      req.removeListener("data", onData);
+      req.removeListener("error", onReqError);
+      req.removeListener("aborted", onReqAborted);
+      req.removeListener("end", onReqEnd);
+      ws.removeListener("error", onWriteError);
+      ws.removeListener("finish", onFinish);
+      try { req.unpipe(ws); } catch {}
+    };
+
+    const fail = (err, status = 500) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try { ws.destroy(); } catch {}
+      try {
+        if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+      } catch {}
+      const outErr = err instanceof Error ? err : new Error(String(err || "Upload failed"));
+      outErr.status = Number(status || outErr.status || 500);
+      reject(outErr);
+    };
+
+    const succeed = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+      } catch {}
+      try {
+        fs.renameSync(tmpPath, outputPath);
+      } catch (err) {
+        fail(err || new Error("Could not save upload"), 500);
+        return;
+      }
+      resolve({ bytes: total });
+    };
+
+    const onData = (chunk) => {
+      const size = Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk || "");
+      total += size;
+      if (total <= limit) return;
+      fail(new Error("Payload too large"), 413);
+      try { req.destroy(); } catch {}
+    };
+    const onReqError = (err) => fail(err || new Error("Upload stream failed"), 400);
+    const onReqAborted = () => fail(new Error("Upload aborted"), 499);
+    const onReqEnd = () => {
+      try { ws.end(); } catch {}
+    };
+    const onWriteError = (err) => fail(err || new Error("Could not write upload"), 500);
+    const onFinish = () => {
+      if (total <= 0) {
+        fail(new Error("Empty upload"), 400);
+        return;
+      }
+      succeed();
+    };
+
+    req.on("data", onData);
+    req.on("error", onReqError);
+    req.on("aborted", onReqAborted);
+    req.on("end", onReqEnd);
+    ws.on("error", onWriteError);
+    ws.on("finish", onFinish);
+    req.pipe(ws);
+  });
+}
+
 function isGuestBridgeAuthorized(req) {
   if (!GUEST_BRIDGE_SECRET) return true;
   const incoming = String(req.headers["x-merm-bridge-secret"] || "");
@@ -1214,6 +1297,124 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/api/file-holder/upload") {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const rawNameHeader = req?.headers?.["x-merm-file-name"];
+      const fileNameRaw = Array.isArray(rawNameHeader) ? rawNameHeader[0] : rawNameHeader;
+      const decodedName = (() => {
+        const value = String(fileNameRaw || "").trim();
+        if (!value) return "";
+        try { return decodeURIComponent(value); } catch { return value; }
+      })();
+      const safeName = safeBasename(decodedName || String(url.searchParams.get("name") || "").trim() || "file");
+      if (!safeName) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Missing file name" }));
+        return;
+      }
+
+      const rawMimeHeader = req?.headers?.["x-merm-file-mime"];
+      const mimeHeader = Array.isArray(rawMimeHeader) ? rawMimeHeader[0] : rawMimeHeader;
+      const mime = normalizeFileHolderMime(String(mimeHeader || "").trim(), safeName);
+      const now = Date.now();
+      const itemId = randomUUID();
+      const ext = String(path.extname(safeName || "") || "").toLowerCase().replace(/[^a-z0-9.]/g, "").slice(0, 12);
+      const storedFile = `${now}-${itemId}${ext || ""}`;
+      const outputPath = path.join(FILE_HOLDER_DIR, storedFile);
+
+      try {
+        const streamed = await streamRequestBodyToFile(req, outputPath, FILE_HOLDER_MAX_FILE_BYTES);
+        const nextEntry = {
+          id: itemId,
+          storedFile,
+          name: safeName,
+          size: Math.max(0, Number(streamed?.bytes || 0)),
+          mime,
+          createdAt: now,
+          updatedAt: now
+        };
+        const result = updateUserFileHolderState(username, (draft) => {
+          draft.unshift(nextEntry);
+          if (draft.length > FILE_HOLDER_MAX_ITEMS) {
+            draft.length = FILE_HOLDER_MAX_ITEMS;
+          }
+          return true;
+        });
+        const state = result?.state || fileHolderStateForClient(user);
+        const item = Array.isArray(state?.items)
+          ? state.items.find((entry) => String(entry?.id || "") === itemId) || null
+          : null;
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          item,
+          state
+        }));
+      } catch (err) {
+        try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
+        const status = Number(err?.status || 500);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Upload failed") }));
+      }
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/api/file-holder/download/")) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const itemIdRaw = String(url.pathname.split("/").pop() || "").trim();
+      let itemId = itemIdRaw;
+      try { itemId = decodeURIComponent(itemIdRaw); } catch {}
+      itemId = String(itemId || "").trim();
+      if (!itemId) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Missing file id" }));
+        return;
+      }
+
+      const entries = listFileHolderEntriesForUser(username);
+      const item = entries.find((entry) => String(entry?.id || "") === itemId);
+      if (!item) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "File not found" }));
+        return;
+      }
+      const storedFile = safeBasename(String(item?.storedFile || "").trim());
+      const filePath = path.join(FILE_HOLDER_DIR, storedFile);
+      if (!storedFile || !fs.existsSync(filePath)) {
+        updateUserFileHolderState(username, (draft) => {
+          const next = draft.filter((entry) => String(entry?.id || "") !== itemId);
+          if (next.length === draft.length) return false;
+          draft.length = 0;
+          next.forEach((entry) => draft.push(entry));
+          return true;
+        });
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "File not found" }));
+        return;
+      }
+      const dispositionType = String(url.searchParams.get("mode") || "").toLowerCase() === "inline" ? "inline" : "attachment";
+      serveFileFromDisk(req, res, filePath, String(item?.name || "file"), dispositionType);
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/guest-transfer/request") {
       setCors(res);
       if (!isGuestBridgeAuthorized(req)) {
@@ -1570,6 +1771,7 @@ const STORAGE_DIR = process.env.STORAGE_DIR || DEFAULT_STORAGE_DIR;
 
 const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
 const FILES_DIR = path.join(STORAGE_DIR, "files");
+const FILE_HOLDER_DIR = path.join(STORAGE_DIR, "file-holder");
 const USERS_DIR = path.join(STORAGE_DIR, "users");
 const GROUPS_DIR = path.join(STORAGE_DIR, "groups");
 const PREVIEW_CACHE_DIR = path.join(STORAGE_DIR, "preview-cache");
@@ -2242,6 +2444,7 @@ function enforceIntentPasswordGate(req, res, url, intent) {
 
 fs.mkdirSync(INTENTS_DIR, { recursive: true });
 fs.mkdirSync(FILES_DIR, { recursive: true });
+fs.mkdirSync(FILE_HOLDER_DIR, { recursive: true });
 fs.mkdirSync(USERS_DIR, { recursive: true });
 fs.mkdirSync(GROUPS_DIR, { recursive: true });
 fs.mkdirSync(PREVIEW_CACHE_DIR, { recursive: true });
@@ -3202,6 +3405,22 @@ function ensureUserShape(u) {
   u.quickChatsState.updatedAt = Math.max(0, Math.floor(Number(u.quickChatsState.updatedAt || Date.now())));
   // Keep legacy key for backwards compatibility with older deployments.
   u.quickChats = u.quickChatsState.chats.slice();
+
+  if (!u.fileHolderState || typeof u.fileHolderState !== "object" || Array.isArray(u.fileHolderState)) {
+    u.fileHolderState = {};
+  }
+  if (!Array.isArray(u.fileHolderState.items)) {
+    u.fileHolderState.items = [];
+  }
+  if (!Number.isFinite(Number(u.fileHolderState.version))) {
+    u.fileHolderState.version = 1;
+  }
+  if (!Number.isFinite(Number(u.fileHolderState.updatedAt))) {
+    u.fileHolderState.updatedAt = Date.now();
+  }
+  u.fileHolderState.items = sanitizeFileHolderEntries(u.fileHolderState.items);
+  u.fileHolderState.version = Math.max(1, Math.floor(Number(u.fileHolderState.version || 1)));
+  u.fileHolderState.updatedAt = Math.max(0, Math.floor(Number(u.fileHolderState.updatedAt || Date.now())));
   return u;
 }
 
@@ -3503,6 +3722,166 @@ function updateUserQuickChatsState(username = "", mutator = null, options = {}) 
     sendToUser(name, { type: "quick_chats", state: next });
   }
   return { changed: true, user, state: next };
+}
+
+function normalizeFileHolderMime(value = "", fallbackName = "") {
+  const raw = String(value || "").trim().toLowerCase();
+  if (/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(raw)) {
+    return raw;
+  }
+  return contentTypeForName(String(fallbackName || "file"));
+}
+
+function normalizeFileHolderEntry(entry = null) {
+  if (!entry || typeof entry !== "object") return null;
+  const id = String(entry.id || entry.itemId || "").trim().slice(0, 128);
+  if (!id) return null;
+  const storedFile = safeBasename(String(entry.storedFile || "").trim());
+  if (!storedFile) return null;
+  const name = safeBasename(String(entry.name || entry.fileName || "file").trim() || "file");
+  const sizeRaw = Number(entry.size || entry.bytes || 0);
+  const size = Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.floor(sizeRaw) : 0;
+  const createdAtRaw = Number(entry.createdAt || entry.updatedAt || 0);
+  const createdAt = Number.isFinite(createdAtRaw) && createdAtRaw > 0 ? Math.floor(createdAtRaw) : Date.now();
+  const updatedAtRaw = Number(entry.updatedAt || createdAt || 0);
+  const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? Math.floor(updatedAtRaw) : createdAt;
+  return {
+    id,
+    storedFile,
+    name,
+    size,
+    mime: normalizeFileHolderMime(entry.mime || entry.contentType || "", name),
+    createdAt,
+    updatedAt
+  };
+}
+
+function sanitizeFileHolderEntries(list = []) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(list) ? list : []) {
+    const entry = normalizeFileHolderEntry(raw);
+    if (!entry || seen.has(entry.id)) continue;
+    const fullPath = path.join(FILE_HOLDER_DIR, entry.storedFile);
+    try {
+      const stat = fs.statSync(fullPath);
+      if (!stat.isFile()) continue;
+      if (!Number.isFinite(entry.size) || entry.size <= 0) {
+        entry.size = Math.max(0, Number(stat.size || 0));
+      }
+    } catch {
+      continue;
+    }
+    seen.add(entry.id);
+    out.push(entry);
+    if (out.length >= FILE_HOLDER_MAX_ITEMS) break;
+  }
+  return out;
+}
+
+function sameFileHolderEntries(a = [], b = []) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i] || {};
+    const right = b[i] || {};
+    if (String(left.id || "") !== String(right.id || "")) return false;
+    if (String(left.storedFile || "") !== String(right.storedFile || "")) return false;
+    if (String(left.name || "") !== String(right.name || "")) return false;
+    if (Number(left.size || 0) !== Number(right.size || 0)) return false;
+    if (String(left.mime || "") !== String(right.mime || "")) return false;
+    if (Number(left.createdAt || 0) !== Number(right.createdAt || 0)) return false;
+    if (Number(left.updatedAt || 0) !== Number(right.updatedAt || 0)) return false;
+  }
+  return true;
+}
+
+function fileHolderStateForClient(userRecord = null) {
+  const user = ensureUserShape(userRecord || {});
+  const state = user.fileHolderState || {};
+  const items = sanitizeFileHolderEntries(state.items || []);
+  return {
+    version: Math.max(1, Math.floor(Number(state.version || 1))),
+    updatedAt: Math.max(0, Math.floor(Number(state.updatedAt || Date.now()))),
+    items: items.map((entry) => ({
+      id: String(entry.id || "").trim(),
+      name: String(entry.name || "file"),
+      size: Math.max(0, Number(entry.size || 0)),
+      mime: normalizeFileHolderMime(entry.mime || "", entry.name || ""),
+      createdAt: Math.max(0, Number(entry.createdAt || 0) || 0),
+      updatedAt: Math.max(0, Number(entry.updatedAt || 0) || 0)
+    }))
+  };
+}
+
+function removeFileHolderStoredFile(storedFile = "") {
+  const safeName = safeBasename(String(storedFile || "").trim());
+  if (!safeName) return;
+  const fullPath = path.join(FILE_HOLDER_DIR, safeName);
+  try {
+    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+  } catch {}
+}
+
+function updateUserFileHolderState(username = "", mutator = null, options = {}) {
+  const name = String(username || "").trim();
+  if (!name || typeof mutator !== "function") return null;
+  const u0 = loadUser(name);
+  if (!u0) return null;
+  const user = ensureUserShape(u0);
+  const prevItems = sanitizeFileHolderEntries((user.fileHolderState || {}).items || []);
+  const prevState = {
+    version: Math.max(1, Math.floor(Number(user?.fileHolderState?.version || 1))),
+    updatedAt: Math.max(0, Math.floor(Number(user?.fileHolderState?.updatedAt || Date.now()))),
+    items: prevItems
+  };
+  const draft = prevItems.map((entry) => ({ ...entry }));
+  const changedByMutator = Boolean(mutator(draft, user));
+  const nextItems = sanitizeFileHolderEntries(draft);
+  const changed = changedByMutator || !sameFileHolderEntries(prevItems, nextItems);
+  if (!changed) {
+    return { changed: false, user, state: fileHolderStateForClient(user) };
+  }
+
+  const next = {
+    version: Math.max(1, Number(prevState.version || 1)) + 1,
+    updatedAt: Date.now(),
+    items: nextItems
+  };
+  user.fileHolderState = next;
+  saveUser(user);
+
+  const retainedStored = new Set(nextItems.map((entry) => String(entry?.storedFile || "").trim()).filter(Boolean));
+  prevItems.forEach((entry) => {
+    const stored = String(entry?.storedFile || "").trim();
+    if (!stored || retainedStored.has(stored)) return;
+    removeFileHolderStoredFile(stored);
+  });
+
+  const clientState = fileHolderStateForClient(user);
+  if (options.broadcast !== false) {
+    sendToUser(name, { type: "file_holder", state: clientState });
+  }
+  return { changed: true, user, state: clientState };
+}
+
+function listFileHolderEntriesForUser(username = "") {
+  const name = String(username || "").trim();
+  if (!name) return [];
+  const u0 = loadUser(name);
+  if (!u0) return [];
+  const user = ensureUserShape(u0);
+  const state = user.fileHolderState || {};
+  const items = sanitizeFileHolderEntries(state.items || []);
+  if (!sameFileHolderEntries(items, state.items || [])) {
+    user.fileHolderState = {
+      version: Math.max(1, Math.floor(Number(state.version || 1))),
+      updatedAt: Math.max(0, Math.floor(Number(state.updatedAt || Date.now()))),
+      items
+    };
+    saveUser(user);
+  }
+  return items;
 }
 
 function touchUserChatOrder(username = "", chatKey = "") {
@@ -3888,7 +4267,8 @@ function friendsListPayload(userRecord) {
     deletedFriends: user.deletedFriends || [],
     onlineUsers: Array.from(online.keys()),
     chatState: chatStateForClient(user),
-    quickChats: quickChatsStateForClient(user)
+    quickChats: quickChatsStateForClient(user),
+    fileHolder: fileHolderStateForClient(user)
   };
 }
 
@@ -3905,7 +4285,8 @@ function sendFriendsList(ws, userRecord = null) {
       deletedFriends: [],
       onlineUsers: Array.from(online.keys()),
       chatState: { version: 1, updatedAt: Date.now(), order: [], manualUnread: [], pins: [] },
-      quickChats: { version: 1, updatedAt: Date.now(), chats: [], pins: [] }
+      quickChats: { version: 1, updatedAt: Date.now(), chats: [], pins: [] },
+      fileHolder: { version: 1, updatedAt: Date.now(), items: [] }
     });
   }
   return send(ws, friendsListPayload(user));
@@ -4100,7 +4481,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
   let data;
     try {
       data = JSON.parse(msg.toString());
-      if (!["ping", "inbox_request", "friends_list", "friend_requests", "guest_transfer_requests", "groups_list", "typing", "chat_state_request", "chat_state_update", "quick_chats_request", "quick_chats_update"].includes(String(data?.type || ""))) {
+      if (!["ping", "inbox_request", "friends_list", "friend_requests", "guest_transfer_requests", "groups_list", "typing", "chat_state_request", "chat_state_update", "quick_chats_request", "quick_chats_update", "file_holder_request", "file_holder_update"].includes(String(data?.type || ""))) {
         console.log("📩 Message received:", data);
       }
     } catch {
@@ -4158,6 +4539,14 @@ if (data.type === "delete_account") {
   // Delete user file
   const userPath = path.join(USERS_DIR, `${username}.json`);
   try {
+    const selfUser = loadUser(username);
+    if (selfUser) {
+      const shaped = ensureUserShape(selfUser);
+      const entries = sanitizeFileHolderEntries((shaped.fileHolderState || {}).items || []);
+      entries.forEach((entry) => {
+        removeFileHolderStoredFile(String(entry?.storedFile || ""));
+      });
+    }
     if (fs.existsSync(userPath)) fs.unlinkSync(userPath);
   } catch (err) {
     console.error("❌ Failed to delete user file:", err);
@@ -4246,6 +4635,11 @@ if (data.type === "auth_signup") {
     chats: [],
     pins: []
   },
+  fileHolderState: {
+    version: 1,
+    updatedAt: Date.now(),
+    items: []
+  },
   sessionTokens: [],
 };
 
@@ -4302,6 +4696,7 @@ if (!user.friends.includes(user.username)) {
   sendGroupsList(ws, username);
   send(ws, { type: "chat_state", state: chatStateForClient(u2) });
   send(ws, { type: "quick_chats", state: quickChatsStateForClient(u2) });
+  send(ws, { type: "file_holder", state: fileHolderStateForClient(u2) });
   broadcastFriendsListForUserAndFriends(username);
 
   return;
@@ -4416,6 +4811,7 @@ if (!user.friends.includes(user.username)) {
   sendGroupsList(ws, username);
   send(ws, { type: "chat_state", state: chatStateForClient(u2) });
   send(ws, { type: "quick_chats", state: quickChatsStateForClient(u2) });
+  send(ws, { type: "file_holder", state: fileHolderStateForClient(u2) });
   broadcastFriendsListForUserAndFriends(username);
 
   return;
@@ -5212,6 +5608,80 @@ if (data.type === "quick_chats_update") {
     return send(ws, { type: "quick_chats", state: result.state });
   }
   return send(ws, { type: "quick_chats_ack", version: Number(result.state?.version || 1) });
+}
+
+if (data.type === "file_holder_request") {
+  const u0 = loadUser(ws.username);
+  if (!u0) {
+    return send(ws, {
+      type: "file_holder",
+      state: { version: 1, updatedAt: Date.now(), items: [] }
+    });
+  }
+  const user = ensureUserShape(u0);
+  saveUser(user);
+  return send(ws, { type: "file_holder", state: fileHolderStateForClient(user) });
+}
+
+if (data.type === "file_holder_update") {
+  const u0 = loadUser(ws.username);
+  if (!u0) return send(ws, { type: "error", message: "User not found" });
+  const updatesRaw = data.updates && typeof data.updates === "object"
+    ? data.updates
+    : (data.state && typeof data.state === "object" ? data.state : {});
+
+  const result = updateUserFileHolderState(ws.username, (draft) => {
+    let changed = false;
+
+    if (Boolean(updatesRaw.clear) && draft.length) {
+      draft.length = 0;
+      changed = true;
+    }
+
+    const removeIds = new Set(
+      [
+        String(updatesRaw.removeId || "").trim(),
+        ...((Array.isArray(updatesRaw.removeIds) ? updatesRaw.removeIds : []).map((raw) => String(raw || "").trim()))
+      ].filter(Boolean)
+    );
+    if (removeIds.size) {
+      const next = draft.filter((entry) => !removeIds.has(String(entry?.id || "").trim()));
+      if (!sameFileHolderEntries(next, draft)) {
+        draft.length = 0;
+        next.forEach((entry) => draft.push(entry));
+        changed = true;
+      }
+    }
+
+    if (Array.isArray(updatesRaw.orderIds) && updatesRaw.orderIds.length > 0 && draft.length > 1) {
+      const order = updatesRaw.orderIds.map((raw) => String(raw || "").trim()).filter(Boolean);
+      const ranking = new Map();
+      order.forEach((id, idx) => {
+        if (!ranking.has(id)) ranking.set(id, idx);
+      });
+      const next = draft.slice().sort((a, b) => {
+        const aId = String(a?.id || "").trim();
+        const bId = String(b?.id || "").trim();
+        const aRank = ranking.has(aId) ? Number(ranking.get(aId)) : Number.MAX_SAFE_INTEGER;
+        const bRank = ranking.has(bId) ? Number(ranking.get(bId)) : Number.MAX_SAFE_INTEGER;
+        if (aRank !== bRank) return aRank - bRank;
+        return Number(b?.updatedAt || b?.createdAt || 0) - Number(a?.updatedAt || a?.createdAt || 0);
+      });
+      if (!sameFileHolderEntries(next, draft)) {
+        draft.length = 0;
+        next.forEach((entry) => draft.push(entry));
+        changed = true;
+      }
+    }
+
+    return changed;
+  });
+
+  if (!result) return send(ws, { type: "error", message: "Could not update file holder" });
+  if (!result.changed) {
+    return send(ws, { type: "file_holder", state: result.state });
+  }
+  return send(ws, { type: "file_holder_ack", version: Number(result.state?.version || 1) });
 }
 
 if (data.type === "intent_access_request") {
