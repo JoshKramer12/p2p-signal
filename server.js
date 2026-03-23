@@ -3973,6 +3973,9 @@ function addFriendSymmetric(a, b) {
 
   saveUser(ua);
   saveUser(ub);
+  // New contacts should surface immediately at the top (below pins) on every device.
+  touchUserChatOrder(a, b);
+  touchUserChatOrder(b, a);
   return { ok: true, a: ua, b: ub };
 }
 
