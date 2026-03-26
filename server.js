@@ -1767,25 +1767,76 @@ const server = http.createServer(async (req, res) => {
           res.end(JSON.stringify({ ok: false, message: "Upload session changed" }));
           return;
         }
-        const parts = Array.isArray(body?.parts)
+        const requestedParts = Array.isArray(body?.parts)
           ? body.parts
             .map((part) => ({
               partNumber: Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.partNumber || part?.PartNumber || 0))),
-              etag: String(part?.etag || part?.ETag || "").trim().replace(/"/g, "")
+              etag: String(part?.etag || part?.ETag || "").trim().replace(/"/g, ""),
+              size: Math.max(0, Number(part?.size || part?.Size || 0))
             }))
-            .filter((part) => Number.isFinite(part.partNumber) && part.etag)
+            .filter((part) => Number.isFinite(part.partNumber))
             .sort((a, b) => a.partNumber - b.partNumber)
           : [];
-        if (!parts.length) {
+
+        let listedParts = [];
+        const needsLookup = !requestedParts.length || requestedParts.some((part) => !part.etag);
+        if (needsLookup) {
+          listedParts = await objectStorage.listMultipartUploadParts(session.objectKey, session.uploadId).catch(() => []);
+        }
+
+        const listedByPartNumber = new Map();
+        listedParts.forEach((part) => {
+          const number = Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.PartNumber || part?.partNumber || 0)));
+          const etag = String(part?.ETag || part?.etag || "").trim().replace(/"/g, "");
+          if (!Number.isFinite(number) || !etag) return;
+          listedByPartNumber.set(number, {
+            etag,
+            size: Math.max(0, Number(part?.Size || part?.size || 0))
+          });
+        });
+
+        let completionParts = [];
+        if (requestedParts.length) {
+          completionParts = requestedParts
+            .map((part) => {
+              const listed = listedByPartNumber.get(part.partNumber) || null;
+              return {
+                partNumber: part.partNumber,
+                etag: String(part.etag || listed?.etag || "").trim(),
+                size: Math.max(0, Number(part.size || listed?.size || 0))
+              };
+            })
+            .filter((part) => Number.isFinite(part.partNumber) && part.etag)
+            .sort((a, b) => a.partNumber - b.partNumber);
+        } else {
+          completionParts = Array.from(listedByPartNumber.entries())
+            .map(([partNumber, part]) => ({
+              partNumber,
+              etag: String(part?.etag || "").trim(),
+              size: Math.max(0, Number(part?.size || 0))
+            }))
+            .filter((part) => Number.isFinite(part.partNumber) && part.etag)
+            .sort((a, b) => a.partNumber - b.partNumber);
+        }
+
+        if (!completionParts.length) {
           res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-          res.end(JSON.stringify({ ok: false, message: "No uploaded parts were provided" }));
+          res.end(JSON.stringify({ ok: false, message: "No uploaded multipart parts were found" }));
           return;
         }
+
+        const knownPartBytes = completionParts.reduce((sum, part) => sum + Math.max(0, Number(part.size || 0)), 0);
+        if (expectedBytes > 0 && knownPartBytes > 0 && knownPartBytes !== expectedBytes) {
+          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ ok: false, message: "Uploaded multipart size does not match intent" }));
+          return;
+        }
+
         try {
           await objectStorage.completeMultipartUpload(
             session.objectKey,
             session.uploadId,
-            parts.map((part) => ({ PartNumber: part.partNumber, ETag: part.etag }))
+            completionParts.map((part) => ({ PartNumber: part.partNumber, ETag: part.etag }))
           );
         } catch (err) {
           const msg = String(err?.message || "").toLowerCase();

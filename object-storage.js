@@ -9,7 +9,8 @@ const {
   CreateMultipartUploadCommand,
   UploadPartCommand,
   CompleteMultipartUploadCommand,
-  AbortMultipartUploadCommand
+  AbortMultipartUploadCommand,
+  ListPartsCommand
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
@@ -214,6 +215,43 @@ async function abortMultipartUpload(objectKey = "", uploadId = "") {
   }
 }
 
+async function listMultipartUploadParts(objectKey = "", uploadId = "") {
+  if (!isEnabled()) return [];
+  const key = String(objectKey || "").trim();
+  const upload = String(uploadId || "").trim();
+  if (!key || !upload) return [];
+
+  const parts = [];
+  let marker = 0;
+  while (true) {
+    const response = await client().send(new ListPartsCommand({
+      Bucket: config.bucket,
+      Key: key,
+      UploadId: upload,
+      PartNumberMarker: marker > 0 ? marker : undefined
+    }));
+    const pageParts = Array.isArray(response?.Parts) ? response.Parts : [];
+    pageParts.forEach((part) => {
+      const number = Math.max(1, Math.min(10000, Number(part?.PartNumber || 0)));
+      const etag = String(part?.ETag || "").trim().replace(/"/g, "");
+      const size = Math.max(0, Number(part?.Size || 0));
+      if (!Number.isFinite(number) || !etag) return;
+      parts.push({
+        PartNumber: number,
+        ETag: etag,
+        Size: size
+      });
+    });
+    const truncated = Boolean(response?.IsTruncated);
+    const nextMarker = Math.max(0, Number(response?.NextPartNumberMarker || 0));
+    if (!truncated || !nextMarker || nextMarker === marker) break;
+    marker = nextMarker;
+  }
+
+  parts.sort((a, b) => a.PartNumber - b.PartNumber);
+  return parts;
+}
+
 async function createDownloadUrl(objectKey = "", options = {}) {
   if (!isEnabled()) return null;
   const key = String(objectKey || "").trim();
@@ -375,6 +413,7 @@ module.exports = {
   createMultipartUploadPartUrl,
   completeMultipartUpload,
   abortMultipartUpload,
+  listMultipartUploadParts,
   createDownloadUrl,
   headObject,
   deleteObject,
