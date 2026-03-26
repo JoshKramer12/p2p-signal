@@ -1,6 +1,16 @@
 const fs = require("fs");
 const { pipeline } = require("stream/promises");
-const { S3Client, DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+const {
+  S3Client,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  HeadObjectCommand,
+  PutObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand
+} = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 function trimEnv(name = "", fallback = "") {
@@ -115,6 +125,93 @@ async function createUploadUrl(objectKey = "", contentType = "application/octet-
       "content-type": String(contentType || "application/octet-stream").trim() || "application/octet-stream"
     }
   };
+}
+
+async function createMultipartUpload(objectKey = "", contentType = "application/octet-stream") {
+  if (!isEnabled()) return null;
+  const key = String(objectKey || "").trim();
+  if (!key) return null;
+  const response = await client().send(new CreateMultipartUploadCommand({
+    Bucket: config.bucket,
+    Key: key,
+    ContentType: String(contentType || "application/octet-stream").trim() || "application/octet-stream"
+  }));
+  const uploadId = String(response?.UploadId || "").trim();
+  if (!uploadId) return null;
+  return {
+    key,
+    uploadId
+  };
+}
+
+async function createMultipartUploadPartUrl(objectKey = "", uploadId = "", partNumber = 1, expiresInSec = config.uploadUrlTtlSec) {
+  if (!isEnabled()) return null;
+  const key = String(objectKey || "").trim();
+  const upload = String(uploadId || "").trim();
+  const part = Math.max(1, Math.min(10000, Number(partNumber || 0)));
+  if (!key || !upload || !Number.isFinite(part)) return null;
+  const url = await getSignedUrl(
+    client(),
+    new UploadPartCommand({
+      Bucket: config.bucket,
+      Key: key,
+      UploadId: upload,
+      PartNumber: part
+    }),
+    { expiresIn: Math.max(60, Number(expiresInSec || config.uploadUrlTtlSec)) }
+  );
+  return {
+    url,
+    method: "PUT",
+    headers: {}
+  };
+}
+
+async function completeMultipartUpload(objectKey = "", uploadId = "", parts = []) {
+  if (!isEnabled()) return null;
+  const key = String(objectKey || "").trim();
+  const upload = String(uploadId || "").trim();
+  const normalizedParts = Array.isArray(parts)
+    ? parts
+      .map((part) => ({
+        PartNumber: Math.max(1, Math.min(10000, Number(part?.PartNumber || part?.partNumber || 0))),
+        ETag: String(part?.ETag || part?.etag || "").trim()
+      }))
+      .filter((part) => Number.isFinite(part.PartNumber) && part.ETag)
+      .sort((a, b) => a.PartNumber - b.PartNumber)
+    : [];
+  if (!key || !upload || !normalizedParts.length) return null;
+  await client().send(new CompleteMultipartUploadCommand({
+    Bucket: config.bucket,
+    Key: key,
+    UploadId: upload,
+    MultipartUpload: {
+      Parts: normalizedParts
+    }
+  }));
+  return {
+    key,
+    uploadId: upload,
+    parts: normalizedParts.length
+  };
+}
+
+async function abortMultipartUpload(objectKey = "", uploadId = "") {
+  if (!isEnabled()) return false;
+  const key = String(objectKey || "").trim();
+  const upload = String(uploadId || "").trim();
+  if (!key || !upload) return false;
+  try {
+    await client().send(new AbortMultipartUploadCommand({
+      Bucket: config.bucket,
+      Key: key,
+      UploadId: upload
+    }));
+    return true;
+  } catch (err) {
+    if (isMissingObjectError(err)) return false;
+    throw err;
+  }
 }
 
 async function createDownloadUrl(objectKey = "", options = {}) {
@@ -274,6 +371,10 @@ module.exports = {
   buildIntentObjectKey,
   buildFileHolderObjectKey,
   createUploadUrl,
+  createMultipartUpload,
+  createMultipartUploadPartUrl,
+  completeMultipartUpload,
+  abortMultipartUpload,
   createDownloadUrl,
   headObject,
   deleteObject,
