@@ -42,7 +42,7 @@ const OBJECT_MULTIPART_PART_SIZE_BYTES = Math.max(
 const OBJECT_MULTIPART_MAX_PARTS = 10000;
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
   1,
-  Math.min(8, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 8))
+  Math.min(12, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 10))
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
@@ -1524,14 +1524,28 @@ const server = http.createServer(async (req, res) => {
           5 * 1024 * 1024,
           Math.ceil(expectedBytes / OBJECT_MULTIPART_MAX_PARTS)
         );
-        const partSize = Math.max(OBJECT_MULTIPART_PART_SIZE_BYTES, maxPartSizeByCount);
+        let tunedPartSize = OBJECT_MULTIPART_PART_SIZE_BYTES;
+        if (expectedBytes >= 2 * 1024 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 24 * 1024 * 1024);
+        } else if (expectedBytes >= 512 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 16 * 1024 * 1024);
+        } else if (expectedBytes >= 128 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 12 * 1024 * 1024);
+        } else if (expectedBytes >= 32 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 10 * 1024 * 1024);
+        }
+        const partSize = Math.max(tunedPartSize, maxPartSizeByCount);
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
-        const recommendedConcurrency = expectedBytes >= 512 * 1024 * 1024
-          ? 8
-          : (expectedBytes >= 64 * 1024 * 1024 ? 6 : 4);
+        const recommendedConcurrency = expectedBytes >= 768 * 1024 * 1024
+          ? 10
+          : (expectedBytes >= 256 * 1024 * 1024
+            ? 9
+            : (expectedBytes >= 96 * 1024 * 1024
+              ? 8
+              : (expectedBytes >= 32 * 1024 * 1024 ? 6 : 4)));
         const maxConcurrency = Math.max(
           1,
-          Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency)
+          Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency, totalParts)
         );
         const multipart = await objectStorage.createMultipartUpload(objectKey, mime);
         if (!multipart?.uploadId) {
