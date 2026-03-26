@@ -33,16 +33,16 @@ const OFFLINE_UPLOAD_STREAM_HWM_BYTES = Math.max(
 );
 const OBJECT_MULTIPART_THRESHOLD_BYTES = Math.max(
   5 * 1024 * 1024,
-  Number(process.env.OBJECT_MULTIPART_THRESHOLD_BYTES || 128 * 1024 * 1024)
+  Number(process.env.OBJECT_MULTIPART_THRESHOLD_BYTES || 8 * 1024 * 1024)
 );
 const OBJECT_MULTIPART_PART_SIZE_BYTES = Math.max(
   5 * 1024 * 1024,
-  Number(process.env.OBJECT_MULTIPART_PART_SIZE_BYTES || 16 * 1024 * 1024)
+  Number(process.env.OBJECT_MULTIPART_PART_SIZE_BYTES || 8 * 1024 * 1024)
 );
 const OBJECT_MULTIPART_MAX_PARTS = 10000;
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
   1,
-  Math.min(8, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 3))
+  Math.min(8, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 8))
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
@@ -1526,6 +1526,13 @@ const server = http.createServer(async (req, res) => {
         );
         const partSize = Math.max(OBJECT_MULTIPART_PART_SIZE_BYTES, maxPartSizeByCount);
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
+        const recommendedConcurrency = expectedBytes >= 512 * 1024 * 1024
+          ? 8
+          : (expectedBytes >= 64 * 1024 * 1024 ? 6 : 4);
+        const maxConcurrency = Math.max(
+          1,
+          Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency)
+        );
         const multipart = await objectStorage.createMultipartUpload(objectKey, mime);
         if (!multipart?.uploadId) {
           res.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -1546,7 +1553,7 @@ const server = http.createServer(async (req, res) => {
           uploadId: multipart.uploadId,
           partSize,
           totalParts,
-          maxConcurrency: OBJECT_MULTIPART_CLIENT_CONCURRENCY
+          maxConcurrency
         };
       } else {
         const singleUploadPlan = await objectStorage.createUploadUrl(objectKey, mime);
@@ -7207,12 +7214,23 @@ if (data.type === "upload_progress") {
   if (!intent) return;
   if (intent.from !== ws.username) return;
   if (!intent.storedObjectKey || !objectStorage.isEnabled()) return;
+  const nowTs = Date.now();
   const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
   const sentBytes = Math.max(0, Math.min(Number(data.sentBytes || 0), expectedBytes || Number(data.sentBytes || 0)));
-  updateIntentUploadCheckpoint(intent, sentBytes, {
-    status: "uploading",
-    transferState: "uploading"
-  });
+  const previousCheckpointBytes = Math.max(0, Number(intent.storedBytes || 0));
+  const previousCheckpointTs = Math.max(0, Number(intent.updatedAt || 0));
+  const checkpointDueByBytes =
+    sentBytes >= expectedBytes ||
+    (sentBytes - previousCheckpointBytes) >= UPLOAD_CHECKPOINT_EVERY_BYTES;
+  const checkpointDueByTime =
+    sentBytes >= expectedBytes ||
+    (nowTs - previousCheckpointTs) >= UPLOAD_CHECKPOINT_MIN_INTERVAL_MS;
+  if (checkpointDueByBytes && checkpointDueByTime) {
+    updateIntentUploadCheckpoint(intent, sentBytes, {
+      status: "uploading",
+      transferState: "uploading"
+    });
+  }
   emitTransferState(intent, "uploading", {
     sentBytes,
     totalBytes: expectedBytes,
