@@ -3291,7 +3291,7 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
   clearTransferAutoFinalizeTimer(t);
 
   const ws = senderWs || t.senderWs || null;
-  const finishIntent = () => {
+  const finishIntent = async () => {
     activeTransfers.delete(intentId);
     if (ws?.currentUploadIntentId === intentId) {
       ws.currentUploadIntentId = null;
@@ -3315,6 +3315,28 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
       }
       return;
     }
+
+    const storedFileName = String(intent.storedFile || "").trim();
+    const localFilePath = String(t.filePath || (storedFileName ? path.join(FILES_DIR, storedFileName) : "")).trim();
+    if (objectStorage.isEnabled() && localFilePath && fs.existsSync(localFilePath)) {
+      const safeName = safeBasename(String(intent.fileName || storedFileName || "file"));
+      const objectKey = String(intent.storedObjectKey || "").trim() || objectStorage.buildIntentObjectKey(intentId, storedFileName || safeName);
+      try {
+        await objectStorage.putFile(objectKey, localFilePath, contentTypeForName(safeName));
+        intent.storedObjectKey = objectKey;
+        try { fs.unlinkSync(localFilePath); } catch {}
+      } catch (err) {
+        console.error("❌ Failed to offload uploaded file to object storage:", err);
+      }
+    }
+
+    intent.stored = true;
+    intent.storedBytes = t.bytesExpected;
+    intent.plainStoredBytes = uploadBytesToPlainBytes(intent, t.bytesExpected);
+    intent.status = "stored";
+    intent.transferState = "delivered";
+    intent.uploadedAt = Date.now();
+    saveIntent(intent);
 
     const receiverSockets = getOnlineSocketsForUser(intent.to);
     if (!intent.groupId && receiverSockets.length && !isIntentDeliveryHeld(intent)) {
@@ -3365,7 +3387,15 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
     if (ws?.currentUploadIntentId === intentId) {
       ws.currentUploadIntentId = null;
     }
-    t.writeStream.end(() => finishIntent());
+    t.writeStream.end(() => {
+      finishIntent().catch((err) => {
+        t.finalizing = false;
+        console.error("❌ Failed to finalize offline transfer:", err);
+        if (ws) {
+          send(ws, { type: "upload_failed", intentId, message: "Server failed finalizing upload" });
+        }
+      });
+    });
   } catch {
     t.finalizing = false;
     activeTransfers.delete(intentId);
@@ -7094,6 +7124,63 @@ if (t.mode === "offline") {
     // 3a) send intent only (NO transport)
 // 3a) send intent only (NO transport)
 if (data.type === "send_intent") {
+  const queuePostIntentWork = (work) => {
+    setImmediate(() => {
+      try {
+        work();
+      } catch (err) {
+        console.error("❌ send_intent post-ack work failed:", err);
+      }
+    });
+  };
+
+  const buildIntentOkPayload = (intentRecord, options = {}) => {
+    const ackIntent = intentRecord || {};
+    const ackIsGroupSend = Boolean(options.isGroupSend);
+    const ackTo = String(options.to || ackIntent.to || "").trim();
+    const ackClientIntentId = options.clientIntentId ?? ackIntent.clientIntentId ?? null;
+    const ackDeliveryHeld = Boolean(
+      typeof options.deliveryHeld === "boolean"
+        ? options.deliveryHeld
+        : isIntentDeliveryHeld(ackIntent)
+    );
+    const ackReceiverOnline = typeof options.receiverOnline === "boolean"
+      ? options.receiverOnline
+      : (ackIsGroupSend ? false : isUserOnline(ackTo));
+    const ackReceiverClient = Object.prototype.hasOwnProperty.call(options, "receiverClient")
+      ? (options.receiverClient || null)
+      : (ackIsGroupSend ? null : (getOnlineSocketsForUser(ackTo)[0]?.client || null));
+    const ackMirrorIntents = Array.isArray(options.mirrorIntents) ? options.mirrorIntents : [];
+    return {
+      type: "intent_ok",
+      intentId: ackIntent.id,
+      clientIntentId: ackClientIntentId,
+      to: ackIsGroupSend ? String(options.senderUsername || ackIntent.from || "").trim() : ackTo,
+      groupId: ackIsGroupSend ? String(ackIntent.groupId || "") : "",
+      groupName: ackIsGroupSend ? String(ackIntent.groupName || "") : "",
+      fileName: ackIntent.fileName || "",
+      downloadToken: ackIntent.downloadToken || null,
+      receiverOnline: ackIsGroupSend
+        ? ackMirrorIntents.some((entry) => isUserOnline(entry?.to))
+        : ackReceiverOnline,
+      receiverClient: ackIsGroupSend ? null : ackReceiverClient,
+      expiresAt: ackIntent.expiresAt,
+      createdAt: ackIntent.createdAt,
+      isTextOnly: Boolean(ackIntent.isTextOnly || ackIntent.messageType === "text"),
+      text: ackIntent.text || "",
+      plainText: ackIntent.plainText || "",
+      fileSize: Number(ackIntent.fileSize || 0),
+      uploadBytesExpected: Number(ackIntent.uploadBytesExpected || ackIntent.fileSize || 0),
+      encryption: ackIntent.encryption || null,
+      passwordProtected: isIntentPasswordProtected(ackIntent),
+      passwordMode: getIntentPasswordMode(ackIntent),
+      passwordHint: String(ackIntent.passwordHint || ""),
+      customExpiry: hasIntentCustomExpiry(ackIntent),
+      deliveryHeld: ackDeliveryHeld,
+      transferState: ackIntent.transferState || (ackIntent.readByRecipientAt ? "read" : (ackIntent.stored ? "delivered" : "queued"))
+    };
+  };
+
   const requestedGroupId = String(data.groupId || "").trim();
   let to = String(data.to || "").trim();
   const rawFileName = String(data.fileName || "").trim();
@@ -7206,53 +7293,38 @@ if (data.type === "send_intent") {
       const receiverSockets = receiverOnline ? getOnlineSocketsForUser(existing.to) : [];
       const receiverClient = receiverSockets[0]?.client || null;
       const existingHeld = isIntentDeliveryHeld(existing);
-      if (receiverOnline && !isGroupSend && !existingHeld) {
-        const safeExistingIntent = intentForClient(existing);
-        if (existing.isTextOnly || existing.messageType === "text") {
-          sendToUser(existing.to, { type: "incoming_file", intent: safeExistingIntent });
-        } else {
-          sendToUser(existing.to, { type: "incoming_intent", intent: safeExistingIntent });
+      const acked = send(ws, buildIntentOkPayload(existing, {
+        clientIntentId,
+        to: existing.to,
+        receiverOnline,
+        receiverClient,
+        deliveryHeld: existingHeld,
+        isGroupSend,
+        senderUsername: ws.username
+      }));
+      queuePostIntentWork(() => {
+        if (receiverOnline && !isGroupSend && !existingHeld) {
+          const safeExistingIntent = intentForClient(existing);
+          if (existing.isTextOnly || existing.messageType === "text") {
+            sendToUser(existing.to, { type: "incoming_file", intent: safeExistingIntent });
+          } else {
+            sendToUser(existing.to, { type: "incoming_intent", intent: safeExistingIntent });
+          }
         }
-        try { sendToUser(existing.to, { type: "inbox", items: loadIntentsForUser(existing.to) }); } catch {}
-      }
-      if (isGroupSend) {
-        const gKey = groupChatKey(existing.groupId || requestedGroupId || "");
-        if (gKey && !existingHeld) {
-          const members = targetGroup?.members?.length ? targetGroup.members : (existing.groupMembers || []);
-          normalizeGroupMembers(members).forEach((member) => {
-            touchUserChatOrder(member, gKey);
-          });
-        }
-      } else {
-        if (!existingHeld) {
+        if (isGroupSend) {
+          const gKey = groupChatKey(existing.groupId || requestedGroupId || "");
+          if (gKey && !existingHeld) {
+            const members = targetGroup?.members?.length ? targetGroup.members : (existing.groupMembers || []);
+            normalizeGroupMembers(members).forEach((member) => {
+              touchUserChatOrder(member, gKey);
+            });
+          }
+        } else if (!existingHeld) {
           touchUserChatOrder(ws.username, existing.to);
           touchUserChatOrder(existing.to, ws.username);
         }
-      }
-    return send(ws, {
-        type: "intent_ok",
-        intentId: existing.id,
-        clientIntentId,
-        to: existing.to,
-        fileName: existing.fileName || "",
-        downloadToken: existing.downloadToken || null,
-        receiverOnline,
-        receiverClient,
-        expiresAt: existing.expiresAt,
-        createdAt: existing.createdAt,
-        isTextOnly: Boolean(existing.isTextOnly || existing.messageType === "text"),
-        text: existing.text || "",
-        plainText: existing.plainText || "",
-        fileSize: Number(existing.fileSize || 0),
-        uploadBytesExpected: Number(existing.uploadBytesExpected || existing.fileSize || 0),
-        encryption: existing.encryption || null,
-        passwordProtected: isIntentPasswordProtected(existing),
-        passwordMode: getIntentPasswordMode(existing),
-        passwordHint: String(existing.passwordHint || ""),
-        customExpiry: hasIntentCustomExpiry(existing),
-        deliveryHeld: existingHeld,
-        transferState: existing.transferState || (existing.readByRecipientAt ? "read" : (existing.stored ? "delivered" : "queued"))
       });
+      return acked;
     }
   }
 
@@ -7335,27 +7407,32 @@ if (data.type === "send_intent") {
   }
 
   const intentHeld = isIntentDeliveryHeld(intent);
+  const acked = send(ws, buildIntentOkPayload(intent, {
+    clientIntentId: clientIntentId || null,
+    to,
+    deliveryHeld: intentHeld,
+    isGroupSend,
+    senderUsername: ws.username,
+    mirrorIntents
+  }));
 
-  if (isGroupSend) {
-    if (!intentHeld) {
-      for (const mirrorIntent of mirrorIntents) {
-        if (!isUserOnline(mirrorIntent.to)) continue;
-        const safeIntent = intentForClient(mirrorIntent);
-        if (isTextOnly) {
-          sendToUser(mirrorIntent.to, { type: "incoming_file", intent: safeIntent });
-        } else {
-          sendToUser(mirrorIntent.to, { type: "incoming_intent", intent: safeIntent });
+  queuePostIntentWork(() => {
+    if (isGroupSend) {
+      if (!intentHeld) {
+        for (const mirrorIntent of mirrorIntents) {
+          if (!isUserOnline(mirrorIntent.to)) continue;
+          const safeIntent = intentForClient(mirrorIntent);
+          if (isTextOnly) {
+            sendToUser(mirrorIntent.to, { type: "incoming_file", intent: safeIntent });
+          } else {
+            sendToUser(mirrorIntent.to, { type: "incoming_intent", intent: safeIntent });
+          }
         }
-        try {
-          sendToUser(mirrorIntent.to, { type: "inbox", items: loadIntentsForUser(mirrorIntent.to) });
-        } catch {}
+        mirrorIntents.forEach((mirrorIntent) => {
+          queuePushNotificationForUser(mirrorIntent.to, buildPushPayloadForIntent(mirrorIntent));
+        });
       }
-      mirrorIntents.forEach((mirrorIntent) => {
-        queuePushNotificationForUser(mirrorIntent.to, buildPushPayloadForIntent(mirrorIntent));
-      });
-    }
-  } else {
-    if (!intentHeld) {
+    } else if (!intentHeld) {
       if (isUserOnline(to)) {
         const safeIntent = intentForClient(intent);
         if (isTextOnly) {
@@ -7363,84 +7440,47 @@ if (data.type === "send_intent") {
         } else {
           sendToUser(to, { type: "incoming_intent", intent: safeIntent });
         }
-        try {
-          sendToUser(to, { type: "inbox", items: loadIntentsForUser(to) });
-        } catch {}
       }
       if (to !== ws.username) {
         queuePushNotificationForUser(to, buildPushPayloadForIntent(intent));
       }
     }
-  }
 
-  // Keep all sender devices fully in sync (web + app) without waiting for polling.
-  // For self-send (to === sender), sender already receives the regular recipient push above.
-  const shouldBroadcastSenderDevices = !intentHeld && (isGroupSend || to !== ws.username);
-  if (shouldBroadcastSenderDevices && isUserOnline(ws.username)) {
-    const senderIntent = intentForClient(intent);
-    if (isTextOnly) {
-      sendToUser(ws.username, { type: "incoming_file", intent: senderIntent });
-    } else {
-      sendToUser(ws.username, { type: "incoming_intent", intent: senderIntent });
+    // Keep all sender devices fully in sync (web + app) without waiting for polling.
+    // For self-send (to === sender), sender already receives the regular recipient push above.
+    const shouldBroadcastSenderDevices = !intentHeld && (isGroupSend || to !== ws.username);
+    if (shouldBroadcastSenderDevices && isUserOnline(ws.username)) {
+      const senderIntent = intentForClient(intent);
+      if (isTextOnly) {
+        sendToUser(ws.username, { type: "incoming_file", intent: senderIntent });
+      } else {
+        sendToUser(ws.username, { type: "incoming_intent", intent: senderIntent });
+      }
     }
-    try {
-      sendToUser(ws.username, { type: "inbox", items: loadIntentsForUser(ws.username) });
-    } catch {}
-  }
 
-  if (!intentHeld && isGroupSend) {
-    const groupKey = groupChatKey(targetGroup?.id || "");
-    if (groupKey) {
-      [ws.username, ...groupRecipients].forEach((member) => {
-        touchUserChatOrder(member, groupKey);
+    if (!intentHeld && isGroupSend) {
+      const groupKey = groupChatKey(targetGroup?.id || "");
+      if (groupKey) {
+        [ws.username, ...groupRecipients].forEach((member) => {
+          touchUserChatOrder(member, groupKey);
+        });
+      }
+    } else if (!intentHeld) {
+      touchUserChatOrder(ws.username, to);
+      touchUserChatOrder(to, ws.username);
+    }
+
+    if (!intentHeld) {
+      emitTransferState(intent, intent.transferState || "queued", {
+        sentBytes: Number(intent.storedBytes || 0),
+        totalBytes: resolveUploadExpectedBytes(intent),
+        plainSentBytes: Number(intent.plainStoredBytes || 0),
+        plainTotalBytes: Number(intent.fileSize || 0),
+        retryable: false
       });
     }
-  } else if (!intentHeld) {
-    touchUserChatOrder(ws.username, to);
-    touchUserChatOrder(to, ws.username);
-  }
-
-  if (!intentHeld) {
-    emitTransferState(intent, intent.transferState || "queued", {
-      sentBytes: Number(intent.storedBytes || 0),
-      totalBytes: resolveUploadExpectedBytes(intent),
-      plainSentBytes: Number(intent.plainStoredBytes || 0),
-      plainTotalBytes: Number(intent.fileSize || 0),
-      retryable: false
-    });
-  }
-
-  // ✅ Always acknowledge sender
-  return send(ws, {
-    type: "intent_ok",
-    intentId: intent.id,
-    clientIntentId: clientIntentId || null,
-    to: isGroupSend ? ws.username : to,
-    groupId: isGroupSend ? intent.groupId : "",
-    groupName: isGroupSend ? intent.groupName : "",
-    fileName: intent.fileName || "",
-    downloadToken: intent.downloadToken || null,
-    receiverOnline: isGroupSend
-      ? mirrorIntents.some((entry) => isUserOnline(entry.to))
-      : isUserOnline(to),
-    receiverClient: isGroupSend
-      ? null
-      : (getOnlineSocketsForUser(to)[0]?.client || null),
-    expiresAt: intent.expiresAt,
-    createdAt: intent.createdAt,
-    isTextOnly,
-    text: intent.text || "",
-    plainText: intent.plainText || "",
-    fileSize: Number(intent.fileSize || 0),
-    uploadBytesExpected: Number(intent.uploadBytesExpected || intent.fileSize || 0),
-    encryption: intent.encryption || null,
-    passwordProtected: isIntentPasswordProtected(intent),
-    passwordMode: getIntentPasswordMode(intent),
-    passwordHint: String(intent.passwordHint || ""),
-    customExpiry: hasIntentCustomExpiry(intent),
-    deliveryHeld: intentHeld,
-    transferState: intent.transferState || (intent.readByRecipientAt ? "read" : (intent.stored ? "delivered" : "queued"))
   });
+  return acked;
 }
 
 
