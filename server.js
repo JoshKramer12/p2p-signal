@@ -1053,6 +1053,126 @@ function serveFileFromDisk(req, res, filePath, safeName, dispositionType = "atta
   rs.pipe(res);
 }
 
+async function serveFileFromObjectStorage(req, res, objectKey, safeName, dispositionType = "attachment") {
+  const key = String(objectKey || "").trim();
+  if (!key || !objectStorage.isEnabled()) {
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("File missing");
+    return;
+  }
+
+  let meta = null;
+  try {
+    meta = await objectStorage.headObject(key);
+  } catch {
+    meta = null;
+  }
+  if (!meta) {
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("File missing");
+    return;
+  }
+
+  const totalSize = Math.max(0, Number(meta.size || 0));
+  const baseHeaders = {
+    "content-type": meta.contentType || contentTypeForName(safeName),
+    "accept-ranges": "bytes",
+    "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
+  };
+
+  if (!Number.isFinite(totalSize) || totalSize <= 0) {
+    res.writeHead(200, {
+      ...baseHeaders,
+      "content-length": 0
+    });
+    res.end();
+    return;
+  }
+
+  const parsedRange = parseHttpRange(req.headers.range, totalSize);
+  if (!parsedRange.ok) {
+    res.writeHead(416, {
+      ...baseHeaders,
+      "content-range": `bytes */${totalSize}`
+    });
+    res.end();
+    return;
+  }
+
+  const start = parsedRange.start;
+  const end = parsedRange.end;
+  const hasRange = parsedRange.hasRange;
+  const headers = {
+    ...baseHeaders,
+    "content-length": hasRange ? Math.max(0, end - start + 1) : totalSize
+  };
+  if (hasRange) {
+    headers["content-range"] = `bytes ${start}-${end}/${totalSize}`;
+  }
+  res.writeHead(hasRange ? 206 : 200, headers);
+
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+
+  const remote = await objectStorage.getObjectStream(key, hasRange ? { range: { start, end } } : {});
+  const body = remote?.body || null;
+  if (!body) {
+    try { res.end(); } catch {}
+    return;
+  }
+  body.on("error", () => {
+    try { res.end(); } catch {}
+  });
+  body.pipe(res);
+}
+
+async function ensureIntentStoredFilePath(intent = null) {
+  if (!intent || typeof intent !== "object") return "";
+  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  if (storedObjectKey && objectStorage.isEnabled()) {
+    const outputPath = resolveIntentObjectCachePath(intent);
+    if (!outputPath) return "";
+    let remoteMeta = null;
+    try {
+      remoteMeta = await objectStorage.headObject(storedObjectKey);
+    } catch {
+      remoteMeta = null;
+    }
+    if (!remoteMeta) return "";
+    let shouldDownload = true;
+    try {
+      const localStat = fs.statSync(outputPath);
+      shouldDownload = Math.max(0, Number(localStat?.size || 0)) !== Math.max(0, Number(remoteMeta.size || 0));
+    } catch {
+      shouldDownload = true;
+    }
+    if (shouldDownload) {
+      const tmpPath = `${outputPath}.tmp-${process.pid}-${Date.now()}`;
+      await objectStorage.downloadObjectToFile(storedObjectKey, tmpPath);
+      fs.renameSync(tmpPath, outputPath);
+    }
+    return outputPath;
+  }
+  const storedFile = String(intent.storedFile || "").trim();
+  if (!storedFile) return "";
+  const localPath = path.join(FILES_DIR, storedFile);
+  return fs.existsSync(localPath) ? localPath : "";
+}
+
+async function serveStoredIntentDownload(req, res, intent = null, dispositionType = "attachment") {
+  const safeName = safeBasename(String(intent?.fileName || "file"));
+  const storedObjectKey = String(intent?.storedObjectKey || "").trim();
+  if (storedObjectKey && objectStorage.isEnabled()) {
+    await serveFileFromObjectStorage(req, res, storedObjectKey, safeName, dispositionType);
+    return;
+  }
+  const storedFile = String(intent?.storedFile || "").trim();
+  const filePath = storedFile ? path.join(FILES_DIR, storedFile) : "";
+  serveFileFromDisk(req, res, filePath, safeName, dispositionType);
+}
+
 function extractZipEntryToPath(zipPath, entryPath, outputPath) {
   const normalizedEntry = normalizeZipPath(entryPath);
   if (!normalizedEntry) {
@@ -1299,6 +1419,225 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    const accountIntentUploadInitMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/object-upload\/init$/i)
+      : null;
+    if (accountIntentUploadInitMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+      if (!objectStorage.isEnabled()) {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: true, enabled: false }));
+        return;
+      }
+
+      const intentId = String(accountIntentUploadInitMatch[1] || "").trim();
+      const intent = loadIntent(intentId);
+      if (!intent) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Intent not found" }));
+        return;
+      }
+      if (intent.from !== username) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
+        return;
+      }
+      if (intent.isTextOnly || String(intent.messageType || "").toLowerCase() === "text") {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Text intents do not need file upload" }));
+        return;
+      }
+
+      let body = {};
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch (err) {
+        const status = Number(err?.status || 400);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Invalid request body") }));
+        return;
+      }
+
+      const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
+      if (!Number.isFinite(expectedBytes) || expectedBytes <= 0) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Intent has invalid upload size" }));
+        return;
+      }
+
+      const requestBytes = Math.max(0, Number(body?.size || 0));
+      if (requestBytes > 0 && requestBytes !== expectedBytes) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload size does not match intent" }));
+        return;
+      }
+
+      if (intent.stored && hasStoredAsset(intent) && String(intent.transferState || "") !== "uploading") {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          enabled: true,
+          intentId,
+          alreadyStored: true,
+          bytesExpected: expectedBytes,
+          plainBytesExpected: Number(intent.fileSize || 0)
+        }));
+        return;
+      }
+
+      if (intent.storedObjectKey) {
+        try { await objectStorage.deleteObject(intent.storedObjectKey); } catch {}
+      }
+      removeIntentCachedObjectFile(intent.id);
+
+      const safeName = safeBasename(String(body?.name || intent.fileName || "file"));
+      const mime = contentTypeForName(safeName);
+      const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${safeName}`;
+      const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName);
+      const uploadPlan = await objectStorage.createUploadUrl(objectKey, mime);
+      if (!uploadPlan?.url) {
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Could not create upload URL" }));
+        return;
+      }
+
+      intent.stored = false;
+      intent.storedFile = storedFileName;
+      intent.storedObjectKey = objectKey;
+      intent.storedBytes = 0;
+      intent.plainStoredBytes = 0;
+      intent.status = "uploading";
+      intent.transferState = "uploading";
+      intent.updatedAt = Date.now();
+      saveIntent(intent);
+      emitTransferState(intent, "uploading", {
+        sentBytes: 0,
+        totalBytes: expectedBytes,
+        plainSentBytes: 0,
+        plainTotalBytes: Number(intent.fileSize || 0)
+      });
+
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        enabled: true,
+        intentId,
+        upload: uploadPlan,
+        bytesExpected: expectedBytes,
+        plainBytesExpected: Number(intent.fileSize || 0),
+        storedFile: storedFileName
+      }));
+      return;
+    }
+
+    const accountIntentUploadCompleteMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/object-upload\/complete$/i)
+      : null;
+    if (accountIntentUploadCompleteMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+      if (!objectStorage.isEnabled()) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Object storage is not configured" }));
+        return;
+      }
+
+      const intentId = String(accountIntentUploadCompleteMatch[1] || "").trim();
+      const intent = loadIntent(intentId);
+      if (!intent) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Intent not found" }));
+        return;
+      }
+      if (intent.from !== username) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
+        return;
+      }
+      if (!intent.storedObjectKey) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload has not been initialized" }));
+        return;
+      }
+
+      let body = {};
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch (err) {
+        const status = Number(err?.status || 400);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Invalid request body") }));
+        return;
+      }
+
+      const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
+      if (!head) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Uploaded file not found" }));
+        return;
+      }
+
+      const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
+      const actualBytes = Math.max(0, Number(head.size || body?.size || 0));
+      if (expectedBytes > 0 && actualBytes !== expectedBytes) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Uploaded file size does not match intent" }));
+        return;
+      }
+
+      intent.status = "stored";
+      intent.transferState = "delivered";
+      intent.stored = true;
+      intent.storedBytes = actualBytes;
+      intent.plainStoredBytes = uploadBytesToPlainBytes(intent, actualBytes);
+      intent.uploadedAt = Date.now();
+      intent.updatedAt = intent.uploadedAt;
+      saveIntent(intent);
+      emitTransferState(intent, "delivered", {
+        sentBytes: actualBytes,
+        totalBytes: expectedBytes || actualBytes,
+        plainSentBytes: intent.plainStoredBytes,
+        plainTotalBytes: Number(intent.fileSize || 0)
+      });
+      if (intent.groupId) {
+        finalizeGroupRecipientCopies(intent, {
+          storedBytes: actualBytes,
+          totalBytes: expectedBytes || actualBytes,
+          uploadedAt: intent.uploadedAt
+        });
+      }
+      sendToUser(intent.from, {
+        type: "upload_done",
+        intentId: intent.id,
+        deliveryHeld: isIntentDeliveryHeld(intent)
+      });
+
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        intentId: intent.id,
+        storedFile: intent.storedFile || null,
+        bytesStored: actualBytes,
+        deliveryHeld: isIntentDeliveryHeld(intent)
+      }));
+      return;
+    }
+
     if (req.method === "POST" && url.pathname === "/api/file-holder/upload") {
       setCors(res);
       const username = extractUsernameFromRequest(req, url);
@@ -1332,12 +1671,22 @@ const server = http.createServer(async (req, res) => {
       const ext = String(path.extname(safeName || "") || "").toLowerCase().replace(/[^a-z0-9.]/g, "").slice(0, 12);
       const storedFile = `${now}-${itemId}${ext || ""}`;
       const outputPath = path.join(FILE_HOLDER_DIR, storedFile);
+      const tempPath = objectStorage.isEnabled()
+        ? path.join(os.tmpdir(), `merm-file-holder-${itemId}${ext || ""}`)
+        : outputPath;
 
       try {
-        const streamed = await streamRequestBodyToFile(req, outputPath, FILE_HOLDER_MAX_FILE_BYTES);
+        const streamed = await streamRequestBodyToFile(req, tempPath, FILE_HOLDER_MAX_FILE_BYTES);
+        let storedObjectKey = null;
+        if (objectStorage.isEnabled()) {
+          storedObjectKey = objectStorage.buildFileHolderObjectKey(username, itemId, safeName);
+          await objectStorage.putFile(storedObjectKey, tempPath, mime);
+          try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+        }
         const nextEntry = {
           id: itemId,
           storedFile,
+          storedObjectKey,
           name: safeName,
           size: Math.max(0, Number(streamed?.bytes || 0)),
           mime,
@@ -1362,7 +1711,13 @@ const server = http.createServer(async (req, res) => {
           state
         }));
       } catch (err) {
-        try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
+        try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+        if (objectStorage.isEnabled()) {
+          try {
+            const objectKey = objectStorage.buildFileHolderObjectKey(username, itemId, safeName);
+            await objectStorage.deleteObject(objectKey);
+          } catch {}
+        }
         const status = Number(err?.status || 500);
         res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: String(err?.message || "Upload failed") }));
@@ -1399,8 +1754,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const storedFile = safeBasename(String(item?.storedFile || "").trim());
-      const filePath = path.join(FILE_HOLDER_DIR, storedFile);
-      if (!storedFile || !fs.existsSync(filePath)) {
+      const storedObjectKey = String(item?.storedObjectKey || "").trim();
+      const filePath = storedFile ? path.join(FILE_HOLDER_DIR, storedFile) : "";
+      let missing = false;
+      if (storedObjectKey && objectStorage.isEnabled()) {
+        const head = await objectStorage.headObject(storedObjectKey).catch(() => null);
+        missing = !head;
+      } else {
+        missing = !storedFile || !fs.existsSync(filePath);
+      }
+      if (missing) {
         updateUserFileHolderState(username, (draft) => {
           const next = draft.filter((entry) => String(entry?.id || "") !== itemId);
           if (next.length === draft.length) return false;
@@ -1413,6 +1776,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const dispositionType = String(url.searchParams.get("mode") || "").toLowerCase() === "inline" ? "inline" : "attachment";
+      if (storedObjectKey && objectStorage.isEnabled()) {
+        await serveFileFromObjectStorage(req, res, storedObjectKey, String(item?.name || "file"), dispositionType);
+        return;
+      }
       serveFileFromDisk(req, res, filePath, String(item?.name || "file"), dispositionType);
       return;
     }
@@ -1477,7 +1844,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const intent = loadIntent(intentId);
-      if (!intent || !intent.stored || !intent.storedFile) {
+      if (!intent || !hasStoredAsset(intent)) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("File not found");
         return;
@@ -1492,8 +1859,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const filePath = path.join(FILES_DIR, intent.storedFile);
-      if (!fs.existsSync(filePath)) {
+      const filePath = await ensureIntentStoredFilePath(intent);
+      if (!filePath) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("File missing");
         return;
@@ -1633,7 +2000,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const intent = loadIntent(intentId);
-      if (!intent || !intent.stored || !intent.storedFile) {
+      if (!intent || !hasStoredAsset(intent)) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("File not found");
         return;
@@ -1648,8 +2015,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const filePath = path.join(FILES_DIR, intent.storedFile);
-      if (!fs.existsSync(filePath)) {
+      const filePath = await ensureIntentStoredFilePath(intent);
+      if (!filePath) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("File missing");
         return;
@@ -1712,7 +2079,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const intent = loadIntent(intentId);
-      if (!intent || !intent.stored || !intent.storedFile) {
+      if (!intent || !hasStoredAsset(intent)) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("File not found");
         return;
@@ -1727,17 +2094,9 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const filePath = path.join(FILES_DIR, intent.storedFile);
-      if (!fs.existsSync(filePath)) {
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("File missing");
-        return;
-      }
-
-      const safeName = safeBasename(intent.fileName || "file");
       const mode = String(url.searchParams.get("disposition") || "").toLowerCase();
       const dispositionType = mode === "inline" ? "inline" : "attachment";
-      serveFileFromDisk(req, res, filePath, safeName, dispositionType);
+      await serveStoredIntentDownload(req, res, intent, dispositionType);
       return;
     }
 
@@ -1756,8 +2115,10 @@ const wss = new WebSocket.Server({
 
 
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const bcrypt = require("bcryptjs");
+const objectStorage = require("./object-storage");
 
 
 // ✅ IMPORTANT: persistence across redeploys requires a durable disk.
@@ -1777,7 +2138,117 @@ const FILE_HOLDER_DIR = path.join(STORAGE_DIR, "file-holder");
 const USERS_DIR = path.join(STORAGE_DIR, "users");
 const GROUPS_DIR = path.join(STORAGE_DIR, "groups");
 const PREVIEW_CACHE_DIR = path.join(STORAGE_DIR, "preview-cache");
+const OBJECT_CACHE_DIR = path.join(STORAGE_DIR, "object-cache");
 const GUEST_TRANSFER_REQUESTS_FILE = path.join(STORAGE_DIR, "guest-transfer-requests.json");
+
+function storedAssetIdFromIntent(intent = null) {
+  if (!intent || typeof intent !== "object") return "";
+  const objectKey = String(intent.storedObjectKey || "").trim();
+  if (objectKey) return `object:${objectKey}`;
+  const storedFile = String(intent.storedFile || "").trim();
+  if (storedFile) return `file:${storedFile}`;
+  return "";
+}
+
+function hasStoredAsset(intent = null) {
+  return Boolean(intent?.stored) && Boolean(storedAssetIdFromIntent(intent));
+}
+
+function resolveStoredAssetSize(intent = null) {
+  const fromMeta = Math.max(
+    0,
+    Number(
+      intent?.storedBytes ||
+      intent?.uploadBytesExpected ||
+      intent?.fileSize ||
+      0
+    )
+  );
+  if (fromMeta > 0) return fromMeta;
+  const storedFile = String(intent?.storedFile || "").trim();
+  if (!storedFile) return 0;
+  try {
+    const fullPath = path.join(FILES_DIR, storedFile);
+    const stat = fs.statSync(fullPath);
+    return Math.max(0, Number(stat?.size || 0));
+  } catch {
+    return 0;
+  }
+}
+
+function resolveIntentObjectCachePath(intent = null) {
+  const id = objectStorage.sanitizeKeySegment(String(intent?.id || "").trim());
+  if (!id) return "";
+  const ext = String(path.extname(String(intent?.fileName || "") || "") || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9.]/g, "")
+    .slice(0, 12);
+  return path.join(OBJECT_CACHE_DIR, `${id}${ext || ""}`);
+}
+
+function removeIntentCachedObjectFile(intentId = "") {
+  const safeId = objectStorage.sanitizeKeySegment(String(intentId || "").trim());
+  if (!safeId) return;
+  try {
+    const entries = fs.readdirSync(OBJECT_CACHE_DIR);
+    entries.forEach((name) => {
+      if (!String(name || "").startsWith(safeId)) return;
+      try { fs.unlinkSync(path.join(OBJECT_CACHE_DIR, name)); } catch {}
+    });
+  } catch {}
+}
+
+function deleteStoredAssetForIntent(intent = null) {
+  if (!intent || typeof intent !== "object") return;
+  const objectKey = String(intent.storedObjectKey || "").trim();
+  if (objectKey && objectStorage.isEnabled()) {
+    objectStorage.deleteObject(objectKey).catch((err) => {
+      try { console.error("❌ Failed to delete object storage asset:", err); } catch {}
+    });
+  }
+  const storedFile = String(intent.storedFile || "").trim();
+  if (storedFile) {
+    try {
+      const filePath = path.join(FILES_DIR, storedFile);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch {}
+  }
+  removeIntentCachedObjectFile(intent.id);
+}
+
+function collectStoredIntentAssets(limit = Infinity) {
+  const rows = [];
+  const seen = new Set();
+  try {
+    const files = fs.readdirSync(INTENTS_DIR).filter((name) => name.endsWith(".json"));
+    for (const file of files) {
+      let intent = null;
+      try {
+        intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
+      } catch {
+        intent = null;
+      }
+      if (!isFileIntent(intent)) continue;
+      const assetId = storedAssetIdFromIntent(intent);
+      if (!assetId || seen.has(assetId)) continue;
+      seen.add(assetId);
+      rows.push({
+        assetId,
+        storedFile: String(intent?.storedFile || "").trim() || null,
+        storedObjectKey: String(intent?.storedObjectKey || "").trim() || null,
+        name: String(intent?.fileName || intent?.storedFile || "file"),
+        size: resolveStoredAssetSize(intent),
+        intentId: String(intent?.id || "").trim() || null,
+        from: String(intent?.from || "").trim() || null,
+        to: String(intent?.to || "").trim() || null,
+        createdAt: Number(intent?.createdAt || 0) || null,
+        expiresAt: Number(intent?.expiresAt || 0) || null
+      });
+      if (rows.length >= limit) break;
+    }
+  } catch {}
+  return rows;
+}
 
 function countUsers() {
   try {
@@ -1823,17 +2294,19 @@ function sendStatsSnapshot(ws = null) {
 
 function mapStoredFilesToIntents() {
   const map = new Map();
-  try {
-    const files = fs.readdirSync(INTENTS_DIR).filter(f => f.endsWith(".json"));
-    for (const file of files) {
-      try {
-        const intent = JSON.parse(fs.readFileSync(path.join(INTENTS_DIR, file), "utf8"));
-        if (intent?.stored && intent?.storedFile) {
-          map.set(intent.storedFile, intent);
-        }
-      } catch {}
-    }
-  } catch {}
+  collectStoredIntentAssets().forEach((entry) => {
+    const storedFile = String(entry?.storedFile || "").trim();
+    if (!storedFile) return;
+    map.set(storedFile, {
+      id: entry.intentId,
+      fileName: entry.name,
+      from: entry.from,
+      to: entry.to,
+      createdAt: entry.createdAt,
+      storedFile,
+      storedObjectKey: entry.storedObjectKey
+    });
+  });
   return map;
 }
 
@@ -1857,24 +2330,18 @@ function deleteStoredFileAndNotify(storedFile) {
   const safeName = String(storedFile || "").trim();
   if (!safeName) return;
 
-  const filePath = path.join(FILES_DIR, safeName);
-  try {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch (err) {
-    console.error("❌ Failed to delete stored file:", err);
-    throw err;
-  }
-
   const intents = findIntentsByStoredFile(safeName);
   intents.forEach((intent) => deleteIntentAndNotify(intent));
 }
 
 function deleteIntentAndNotify(intent) {
   if (!intent) return;
+  deleteStoredAssetForIntent(intent);
   const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
   try { if (fs.existsSync(intentFile)) fs.unlinkSync(intentFile); } catch {}
   invalidateIntentListCacheForIntent(intent);
   removePreviewCacheForIntent(intent.id);
+  removeIntentCachedObjectFile(intent.id);
   archiveIndexCache.delete(String(intent.id || ""));
 
   const senderOnline = isUserOnline(intent.from);
@@ -1916,11 +2383,7 @@ function cleanupExpiredIntents() {
       if (!effectiveExpiry) continue;
       if (now < effectiveExpiry) continue;
 
-      if (intent.stored && intent.storedFile) {
-        const filePath = path.join(FILES_DIR, intent.storedFile);
-        try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
-      }
-
+      deleteStoredAssetForIntent(intent);
       deleteIntentAndNotify(intent);
       try {
         const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
@@ -1962,48 +2425,39 @@ function cleanupOrphanStoredFiles() {
         fs.unlinkSync(path.join(PREVIEW_CACHE_DIR, name));
       } catch {}
     });
+
+    const objectCacheFiles = fs.readdirSync(OBJECT_CACHE_DIR);
+    objectCacheFiles.forEach((name) => {
+      const stem = String(name || "").split(".")[0] || "";
+      if (!stem || intentIds.has(stem)) return;
+      try {
+        fs.unlinkSync(path.join(OBJECT_CACHE_DIR, name));
+      } catch {}
+    });
   } catch {}
 }
 
 function countStoredFiles() {
-  try {
-    return fs.readdirSync(FILES_DIR).length;
-  } catch {
-    return 0;
-  }
+  return collectStoredIntentAssets().length;
 }
 
 function storageBytesUsed() {
-  try {
-    return fs.readdirSync(FILES_DIR).reduce((sum, name) => {
-      try {
-        return sum + fs.statSync(path.join(FILES_DIR, name)).size;
-      } catch {
-        return sum;
-      }
-    }, 0);
-  } catch {
-    return 0;
-  }
+  return collectStoredIntentAssets().reduce((sum, entry) => {
+    return sum + Math.max(0, Number(entry?.size || 0));
+  }, 0);
 }
 
 function largestStoredFiles(limit = 50) {
   try {
-    const intentMap = mapStoredFilesToIntents();
-    const files = fs.readdirSync(FILES_DIR).map((name) => {
-      const full = path.join(FILES_DIR, name);
-      const size = fs.statSync(full).size;
-      const intent = intentMap.get(name);
-      return {
-        storedFile: name,
-        name: intent?.fileName || name,
-        size,
-        intentId: intent?.id || null,
-        from: intent?.from || null,
-        to: intent?.to || null,
-        createdAt: intent?.createdAt || null
-      };
-    });
+    const files = collectStoredIntentAssets().map((entry) => ({
+      storedFile: entry.storedFile || (entry.storedObjectKey ? `obj:${entry.storedObjectKey}` : null),
+      name: entry.name,
+      size: Math.max(0, Number(entry.size || 0)),
+      intentId: entry.intentId || null,
+      from: entry.from || null,
+      to: entry.to || null,
+      createdAt: entry.createdAt || null
+    }));
     files.sort((a, b) => b.size - a.size);
     return files.slice(0, limit);
   } catch {
@@ -2013,7 +2467,7 @@ function largestStoredFiles(limit = 50) {
 
 function isFileIntent(intent) {
   if (!intent) return false;
-  if (!intent.stored || !intent.storedFile) return false;
+  if (!hasStoredAsset(intent)) return false;
   if (intent.isTextOnly || intent.messageType === "text") return false;
   return true;
 }
@@ -2021,12 +2475,8 @@ function isFileIntent(intent) {
 function resolveStoredFileSize(storedFile) {
   const safeName = String(storedFile || "").trim();
   if (!safeName) return null;
-  try {
-    const filePath = path.join(FILES_DIR, safeName);
-    if (fs.existsSync(filePath)) {
-      return fs.statSync(filePath).size;
-    }
-  } catch {}
+  const intent = findIntentsByStoredFile(safeName)[0] || null;
+  if (intent) return resolveStoredAssetSize(intent);
   return null;
 }
 
@@ -2066,16 +2516,17 @@ function buildUserStoragePayload(username) {
       if (from !== username) continue;
       if (intent?.isGroupRecipientCopy && intent.to !== username) continue;
 
-      const fileSizeOnDisk = resolveStoredFileSize(intent.storedFile);
-      if (fileSizeOnDisk === null) continue;
-
+      const assetId = storedAssetIdFromIntent(intent);
+      if (!assetId) continue;
+      const fileSizeOnDisk = resolveStoredAssetSize(intent);
       sentStoredFilesCount += 1;
-      if (!countedStoredFiles.has(intent.storedFile)) {
-        countedStoredFiles.add(intent.storedFile);
+      if (!countedStoredFiles.has(assetId)) {
+        countedStoredFiles.add(assetId);
         usedBytes += fileSizeOnDisk;
       }
       sentFiles.push({
         storedFile: intent.storedFile,
+        storedObjectKey: String(intent.storedObjectKey || "").trim() || null,
         name: intent.fileName || intent.storedFile,
         size: fileSizeOnDisk,
         intentId: intent.id || null,
@@ -2450,6 +2901,7 @@ fs.mkdirSync(FILE_HOLDER_DIR, { recursive: true });
 fs.mkdirSync(USERS_DIR, { recursive: true });
 fs.mkdirSync(GROUPS_DIR, { recursive: true });
 fs.mkdirSync(PREVIEW_CACHE_DIR, { recursive: true });
+fs.mkdirSync(OBJECT_CACHE_DIR, { recursive: true });
 
 
 function saveIntent(intent) {
@@ -3009,6 +3461,7 @@ function finalizeGroupRecipientCopies(primaryIntent, options = {}) {
     if (!mirror) return;
     mirror.stored = true;
     mirror.storedFile = primary.storedFile || mirror.storedFile || null;
+    mirror.storedObjectKey = primary.storedObjectKey || mirror.storedObjectKey || null;
     mirror.storedBytes = storedBytes;
     mirror.plainStoredBytes = uploadBytesToPlainBytes(mirror, storedBytes);
     mirror.uploadBytesExpected = Number(mirror.uploadBytesExpected || primary.uploadBytesExpected || totalBytes || 0);
@@ -3814,7 +4267,8 @@ function normalizeFileHolderEntry(entry = null) {
   const id = String(entry.id || entry.itemId || "").trim().slice(0, 128);
   if (!id) return null;
   const storedFile = safeBasename(String(entry.storedFile || "").trim());
-  if (!storedFile) return null;
+  const storedObjectKey = String(entry.storedObjectKey || "").trim();
+  if (!storedFile && !storedObjectKey) return null;
   const name = safeBasename(String(entry.name || entry.fileName || "file").trim() || "file");
   const sizeRaw = Number(entry.size || entry.bytes || 0);
   const size = Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.floor(sizeRaw) : 0;
@@ -3824,7 +4278,8 @@ function normalizeFileHolderEntry(entry = null) {
   const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? Math.floor(updatedAtRaw) : createdAt;
   return {
     id,
-    storedFile,
+    storedFile: storedFile || null,
+    storedObjectKey: storedObjectKey || null,
     name,
     size,
     mime: normalizeFileHolderMime(entry.mime || entry.contentType || "", name),
@@ -3839,15 +4294,21 @@ function sanitizeFileHolderEntries(list = []) {
   for (const raw of Array.isArray(list) ? list : []) {
     const entry = normalizeFileHolderEntry(raw);
     if (!entry || seen.has(entry.id)) continue;
-    const fullPath = path.join(FILE_HOLDER_DIR, entry.storedFile);
-    try {
-      const stat = fs.statSync(fullPath);
-      if (!stat.isFile()) continue;
-      if (!Number.isFinite(entry.size) || entry.size <= 0) {
-        entry.size = Math.max(0, Number(stat.size || 0));
+    if (entry.storedObjectKey && objectStorage.isEnabled()) {
+      if (!Number.isFinite(entry.size) || entry.size < 0) {
+        entry.size = 0;
       }
-    } catch {
-      continue;
+    } else {
+      const fullPath = path.join(FILE_HOLDER_DIR, String(entry.storedFile || "").trim());
+      try {
+        const stat = fs.statSync(fullPath);
+        if (!stat.isFile()) continue;
+        if (!Number.isFinite(entry.size) || entry.size <= 0) {
+          entry.size = Math.max(0, Number(stat.size || 0));
+        }
+      } catch {
+        continue;
+      }
     }
     seen.add(entry.id);
     out.push(entry);
@@ -3864,6 +4325,7 @@ function sameFileHolderEntries(a = [], b = []) {
     const right = b[i] || {};
     if (String(left.id || "") !== String(right.id || "")) return false;
     if (String(left.storedFile || "") !== String(right.storedFile || "")) return false;
+    if (String(left.storedObjectKey || "") !== String(right.storedObjectKey || "")) return false;
     if (String(left.name || "") !== String(right.name || "")) return false;
     if (Number(left.size || 0) !== Number(right.size || 0)) return false;
     if (String(left.mime || "") !== String(right.mime || "")) return false;
@@ -3884,6 +4346,7 @@ function fileHolderStateForClient(userRecord = null) {
       id: String(entry.id || "").trim(),
       name: String(entry.name || "file"),
       size: Math.max(0, Number(entry.size || 0)),
+      storedFile: String(entry.storedFile || "").trim() || null,
       mime: normalizeFileHolderMime(entry.mime || "", entry.name || ""),
       createdAt: Math.max(0, Number(entry.createdAt || 0) || 0),
       updatedAt: Math.max(0, Number(entry.updatedAt || 0) || 0)
@@ -3891,8 +4354,12 @@ function fileHolderStateForClient(userRecord = null) {
   };
 }
 
-function removeFileHolderStoredFile(storedFile = "") {
-  const safeName = safeBasename(String(storedFile || "").trim());
+function removeFileHolderStoredEntry(entry = null) {
+  const storedObjectKey = String(entry?.storedObjectKey || "").trim();
+  if (storedObjectKey && objectStorage.isEnabled()) {
+    objectStorage.deleteObject(storedObjectKey).catch(() => {});
+  }
+  const safeName = safeBasename(String(entry?.storedFile || "").trim());
   if (!safeName) return;
   const fullPath = path.join(FILE_HOLDER_DIR, safeName);
   try {
@@ -3931,8 +4398,10 @@ function updateUserFileHolderState(username = "", mutator = null, options = {}) 
   const retainedStored = new Set(nextItems.map((entry) => String(entry?.storedFile || "").trim()).filter(Boolean));
   prevItems.forEach((entry) => {
     const stored = String(entry?.storedFile || "").trim();
-    if (!stored || retainedStored.has(stored)) return;
-    removeFileHolderStoredFile(stored);
+    const objectKey = String(entry?.storedObjectKey || "").trim();
+    const retainedObject = nextItems.some((row) => String(row?.storedObjectKey || "").trim() === objectKey && objectKey);
+    if ((!stored || retainedStored.has(stored)) && (!objectKey || retainedObject)) return;
+    removeFileHolderStoredEntry(entry);
   });
 
   const clientState = fileHolderStateForClient(user);
@@ -4455,7 +4924,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
 
   ws.username = null;
 
-  ws.on("message", (msg, isBinary) => {
+  ws.on("message", async (msg, isBinary) => {
     try {
 
 
@@ -4621,7 +5090,7 @@ if (data.type === "delete_account") {
       const shaped = ensureUserShape(selfUser);
       const entries = sanitizeFileHolderEntries((shaped.fileHolderState || {}).items || []);
       entries.forEach((entry) => {
-        removeFileHolderStoredFile(String(entry?.storedFile || ""));
+        removeFileHolderStoredEntry(entry);
       });
     }
     if (fs.existsSync(userPath)) fs.unlinkSync(userPath);
@@ -4950,13 +5419,8 @@ if (data.type === "download_ws_request") {
   if (intent.to !== ws.username && intent.from !== ws.username) {
     return send(ws, { type: "error", message: "Not authorized for this intent", intentId });
   }
-  if (!intent.stored || !intent.storedFile) {
+  if (!hasStoredAsset(intent)) {
     return send(ws, { type: "error", message: "File not stored on server", intentId });
-  }
-
-  const filePath = path.join(FILES_DIR, intent.storedFile);
-  if (!fs.existsSync(filePath)) {
-    return send(ws, { type: "error", message: "Stored file missing", intentId });
   }
 
   // Tell browser what's coming
@@ -4967,7 +5431,18 @@ if (data.type === "download_ws_request") {
     size: intent.fileSize,
   });
 
-  const rs = fs.createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024 });
+  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  const rs = storedObjectKey && objectStorage.isEnabled()
+    ? ((await objectStorage.getObjectStream(storedObjectKey))?.body || null)
+    : (() => {
+        const filePath = path.join(FILES_DIR, String(intent.storedFile || "").trim());
+        return fs.existsSync(filePath)
+          ? fs.createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024 })
+          : null;
+      })();
+  if (!rs) {
+    return send(ws, { type: "error", message: "Stored file missing", intentId });
+  }
 
   rs.on("data", (chunk) => {
     if (ws.readyState === WebSocket.OPEN) {
@@ -5018,16 +5493,7 @@ if (data.type === "delete_intent") {
   }
 
   // 🗑️ Delete stored file if it exists
-  if (intent.stored && intent.storedFile) {
-    const filePath = path.join(FILES_DIR, intent.storedFile);
-    try {
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-    } catch (err) {
-      console.error("❌ Failed to delete file:", err);
-    }
-  }
+  deleteStoredAssetForIntent(intent);
 
   // 🗑️ Delete intent JSON
   try {
@@ -5079,7 +5545,7 @@ if (data.type === "download_request") {
     return send(ws, { type: "error", message: "Not authorized" });
   }
 
-  if (!intent.stored || !intent.storedFile) {
+  if (!hasStoredAsset(intent)) {
     return send(ws, { type: "error", message: "File not stored on server" });
   }
 
@@ -5134,7 +5600,11 @@ if (intentOnDisk?.stored) {
     let host = ws.publicIp;
     if (host.startsWith("::ffff:")) host = host.replace("::ffff:", "");
 
-    const filePath = path.join(FILES_DIR, downloadIntent.storedFile);
+    const filePath = await ensureIntentStoredFilePath(downloadIntent);
+    if (!filePath) {
+      console.error("❌ Download source missing for intent:", downloadIntent.id);
+      return;
+    }
     const stats = fs.statSync(filePath);
 
     console.log(`🔌 TCP connect for download ${host}:${ws.tcpPort}`);
@@ -5985,9 +6455,8 @@ if (data.type === "cancel_send") {
   }
 
   const storedFileName = String(intent.storedFile || "").trim();
-  if (storedFileName) {
-    const filePath = path.join(FILES_DIR, storedFileName);
-    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  if (storedFileName || intent.storedObjectKey) {
+    deleteStoredAssetForIntent(intent);
   }
 
   emitTransferState(intent, "canceled", {
@@ -6022,10 +6491,7 @@ if (data.type === "delete_message_everyone") {
     return send(ws, { type: "error", message: "Not authorized" });
   }
 
-  if (intent.stored && intent.storedFile) {
-    const filePath = path.join(FILES_DIR, intent.storedFile);
-    try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
-  }
+  deleteStoredAssetForIntent(intent);
 
   deleteIntentAndNotify(intent);
 
@@ -6261,6 +6727,25 @@ if (data.type === "add_friend") {
 
 
 // ============================
+// DIRECT OBJECT UPLOAD PROGRESS
+// ============================
+if (data.type === "upload_progress") {
+  const intentId = String(data.intentId || "").trim();
+  if (!intentId) return;
+  const intent = loadIntent(intentId);
+  if (!intent) return;
+  if (intent.from !== ws.username) return;
+  if (!intent.storedObjectKey || !objectStorage.isEnabled()) return;
+  const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
+  const sentBytes = Math.max(0, Math.min(Number(data.sentBytes || 0), expectedBytes || Number(data.sentBytes || 0)));
+  updateIntentUploadCheckpoint(intent, sentBytes, {
+    status: "uploading",
+    transferState: "uploading"
+  });
+  return;
+}
+
+// ============================
 // FILE UPLOAD BEGIN (Alice → Server)
 // ============================
 if (data.type === "upload_begin") {
@@ -6301,7 +6786,7 @@ if (size !== expectedBytes) {
   return send(ws, { type: "error", message: "Upload size does not match intent", intentId });
 }
 
-if (intent.stored && intent.storedFile && String(intent.transferState || "") !== "uploading") {
+if (hasStoredAsset(intent) && String(intent.transferState || "") !== "uploading") {
   ws.currentUploadIntentId = null;
   return send(ws, {
     type: "upload_ok",
@@ -6357,6 +6842,11 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
   // =========================
   if (!receiverWs) {
     const safeName = safeBasename(name);
+    if (intent.storedObjectKey && objectStorage.isEnabled()) {
+      try { await objectStorage.deleteObject(intent.storedObjectKey); } catch {}
+      intent.storedObjectKey = null;
+    }
+    removeIntentCachedObjectFile(intent.id);
     const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${safeName}`;
     const filePath = path.join(FILES_DIR, storedFileName);
     let existingBytes = 0;
@@ -6411,6 +6901,7 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
 // Persist linkage but DO NOT mark stored until upload_end finishes
 intent.stored = false;
 intent.storedFile = storedFileName;
+intent.storedObjectKey = null;
 intent.storedBytes = resumeFrom;
 intent.plainStoredBytes = uploadBytesToPlainBytes(intent, resumeFrom);
 intent.status = "uploading";
@@ -6493,7 +6984,7 @@ if (data.type === "upload_end") {
     if (intent.from !== ws.username) {
       return send(ws, { type: "error", message: "Not sender", intentId });
     }
-    if (intent.stored && intent.storedFile) {
+    if (hasStoredAsset(intent)) {
       return send(ws, {
         type: "upload_done",
         intentId,
@@ -6806,6 +7297,7 @@ if (data.type === "send_intent") {
   if (isTextOnly) {
     intent.stored = true;
     intent.storedFile = null;
+    intent.storedObjectKey = null;
     intent.storedBytes = 0;
     intent.plainStoredBytes = 0;
     intent.uploadedAt = now;
@@ -6829,6 +7321,7 @@ if (data.type === "send_intent") {
       if (isTextOnly) {
         mirrorIntent.stored = true;
         mirrorIntent.storedFile = null;
+        mirrorIntent.storedObjectKey = null;
         mirrorIntent.storedBytes = 0;
         mirrorIntent.plainStoredBytes = 0;
         mirrorIntent.uploadedAt = now;
