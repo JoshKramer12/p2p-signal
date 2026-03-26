@@ -1735,6 +1735,18 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, message: "Upload has not been initialized" }));
         return;
       }
+      if (intent.stored && hasStoredAsset(intent) && String(intent.transferState || "").toLowerCase() !== "uploading") {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          intentId: intent.id,
+          storedFile: intent.storedFile || null,
+          bytesStored: Number(intent.storedBytes || 0),
+          deliveryHeld: isIntentDeliveryHeld(intent),
+          alreadyStored: true
+        }));
+        return;
+      }
 
       let body = {};
       try {
@@ -1803,33 +1815,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      intent.status = "stored";
-      intent.transferState = "delivered";
-      intent.stored = true;
-      intent.objectUploadSession = null;
-      intent.storedBytes = actualBytes;
-      intent.plainStoredBytes = uploadBytesToPlainBytes(intent, actualBytes);
-      intent.uploadedAt = Date.now();
-      intent.updatedAt = intent.uploadedAt;
-      saveIntent(intent);
-      emitTransferState(intent, "delivered", {
-        sentBytes: actualBytes,
-        totalBytes: expectedBytes || actualBytes,
-        plainSentBytes: intent.plainStoredBytes,
-        plainTotalBytes: Number(intent.fileSize || 0)
-      });
-      if (intent.groupId) {
-        finalizeGroupRecipientCopies(intent, {
-          storedBytes: actualBytes,
-          totalBytes: expectedBytes || actualBytes,
-          uploadedAt: intent.uploadedAt
-        });
-      }
-      sendToUser(intent.from, {
-        type: "upload_done",
-        intentId: intent.id,
-        deliveryHeld: isIntentDeliveryHeld(intent)
-      });
+      finalizeObjectUploadIntent(intent, actualBytes, expectedBytes || actualBytes);
 
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       res.end(JSON.stringify({
@@ -1839,6 +1825,113 @@ const server = http.createServer(async (req, res) => {
         bytesStored: actualBytes,
         deliveryHeld: isIntentDeliveryHeld(intent)
       }));
+      return;
+    }
+
+    const accountIntentCancelMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/cancel$/i)
+      : null;
+    if (accountIntentCancelMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const intentId = String(accountIntentCancelMatch[1] || "").trim();
+      const intent = loadIntent(intentId);
+      if (!intent) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, intentId, status: "not_found", message: "Intent not found" }));
+        return;
+      }
+      if (intent.from !== username) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
+        return;
+      }
+
+      const transfer = activeTransfers.get(intentId) || null;
+      const status = String(intent.status || "");
+      const canCancel = Boolean(transfer) || status === "pending" || status === "uploading" || !intent.stored;
+      if (!canCancel) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, intentId, status: "ignored", message: "Intent is already finalized" }));
+        return;
+      }
+
+      if (transfer) {
+        failActiveTransfer(intentId, "Upload canceled by sender", {
+          notify: false,
+          deleteIntent: false,
+          suppressState: true
+        });
+      }
+
+      const storedFileName = String(intent.storedFile || "").trim();
+      if (storedFileName || intent.storedObjectKey) {
+        deleteStoredAssetForIntent(intent);
+      }
+      emitTransferState(intent, "canceled", {
+        sentBytes: Number(intent.storedBytes || 0),
+        totalBytes: Number(resolveUploadExpectedBytes(intent) || 0),
+        plainSentBytes: Number(intent.plainStoredBytes || 0),
+        plainTotalBytes: Number(intent.fileSize || 0),
+        retryable: false,
+        message: "Canceled by sender"
+      });
+      deleteIntentAndNotify(intent);
+
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({ ok: true, intentId, status: "canceled" }));
+      return;
+    }
+
+    const accountIntentDeleteEveryoneMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/delete-everyone$/i)
+      : null;
+    if (accountIntentDeleteEveryoneMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const intentId = String(accountIntentDeleteEveryoneMatch[1] || "").trim();
+      const intent = loadIntent(intentId);
+      if (!intent) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, intentId, status: "not_found", message: "Intent not found" }));
+        return;
+      }
+      if (intent.from !== username && intent.to !== username) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
+        return;
+      }
+
+      const transfer = activeTransfers.get(intentId) || null;
+      if (transfer) {
+        failActiveTransfer(intentId, "Deleted by user", {
+          notify: false,
+          deleteIntent: false,
+          suppressState: true
+        });
+      }
+
+      deleteStoredAssetForIntent(intent);
+      deleteIntentAndNotify(intent);
+
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({ ok: true, intentId, status: "deleted" }));
       return;
     }
 
@@ -3454,6 +3547,43 @@ function updateIntentUploadCheckpoint(intent, sentBytes, options = {}) {
   intent.transferState = String(options.transferState || intent.transferState || "uploading");
   intent.updatedAt = Date.now();
   try { saveIntent(intent); } catch {}
+}
+
+function finalizeObjectUploadIntent(intent, actualBytes, expectedBytes = 0) {
+  if (!intent || !intent.id) return false;
+  const bytesStored = Math.max(0, Number(actualBytes || 0));
+  const totalBytes = Math.max(0, Number(expectedBytes || resolveUploadExpectedBytes(intent) || bytesStored || 0));
+  if (intent.stored && String(intent.transferState || "").toLowerCase() === "delivered") {
+    return true;
+  }
+  intent.status = "stored";
+  intent.transferState = "delivered";
+  intent.stored = true;
+  intent.objectUploadSession = null;
+  intent.storedBytes = bytesStored;
+  intent.plainStoredBytes = uploadBytesToPlainBytes(intent, bytesStored);
+  intent.uploadedAt = Date.now();
+  intent.updatedAt = intent.uploadedAt;
+  saveIntent(intent);
+  emitTransferState(intent, "delivered", {
+    sentBytes: bytesStored,
+    totalBytes: totalBytes || bytesStored,
+    plainSentBytes: intent.plainStoredBytes,
+    plainTotalBytes: Number(intent.fileSize || 0)
+  });
+  if (intent.groupId) {
+    finalizeGroupRecipientCopies(intent, {
+      storedBytes: bytesStored,
+      totalBytes: totalBytes || bytesStored,
+      uploadedAt: intent.uploadedAt
+    });
+  }
+  sendToUser(intent.from, {
+    type: "upload_done",
+    intentId: intent.id,
+    deliveryHeld: isIntentDeliveryHeld(intent)
+  });
+  return true;
 }
 
 function maybeSendUploadProgress(t) {
@@ -6769,9 +6899,21 @@ if (data.type === "delete_message_everyone") {
     return send(ws, { type: "error", message: "Not authorized" });
   }
 
+  const transfer = activeTransfers.get(intentId) || null;
+  if (transfer) {
+    failActiveTransfer(intentId, "Deleted by user", {
+      notify: false,
+      deleteIntent: false,
+      suppressState: true
+    });
+  } else if (ws.currentUploadIntentId === intentId) {
+    ws.currentUploadIntentId = null;
+  }
+
   deleteStoredAssetForIntent(intent);
 
   deleteIntentAndNotify(intent);
+  send(ws, { type: "delete_message_everyone_ok", intentId, status: "deleted" });
 
   sendStatsSnapshot(ws);
   return;
@@ -7020,6 +7162,25 @@ if (data.type === "upload_progress") {
     status: "uploading",
     transferState: "uploading"
   });
+  emitTransferState(intent, "uploading", {
+    sentBytes,
+    totalBytes: expectedBytes,
+    plainSentBytes: uploadBytesToPlainBytes(intent, sentBytes),
+    plainTotalBytes: Number(intent.fileSize || 0)
+  });
+
+  if (
+    expectedBytes > 0 &&
+    sentBytes >= expectedBytes &&
+    !intent.stored &&
+    String(intent.transferState || "").toLowerCase() !== "delivered"
+  ) {
+    const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
+    const headSize = Math.max(0, Number(head?.size || 0));
+    if (head && headSize === expectedBytes) {
+      finalizeObjectUploadIntent(intent, headSize, expectedBytes);
+    }
+  }
   return;
 }
 
