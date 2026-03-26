@@ -1585,15 +1585,18 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
-      if (!head) {
-        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-        res.end(JSON.stringify({ ok: false, message: "Uploaded file not found" }));
-        return;
-      }
-
       const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
-      const actualBytes = Math.max(0, Number(head.size || body?.size || 0));
+      const reportedBytes = Math.max(0, Number(body?.size || 0));
+      let actualBytes = reportedBytes;
+      if (actualBytes <= 0) {
+        const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
+        if (!head) {
+          res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ ok: false, message: "Uploaded file not found" }));
+          return;
+        }
+        actualBytes = Math.max(0, Number(head.size || 0));
+      }
       if (expectedBytes > 0 && actualBytes !== expectedBytes) {
         res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: "Uploaded file size does not match intent" }));
