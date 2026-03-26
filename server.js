@@ -42,7 +42,7 @@ const OBJECT_MULTIPART_PART_SIZE_BYTES = Math.max(
 const OBJECT_MULTIPART_MAX_PARTS = 10000;
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
   1,
-  Math.min(12, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 10))
+  Math.min(14, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 12))
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
@@ -1536,13 +1536,13 @@ const server = http.createServer(async (req, res) => {
         }
         const partSize = Math.max(tunedPartSize, maxPartSizeByCount);
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
-        const recommendedConcurrency = expectedBytes >= 768 * 1024 * 1024
-          ? 10
-          : (expectedBytes >= 256 * 1024 * 1024
-            ? 9
-            : (expectedBytes >= 96 * 1024 * 1024
-              ? 8
-              : (expectedBytes >= 32 * 1024 * 1024 ? 6 : 4)));
+        const recommendedConcurrency = expectedBytes >= 1024 * 1024 * 1024
+          ? 12
+          : (expectedBytes >= 384 * 1024 * 1024
+            ? 11
+            : (expectedBytes >= 128 * 1024 * 1024
+              ? 10
+              : (expectedBytes >= 32 * 1024 * 1024 ? 8 : 5)));
         const maxConcurrency = Math.max(
           1,
           Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency, totalParts)
