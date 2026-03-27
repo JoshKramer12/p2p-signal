@@ -22,6 +22,18 @@ const ARCHIVE_PREVIEW_MAX_BYTES = Math.max(
 );
 const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
+const ARCHIVE_PREVIEW_WARMUP_MAX_BYTES = Math.max(
+  0,
+  Number(process.env.ARCHIVE_PREVIEW_WARMUP_MAX_BYTES || 3 * 1024 * 1024 * 1024)
+);
+const ARCHIVE_PREVIEW_WARMUP_MAX_ENTRIES = Math.max(
+  0,
+  Number(process.env.ARCHIVE_PREVIEW_WARMUP_MAX_ENTRIES || 12)
+);
+const ARCHIVE_PREVIEW_WARMUP_ENTRY_MAX_BYTES = Math.max(
+  512 * 1024,
+  Number(process.env.ARCHIVE_PREVIEW_WARMUP_ENTRY_MAX_BYTES || 40 * 1024 * 1024)
+);
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
 const INLINE_TINY_INTENT_MAX_BYTES = Math.max(
   1024,
@@ -119,7 +131,10 @@ const inboxes = new Map();
 // intentId -> { tcp: net.Socket, bytesExpected, bytesSent, senderWs, receiverWs }
 const activeTransfers = new Map();
 const archiveIndexCache = new Map(); // intentId -> { entries, archiveSize, archiveMtimeMs, cachedAt }
+const archiveIndexBuildJobs = new Map(); // `${intentId}:${archiveSize}:${archiveMtimeMs}` -> Promise<entries[]>
+const archivePreviewWarmupJobs = new Map(); // intentId -> Promise<void>
 const previewExtractJobs = new Map(); // cachePath -> Promise<void>
+const intentObjectCacheJobs = new Map(); // outputPath -> Promise<string>
 const intentListCacheByUser = new Map(); // username -> { ts, items }
 
 function getOnlineSocketSet(username = "") {
@@ -961,6 +976,202 @@ function setCachedArchiveIndex(intentId, archiveStat, entries = []) {
   pruneArchiveIndexCache();
 }
 
+function archiveIndexBuildJobKey(intentId, archiveStat = null) {
+  const id = String(intentId || "").trim();
+  if (!id) return "";
+  const size = Math.max(0, Number(archiveStat?.size || 0));
+  const mtimeMs = Math.max(0, Number(archiveStat?.mtimeMs || 0));
+  return `${id}:${size}:${mtimeMs}`;
+}
+
+function clearArchiveIndexBuildJobsForIntent(intentId = "") {
+  const id = String(intentId || "").trim();
+  if (!id) return;
+  const prefix = `${id}:`;
+  Array.from(archiveIndexBuildJobs.keys()).forEach((key) => {
+    if (String(key || "").startsWith(prefix)) {
+      archiveIndexBuildJobs.delete(key);
+    }
+  });
+}
+
+function isArchivePreviewPackageIntent(intent = null) {
+  const ext = String(path.extname(intent?.fileName || "") || "").toLowerCase();
+  return ext === ".zip" || ext === ".folder";
+}
+
+function isImageArchiveEntryName(name = "") {
+  const ext = String(path.extname(String(name || "").trim()) || "").toLowerCase();
+  return [
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+    ".heic", ".heif", ".avif", ".tif", ".tiff"
+  ].includes(ext);
+}
+
+async function buildArchiveIndexEntries(zipPath = "") {
+  let zipFile;
+  try {
+    zipFile = await openZipFile(zipPath, { lazyEntries: true, autoClose: true });
+  } catch (err) {
+    const nextErr = err instanceof Error ? err : new Error("Could not read package");
+    nextErr.status = 500;
+    throw nextErr;
+  }
+
+  const entries = await new Promise((resolve, reject) => {
+    const out = [];
+    let done = false;
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      zipFile.removeAllListeners("entry");
+      zipFile.removeAllListeners("error");
+      zipFile.removeAllListeners("end");
+      if (err) reject(err);
+      else resolve(out);
+    };
+
+    zipFile.on("entry", (entry) => {
+      const rawName = normalizeZipPath(entry?.fileName || "");
+      if (!rawName || rawName.includes("\0")) {
+        zipFile.readEntry();
+        return;
+      }
+
+      const dir = /\/$/.test(rawName);
+      const name = dir ? rawName : rawName.replace(/\/+$/, "");
+      const size = Number(entry?.uncompressedSize || 0);
+      const lastMod = entry?.getLastModDate instanceof Function ? entry.getLastModDate() : null;
+      const dateMs = lastMod instanceof Date ? lastMod.getTime() : 0;
+      out.push({
+        name,
+        dir,
+        size: Number.isFinite(size) && size >= 0 ? size : 0,
+        date: Number.isFinite(dateMs) && dateMs > 0 ? dateMs : 0
+      });
+      zipFile.readEntry();
+    });
+
+    zipFile.once("end", () => finish(null));
+    zipFile.once("error", (err) => finish(err));
+    zipFile.readEntry();
+  }).catch((err) => {
+    const nextErr = err instanceof Error ? err : new Error("Could not read package");
+    nextErr.status = 500;
+    throw nextErr;
+  });
+
+  entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  return entries;
+}
+
+async function getArchiveIndexEntries(intentId, zipPath, archiveStat) {
+  const cached = getCachedArchiveIndex(intentId, archiveStat);
+  if (cached) return cached;
+
+  const key = archiveIndexBuildJobKey(intentId, archiveStat);
+  if (!key) {
+    return buildArchiveIndexEntries(zipPath);
+  }
+
+  let job = archiveIndexBuildJobs.get(key);
+  if (!job) {
+    job = (async () => {
+      const existing = getCachedArchiveIndex(intentId, archiveStat);
+      if (existing) return existing;
+      const rows = await buildArchiveIndexEntries(zipPath);
+      setCachedArchiveIndex(intentId, archiveStat, rows);
+      return rows;
+    })().finally(() => {
+      archiveIndexBuildJobs.delete(key);
+    });
+    archiveIndexBuildJobs.set(key, job);
+  }
+  return job;
+}
+
+function pickArchivePreviewWarmupEntries(entries = []) {
+  const limit = Math.max(0, Number(ARCHIVE_PREVIEW_WARMUP_MAX_ENTRIES || 0));
+  if (!limit || !Array.isArray(entries) || !entries.length) return [];
+  const images = [];
+  const others = [];
+  for (const row of entries) {
+    if (!row || row.dir) continue;
+    const name = String(row.name || "").replace(/\\/g, "/");
+    if (!name || name.includes("\0") || name.includes("..")) continue;
+    const size = Math.max(0, Number(row?.size || 0));
+    if (size > ARCHIVE_PREVIEW_WARMUP_ENTRY_MAX_BYTES) continue;
+    if (isImageArchiveEntryName(name)) {
+      images.push(row);
+      continue;
+    }
+    if (others.length < limit) {
+      others.push(row);
+    }
+  }
+  const preferred = images.slice(0, limit);
+  if (preferred.length >= limit) return preferred;
+  const remaining = limit - preferred.length;
+  return preferred.concat(others.slice(0, remaining));
+}
+
+async function warmIntentArchivePreview(intent = null) {
+  if (!intent || !intent.id || !hasStoredAsset(intent)) return;
+  if (!isArchivePreviewPackageIntent(intent)) return;
+
+  const expectedBytes = Math.max(
+    0,
+    Number(intent?.storedBytes || intent?.uploadBytesExpected || intent?.fileSize || 0)
+  );
+  if (expectedBytes > ARCHIVE_PREVIEW_WARMUP_MAX_BYTES) return;
+
+  const filePath = await ensureIntentStoredFilePath(intent);
+  if (!filePath) return;
+
+  let archiveStat;
+  try {
+    archiveStat = fs.statSync(filePath);
+  } catch {
+    return;
+  }
+  if (!archiveStat?.isFile?.()) return;
+  if (Math.max(0, Number(archiveStat.size || 0)) > ARCHIVE_PREVIEW_MAX_BYTES) return;
+
+  let entries = [];
+  try {
+    entries = await getArchiveIndexEntries(intent.id, filePath, archiveStat);
+  } catch {
+    return;
+  }
+
+  const warmRows = pickArchivePreviewWarmupEntries(entries);
+  if (!warmRows.length) return;
+
+  for (const row of warmRows) {
+    const entryPath = String(row?.name || "").replace(/\\/g, "/").replace(/^\/+/, "");
+    if (!entryPath || entryPath.includes("..") || entryPath.includes("\0")) continue;
+    const safeName = safeBasename(path.basename(entryPath) || "file");
+    try {
+      await ensureZipEntryExtracted(intent.id, filePath, entryPath, safeName);
+    } catch {}
+  }
+}
+
+function queueIntentArchivePreviewWarmup(intent = null) {
+  const id = String(intent?.id || "").trim();
+  if (!id) return;
+  if (archivePreviewWarmupJobs.has(id)) return;
+  const job = (async () => {
+    const latest = loadIntent(id) || intent;
+    await warmIntentArchivePreview(latest);
+  })().catch(() => {
+    // Keep preview warmup best-effort and non-blocking.
+  }).finally(() => {
+    archivePreviewWarmupJobs.delete(id);
+  });
+  archivePreviewWarmupJobs.set(id, job);
+}
+
 function buildPreviewEntryCachePath(intentId, entryPath, safeName = "file") {
   const key = `${String(intentId || "")}\n${String(entryPath || "")}`;
   const hash = createHash("sha1").update(key).digest("hex");
@@ -1158,17 +1369,56 @@ async function ensureIntentStoredFilePath(intent = null) {
       remoteMeta = null;
     }
     if (!remoteMeta) return "";
+    const expectedSize = Math.max(0, Number(remoteMeta.size || 0));
     let shouldDownload = true;
     try {
       const localStat = fs.statSync(outputPath);
-      shouldDownload = Math.max(0, Number(localStat?.size || 0)) !== Math.max(0, Number(remoteMeta.size || 0));
+      shouldDownload = Math.max(0, Number(localStat?.size || 0)) !== expectedSize;
     } catch {
       shouldDownload = true;
     }
     if (shouldDownload) {
-      const tmpPath = `${outputPath}.tmp-${process.pid}-${Date.now()}`;
-      await objectStorage.downloadObjectToFile(storedObjectKey, tmpPath);
-      fs.renameSync(tmpPath, outputPath);
+      const cacheKey = String(outputPath || "").trim();
+      let job = intentObjectCacheJobs.get(cacheKey);
+      if (!job) {
+        job = (async () => {
+          let tmpPath = "";
+          try {
+            fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+          } catch {}
+          try {
+            tmpPath = `${outputPath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            await objectStorage.downloadObjectToFile(storedObjectKey, tmpPath);
+            try {
+              if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+            } catch {}
+            fs.renameSync(tmpPath, outputPath);
+            return outputPath;
+          } finally {
+            if (tmpPath) {
+              try {
+                if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+              } catch {}
+            }
+          }
+        })().finally(() => {
+          intentObjectCacheJobs.delete(cacheKey);
+        });
+        intentObjectCacheJobs.set(cacheKey, job);
+      }
+      try {
+        await job;
+      } catch {
+        return "";
+      }
+      try {
+        const localStat = fs.statSync(outputPath);
+        if (Math.max(0, Number(localStat?.size || 0)) !== expectedSize) {
+          return "";
+        }
+      } catch {
+        return "";
+      }
     }
     return outputPath;
   }
@@ -2259,72 +2509,15 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const cachedEntries = getCachedArchiveIndex(intentId, archiveStat);
-      if (cachedEntries) {
-        res.writeHead(200, {
-          "content-type": "application/json; charset=utf-8",
-          "cache-control": "no-store"
-        });
-        res.end(JSON.stringify({ intentId, entries: cachedEntries }));
-        return;
-      }
-
-      let zipFile;
+      let entries = [];
       try {
-        zipFile = await openZipFile(filePath, { lazyEntries: true, autoClose: true });
+        entries = await getArchiveIndexEntries(intentId, filePath, archiveStat);
       } catch {
         res.writeHead(500, { "content-type": "text/plain" });
         res.end("Could not read package");
         return;
       }
-
-      const entries = await new Promise((resolve, reject) => {
-        const out = [];
-        let done = false;
-        const finish = (err) => {
-          if (done) return;
-          done = true;
-          zipFile.removeAllListeners("entry");
-          zipFile.removeAllListeners("error");
-          zipFile.removeAllListeners("end");
-          if (err) reject(err);
-          else resolve(out);
-        };
-
-        zipFile.on("entry", (entry) => {
-          const rawName = normalizeZipPath(entry?.fileName || "");
-          if (!rawName || rawName.includes("\0")) {
-            zipFile.readEntry();
-            return;
-          }
-
-          const dir = /\/$/.test(rawName);
-          const name = dir ? rawName : rawName.replace(/\/+$/, "");
-          const size = Number(entry?.uncompressedSize || 0);
-          const lastMod = entry?.getLastModDate instanceof Function ? entry.getLastModDate() : null;
-          const dateMs = lastMod instanceof Date ? lastMod.getTime() : 0;
-          out.push({
-            name,
-            dir,
-            size: Number.isFinite(size) && size >= 0 ? size : 0,
-            date: Number.isFinite(dateMs) && dateMs > 0 ? dateMs : 0
-          });
-          zipFile.readEntry();
-        });
-
-        zipFile.once("end", () => finish(null));
-        zipFile.once("error", (err) => finish(err));
-        zipFile.readEntry();
-      }).catch(() => null);
-
-      if (!entries) {
-        res.writeHead(500, { "content-type": "text/plain" });
-        res.end("Could not read package");
-        return;
-      }
-
-      entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
-      setCachedArchiveIndex(intentId, archiveStat, entries);
+      queueIntentArchivePreviewWarmup(intent);
 
       res.writeHead(200, {
         "content-type": "application/json; charset=utf-8",
@@ -2760,6 +2953,12 @@ function deleteIntentAndNotify(intent) {
   removePreviewCacheForIntent(intent.id);
   removeIntentCachedObjectFile(intent.id);
   archiveIndexCache.delete(String(intent.id || ""));
+  clearArchiveIndexBuildJobsForIntent(intent.id);
+  archivePreviewWarmupJobs.delete(String(intent.id || ""));
+  const cachedObjectPath = resolveIntentObjectCachePath(intent);
+  if (cachedObjectPath) {
+    intentObjectCacheJobs.delete(cachedObjectPath);
+  }
 
   const senderOnline = isUserOnline(intent.from);
   const receiverOnline = isUserOnline(intent.to);
@@ -3674,6 +3873,7 @@ function finalizeObjectUploadIntent(intent, actualBytes, expectedBytes = 0) {
     intentId: intent.id,
     deliveryHeld: isIntentDeliveryHeld(intent)
   });
+  queueIntentArchivePreviewWarmup(intent);
   return true;
 }
 
@@ -3915,6 +4115,7 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
     intent.transferState = "delivered";
     intent.uploadedAt = Date.now();
     saveIntent(intent);
+    queueIntentArchivePreviewWarmup(intent);
 
     const receiverSockets = getOnlineSocketsForUser(intent.to);
     if (!intent.groupId && receiverSockets.length && !isIntentDeliveryHeld(intent)) {
@@ -4077,6 +4278,7 @@ function finalizeGroupRecipientCopies(primaryIntent, options = {}) {
     mirror.transferState = "delivered";
     mirror.uploadedAt = uploadedAt;
     saveIntent(mirror);
+    queueIntentArchivePreviewWarmup(mirror);
 
     emitTransferState(mirror, "delivered", {
       sentBytes: storedBytes,
@@ -7710,6 +7912,7 @@ if (t.mode === "live") {
         uploadedAt: t.intent.uploadedAt
       });
     }
+    queueIntentArchivePreviewWarmup(t.intent);
   }
 
   send(ws, { type: "upload_done", intentId, deliveryHeld: isIntentDeliveryHeld(t.intent) });
