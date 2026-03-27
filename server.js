@@ -58,7 +58,7 @@ const OBJECT_MULTIPART_PART_SIZE_BYTES = Math.max(
 const OBJECT_MULTIPART_MAX_PARTS = 10000;
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
   1,
-  Math.min(10, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 8))
+  Math.min(10, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 10))
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
@@ -1848,7 +1848,13 @@ const server = http.createServer(async (req, res) => {
           Math.ceil(expectedBytes / OBJECT_MULTIPART_MAX_PARTS)
         );
         let tunedPartSize = OBJECT_MULTIPART_PART_SIZE_BYTES;
-        if (expectedBytes >= 2 * 1024 * 1024 * 1024) {
+        if (expectedBytes >= 8 * 1024 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 40 * 1024 * 1024);
+        } else if (expectedBytes >= 4 * 1024 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 36 * 1024 * 1024);
+        } else if (expectedBytes >= 2 * 1024 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 32 * 1024 * 1024);
+        } else if (expectedBytes >= 1024 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 24 * 1024 * 1024);
         } else if (expectedBytes >= 512 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 20 * 1024 * 1024);
@@ -1859,13 +1865,15 @@ const server = http.createServer(async (req, res) => {
         }
         const partSize = Math.max(tunedPartSize, maxPartSizeByCount);
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
-        const recommendedConcurrency = expectedBytes >= 1024 * 1024 * 1024
-          ? 8
-          : (expectedBytes >= 384 * 1024 * 1024
-            ? 7
-            : (expectedBytes >= 128 * 1024 * 1024
-              ? 6
-              : (expectedBytes >= 32 * 1024 * 1024 ? 5 : 4)));
+        const recommendedConcurrency = expectedBytes >= 4 * 1024 * 1024 * 1024
+          ? 10
+          : (expectedBytes >= 2 * 1024 * 1024 * 1024
+            ? 9
+            : (expectedBytes >= 768 * 1024 * 1024
+              ? 8
+              : (expectedBytes >= 256 * 1024 * 1024
+                ? 7
+                : (expectedBytes >= 64 * 1024 * 1024 ? 6 : 5))));
         const maxConcurrency = Math.max(
           1,
           Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency, totalParts)
