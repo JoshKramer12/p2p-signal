@@ -37,7 +37,7 @@ const ARCHIVE_PREVIEW_WARMUP_ENTRY_MAX_BYTES = Math.max(
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
 const INLINE_TINY_INTENT_MAX_BYTES = Math.max(
   1024,
-  Math.min(1024 * 1024, Number(process.env.INLINE_TINY_INTENT_MAX_BYTES || 256 * 1024))
+  Math.min(1024 * 1024, Number(process.env.INLINE_TINY_INTENT_MAX_BYTES || 1024 * 1024))
 );
 const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CACHE_TTL_MS || 10 * 1000));
 // Keep Office-native preview compatibility by default.
