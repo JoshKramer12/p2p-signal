@@ -622,6 +622,75 @@ function verifyAccountSession(username = "", sessionToken = "") {
   return user;
 }
 
+function resolveAuthenticatedUsernameFromRequest(req, url) {
+  const username = extractUsernameFromRequest(req, url);
+  const sessionToken = extractSessionTokenFromRequest(req, url);
+  if (!username || !sessionToken) return "";
+  const user = verifyAccountSession(username, sessionToken);
+  return String(user?.username || "").trim();
+}
+
+function markIntentDownloadedByRecipient(intent = null, downloaderUsername = "", options = {}) {
+  if (!intent || typeof intent !== "object") return false;
+  if (intent.isTextOnly || String(intent.messageType || "").toLowerCase() === "text") return false;
+
+  const by = String(downloaderUsername || "").trim();
+  const sender = String(intent.from || "").trim();
+  const recipient = String(intent.to || "").trim();
+  if (!by || !sender || !recipient) return false;
+  if (by !== recipient) return false;
+  if (by === sender) return false;
+
+  const existing = Number(intent.downloadedByRecipientAt || 0);
+  if (Number.isFinite(existing) && existing > 0) return false;
+
+  const now = Math.max(1, Number(options?.downloadedAt || Date.now()) || Date.now());
+  intent.downloadedByRecipientAt = now;
+  intent.downloadedByRecipientBy = by;
+  intent.updatedAt = now;
+  saveIntent(intent);
+
+  let senderEventIntentId = String(intent.id || "").trim();
+  const groupPrimaryIntentId = String(intent.groupPrimaryIntentId || "").trim();
+  if (groupPrimaryIntentId) {
+    const primary = loadIntent(groupPrimaryIntentId);
+    if (primary && String(primary.from || "").trim() === sender) {
+      const primaryExisting = Number(primary.downloadedByRecipientAt || 0);
+      if (!(Number.isFinite(primaryExisting) && primaryExisting > 0)) {
+        primary.downloadedByRecipientAt = now;
+        primary.downloadedByRecipientBy = by;
+        primary.updatedAt = now;
+        saveIntent(primary);
+      }
+      senderEventIntentId = String(primary.id || groupPrimaryIntentId).trim() || senderEventIntentId;
+    }
+  }
+
+  sendToUser(sender, {
+    type: "intent_downloaded",
+    intentId: senderEventIntentId,
+    downloadedAt: now,
+    by,
+    from: sender,
+    to: recipient,
+    groupId: String(intent.groupId || "").trim(),
+    source: String(options?.source || "download").trim() || "download"
+  });
+  return true;
+}
+
+function maybeMarkIntentDownloadedFromRequest(intent = null, req = null, url = null, options = {}) {
+  if (!intent || typeof intent !== "object") return false;
+  if (String(url?.searchParams?.get("track") || "") !== "1") return false;
+  const method = String(req?.method || "GET").trim().toUpperCase();
+  if (method === "HEAD") return false;
+  const dispositionType = String(options?.dispositionType || "").trim().toLowerCase();
+  if (dispositionType && dispositionType !== "attachment") return false;
+  const downloaderUsername = resolveAuthenticatedUsernameFromRequest(req, url);
+  if (!downloaderUsername) return false;
+  return markIntentDownloadedByRecipient(intent, downloaderUsername, options);
+}
+
 function intentChatKeyForUser(intent = {}, username = "") {
   const name = String(username || "").trim();
   if (!name || !intent || typeof intent !== "object") return "";
@@ -2630,6 +2699,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      maybeMarkIntentDownloadedFromRequest(intent, req, url, {
+        dispositionType,
+        source: "download-entry"
+      });
       serveFileFromDisk(req, res, extracted.cachePath, safeName, dispositionType);
       return;
     }
@@ -2662,6 +2735,10 @@ const server = http.createServer(async (req, res) => {
 
       const mode = String(url.searchParams.get("disposition") || "").toLowerCase();
       const dispositionType = mode === "inline" ? "inline" : "attachment";
+      maybeMarkIntentDownloadedFromRequest(intent, req, url, {
+        dispositionType,
+        source: "download"
+      });
       await serveStoredIntentDownload(req, res, intent, dispositionType);
       return;
     }
