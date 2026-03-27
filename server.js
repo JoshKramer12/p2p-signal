@@ -23,6 +23,10 @@ const ARCHIVE_PREVIEW_MAX_BYTES = Math.max(
 const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
+const INLINE_TINY_INTENT_MAX_BYTES = Math.max(
+  1024,
+  Math.min(1024 * 1024, Number(process.env.INLINE_TINY_INTENT_MAX_BYTES || 256 * 1024))
+);
 const INTENT_LIST_CACHE_TTL_MS = Math.max(250, Number(process.env.INTENT_LIST_CACHE_TTL_MS || 10 * 1000));
 // Keep Office-native preview compatibility by default.
 // Set REQUIRE_E2EE=1 in env if you want to force encrypted file/message payloads again.
@@ -3069,6 +3073,21 @@ function base64UrlDecodeToBuffer(value = "") {
   }
 }
 
+function decodeBase64PayloadToBuffer(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const compact = raw.replace(/\s+/g, "");
+  if (!compact) return null;
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact)) return null;
+  const padded = compact + "=".repeat((4 - (compact.length % 4)) % 4);
+  const normalized = padded.replace(/-/g, "+").replace(/_/g, "/");
+  try {
+    return Buffer.from(normalized, "base64");
+  } catch {
+    return null;
+  }
+}
+
 function signIntentUnlockPayload(payloadBase64 = "") {
   return base64UrlEncodeBuffer(
     createHmac("sha256", INTENT_UNLOCK_SECRET).update(String(payloadBase64 || ""), "utf8").digest()
@@ -3656,6 +3675,115 @@ function finalizeObjectUploadIntent(intent, actualBytes, expectedBytes = 0) {
     deliveryHeld: isIntentDeliveryHeld(intent)
   });
   return true;
+}
+
+function tryStoreInlineTinyIntentPayload(intent, payloadBase64 = "", options = {}) {
+  if (!intent || !intent.id) {
+    return { ok: false, reason: "missing_intent" };
+  }
+  const expectedBytes = Math.max(0, Number(options.expectedBytes || resolveUploadExpectedBytes(intent) || intent.fileSize || 0));
+  const hintedBytes = Math.max(0, Number(options.hintedBytes || 0));
+  const payload = String(payloadBase64 || "").trim();
+  if (!payload) {
+    return { ok: false, reason: "missing_payload" };
+  }
+  const bytes = decodeBase64PayloadToBuffer(payload);
+  if (!Buffer.isBuffer(bytes) || bytes.length <= 0) {
+    return { ok: false, reason: "invalid_payload" };
+  }
+  if (bytes.length > INLINE_TINY_INTENT_MAX_BYTES) {
+    return {
+      ok: false,
+      reason: "too_large",
+      actualBytes: bytes.length,
+      maxBytes: INLINE_TINY_INTENT_MAX_BYTES
+    };
+  }
+  if (expectedBytes > 0 && bytes.length !== expectedBytes) {
+    return {
+      ok: false,
+      reason: "size_mismatch",
+      expectedBytes,
+      actualBytes: bytes.length
+    };
+  }
+  if (hintedBytes > 0 && hintedBytes !== bytes.length) {
+    return {
+      ok: false,
+      reason: "hint_mismatch",
+      expectedBytes: hintedBytes,
+      actualBytes: bytes.length
+    };
+  }
+
+  const safeName = safeBasename(String(intent.fileName || "file"));
+  const storedFileName = `${intent.id}_${Date.now()}_${safeName}`;
+  const localFilePath = path.join(FILES_DIR, storedFileName);
+  try {
+    fs.writeFileSync(localFilePath, bytes);
+  } catch (err) {
+    return { ok: false, reason: "write_failed", error: err };
+  }
+
+  const now = Date.now();
+  const bytesStored = bytes.length;
+  intent.stored = true;
+  intent.storedFile = storedFileName;
+  intent.storedObjectKey = null;
+  intent.objectUploadSession = null;
+  intent.storedBytes = bytesStored;
+  intent.plainStoredBytes = uploadBytesToPlainBytes(intent, bytesStored);
+  intent.uploadBytesExpected = Math.max(expectedBytes, bytesStored);
+  intent.status = "stored";
+  intent.transferState = "delivered";
+  intent.uploadedAt = now;
+  intent.completedAt = now;
+  intent.updatedAt = now;
+
+  return {
+    ok: true,
+    bytesStored,
+    safeName,
+    localFilePath,
+    payload: bytes
+  };
+}
+
+function queueInlineStoredIntentOffload(intentId = "", payloadBuffer = null, options = {}) {
+  if (!objectStorage.isEnabled()) return;
+  const id = String(intentId || "").trim();
+  if (!id) return;
+  const payload = Buffer.isBuffer(payloadBuffer) ? payloadBuffer : null;
+  if (!payload || !payload.length) return;
+  const safeName = safeBasename(String(options.safeName || "file"));
+  const localFilePath = String(options.localFilePath || "").trim();
+
+  setImmediate(async () => {
+    try {
+      const latest = loadIntent(id);
+      if (!latest) return;
+      const objectKey = String(latest.storedObjectKey || "").trim() || objectStorage.buildIntentObjectKey(id, safeName);
+      await objectStorage.putBuffer(objectKey, payload, contentTypeForName(safeName));
+      latest.storedObjectKey = objectKey;
+      saveIntent(latest);
+
+      if (latest.groupId) {
+        const mirrorIds = Array.isArray(latest.groupMirrorIntentIds) ? latest.groupMirrorIntentIds : [];
+        mirrorIds.forEach((mirrorId) => {
+          const mirror = loadIntent(String(mirrorId || "").trim());
+          if (!mirror) return;
+          mirror.storedObjectKey = objectKey;
+          saveIntent(mirror);
+        });
+      }
+
+      if (localFilePath && fs.existsSync(localFilePath)) {
+        try { fs.unlinkSync(localFilePath); } catch {}
+      }
+    } catch (err) {
+      console.error("❌ Failed to offload inline tiny upload:", err);
+    }
+  });
 }
 
 function maybeSendUploadProgress(t) {
@@ -7628,6 +7756,14 @@ if (data.type === "send_intent") {
     });
   };
 
+  const incomingTypeForIntent = (intentRecord = null) => {
+    const entry = intentRecord || {};
+    if (entry.isTextOnly || String(entry.messageType || "").toLowerCase() === "text") {
+      return "incoming_file";
+    }
+    return entry.stored ? "incoming_file" : "incoming_intent";
+  };
+
   const buildIntentOkPayload = (intentRecord, options = {}) => {
     const ackIntent = intentRecord || {};
     const ackIsGroupSend = Boolean(options.isGroupSend);
@@ -7671,7 +7807,9 @@ if (data.type === "send_intent") {
       passwordHint: String(ackIntent.passwordHint || ""),
       customExpiry: hasIntentCustomExpiry(ackIntent),
       deliveryHeld: ackDeliveryHeld,
-      transferState: ackIntent.transferState || (ackIntent.readByRecipientAt ? "read" : (ackIntent.stored ? "delivered" : "queued"))
+      transferState: ackIntent.transferState || (ackIntent.readByRecipientAt ? "read" : (ackIntent.stored ? "delivered" : "queued")),
+      stored: Boolean(ackIntent.stored),
+      inlineTinyStored: Boolean(options.inlineTinyStored || ackIntent.inlineTinyStored)
     };
   };
 
@@ -7685,6 +7823,9 @@ if (data.type === "send_intent") {
   const text = typeof data.text === "string" ? data.text.trim().slice(0, 5000) : "";
   const plainText = typeof data.plainText === "string" ? data.plainText.trim().slice(0, 5000) : "";
   const isTextOnly = Boolean(data.isTextOnly) || ((!!text || !!plainText) && !fileName && !fileSize);
+  const inlineTinyRequested = Boolean(data.inlineTinyUpload) && !isTextOnly;
+  const inlinePayloadBase64 = inlineTinyRequested ? String(data.inlinePayloadB64 || "").trim() : "";
+  const inlinePayloadBytes = inlineTinyRequested ? Number(data.inlinePayloadBytes || 0) : 0;
   const clientIntentId = String(data.clientIntentId || "").trim();
   const silentPreupload = Boolean(data.silentPreupload) && !isTextOnly;
   const now = Date.now();
@@ -7794,16 +7935,22 @@ if (data.type === "send_intent") {
         receiverClient,
         deliveryHeld: existingHeld,
         isGroupSend,
-        senderUsername: ws.username
+        senderUsername: ws.username,
+        inlineTinyStored: Boolean(existing.stored && !(existing.isTextOnly || existing.messageType === "text"))
       }));
       queuePostIntentWork(() => {
         if (receiverOnline && !isGroupSend && !existingHeld) {
           const safeExistingIntent = intentForClient(existing);
-          if (existing.isTextOnly || existing.messageType === "text") {
-            sendToUser(existing.to, { type: "incoming_file", intent: safeExistingIntent });
-          } else {
-            sendToUser(existing.to, { type: "incoming_intent", intent: safeExistingIntent });
-          }
+          sendToUser(existing.to, { type: incomingTypeForIntent(existing), intent: safeExistingIntent });
+        }
+        if (!existingHeld && existing.stored && !(existing.isTextOnly || existing.messageType === "text")) {
+          sendToUser(ws.username, {
+            type: "upload_done",
+            intentId: existing.id,
+            alreadyStored: true,
+            deliveryHeld: existingHeld,
+            inlineTiny: Boolean(existing.inlineTinyStored)
+          });
         }
         if (isGroupSend) {
           const gKey = groupChatKey(existing.groupId || requestedGroupId || "");
@@ -7860,6 +8007,8 @@ if (data.type === "send_intent") {
     downloadToken: isTextOnly ? null : generateDownloadToken(),
     isGroupRecipientCopy: false
   };
+  let inlineTinyStored = false;
+  let inlineTinyStore = null;
   if (isTextOnly) {
     intent.stored = true;
     intent.storedFile = null;
@@ -7869,6 +8018,19 @@ if (data.type === "send_intent") {
     intent.plainStoredBytes = 0;
     intent.uploadedAt = now;
     intent.completedAt = now;
+  } else if (inlineTinyRequested && !silentPreupload && !encryption) {
+    inlineTinyStore = tryStoreInlineTinyIntentPayload(intent, inlinePayloadBase64, {
+      expectedBytes: uploadBytesExpected,
+      hintedBytes: inlinePayloadBytes
+    });
+    if (inlineTinyStore.ok) {
+      inlineTinyStored = true;
+      intent.inlineTinyStored = true;
+    } else if (inlineTinyStore.reason && inlineTinyStore.reason !== "missing_payload") {
+      console.warn(
+        `⚠️ Inline tiny send fallback (${inlineTinyStore.reason}) for intent ${intent.id} (${inlineTinyStore.actualBytes || 0}/${inlineTinyStore.expectedBytes || uploadBytesExpected})`
+      );
+    }
   }
 
   saveIntent(intent);
@@ -7894,12 +8056,31 @@ if (data.type === "send_intent") {
         mirrorIntent.plainStoredBytes = 0;
         mirrorIntent.uploadedAt = now;
         mirrorIntent.completedAt = now;
+      } else if (inlineTinyStored) {
+        mirrorIntent.stored = true;
+        mirrorIntent.storedFile = intent.storedFile || null;
+        mirrorIntent.storedObjectKey = intent.storedObjectKey || null;
+        mirrorIntent.objectUploadSession = null;
+        mirrorIntent.storedBytes = Number(intent.storedBytes || uploadBytesExpected || fileSize || 0);
+        mirrorIntent.plainStoredBytes = uploadBytesToPlainBytes(mirrorIntent, mirrorIntent.storedBytes);
+        mirrorIntent.uploadedAt = Number(intent.uploadedAt || now) || now;
+        mirrorIntent.completedAt = Number(intent.completedAt || mirrorIntent.uploadedAt || now) || now;
+        mirrorIntent.status = "stored";
+        mirrorIntent.transferState = "delivered";
+        mirrorIntent.inlineTinyStored = true;
       }
       saveIntent(mirrorIntent);
       mirrorIntents.push(mirrorIntent);
     }
     intent.groupMirrorIntentIds = mirrorIntents.map((entry) => entry.id);
     saveIntent(intent);
+  }
+
+  if (inlineTinyStored && inlineTinyStore?.ok) {
+    queueInlineStoredIntentOffload(intent.id, inlineTinyStore.payload, {
+      safeName: inlineTinyStore.safeName || intent.fileName || "file",
+      localFilePath: inlineTinyStore.localFilePath || ""
+    });
   }
 
   const intentHeld = isIntentDeliveryHeld(intent);
@@ -7909,7 +8090,8 @@ if (data.type === "send_intent") {
     deliveryHeld: intentHeld,
     isGroupSend,
     senderUsername: ws.username,
-    mirrorIntents
+    mirrorIntents,
+    inlineTinyStored
   }));
 
   queuePostIntentWork(() => {
@@ -7918,11 +8100,7 @@ if (data.type === "send_intent") {
         for (const mirrorIntent of mirrorIntents) {
           if (!isUserOnline(mirrorIntent.to)) continue;
           const safeIntent = intentForClient(mirrorIntent);
-          if (isTextOnly) {
-            sendToUser(mirrorIntent.to, { type: "incoming_file", intent: safeIntent });
-          } else {
-            sendToUser(mirrorIntent.to, { type: "incoming_intent", intent: safeIntent });
-          }
+          sendToUser(mirrorIntent.to, { type: incomingTypeForIntent(mirrorIntent), intent: safeIntent });
         }
         mirrorIntents.forEach((mirrorIntent) => {
           queuePushNotificationForUser(mirrorIntent.to, buildPushPayloadForIntent(mirrorIntent));
@@ -7931,11 +8109,7 @@ if (data.type === "send_intent") {
     } else if (!intentHeld) {
       if (isUserOnline(to)) {
         const safeIntent = intentForClient(intent);
-        if (isTextOnly) {
-          sendToUser(to, { type: "incoming_file", intent: safeIntent });
-        } else {
-          sendToUser(to, { type: "incoming_intent", intent: safeIntent });
-        }
+        sendToUser(to, { type: incomingTypeForIntent(intent), intent: safeIntent });
       }
       if (to !== ws.username) {
         queuePushNotificationForUser(to, buildPushPayloadForIntent(intent));
@@ -7947,11 +8121,7 @@ if (data.type === "send_intent") {
     const shouldBroadcastSenderDevices = !intentHeld && (isGroupSend || to !== ws.username);
     if (shouldBroadcastSenderDevices && isUserOnline(ws.username)) {
       const senderIntent = intentForClient(intent);
-      if (isTextOnly) {
-        sendToUser(ws.username, { type: "incoming_file", intent: senderIntent });
-      } else {
-        sendToUser(ws.username, { type: "incoming_intent", intent: senderIntent });
-      }
+      sendToUser(ws.username, { type: incomingTypeForIntent(intent), intent: senderIntent });
     }
 
     if (!intentHeld && isGroupSend) {
@@ -7973,6 +8143,14 @@ if (data.type === "send_intent") {
         plainSentBytes: Number(intent.plainStoredBytes || 0),
         plainTotalBytes: Number(intent.fileSize || 0),
         retryable: false
+      });
+    }
+    if (inlineTinyStored && !isTextOnly) {
+      sendToUser(ws.username, {
+        type: "upload_done",
+        intentId: intent.id,
+        inlineTiny: true,
+        deliveryHeld: intentHeld
       });
     }
   });
