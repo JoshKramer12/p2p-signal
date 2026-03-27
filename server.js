@@ -4751,7 +4751,10 @@ function quickChatKeyFromId(threadId = "") {
 }
 
 function normalizeQuickChatCode(value = "") {
-  return String(value || "").replace(/\D/g, "").slice(0, 6);
+  return String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(0, 6);
 }
 
 function normalizeQuickChatEntry(entry = null) {
@@ -5440,7 +5443,7 @@ function resolveGuestTransferTargetUsername(payload = {}) {
 function normalizeGuestTransferRequest(raw = {}, targetUsername = "") {
   const target = String(targetUsername || raw?.targetUsername || "").trim();
   const requestId = String(raw?.id || "").trim() || randomUUID();
-  const code = String(raw?.code || "").replace(/\D/g, "").slice(0, 6);
+  const code = normalizeQuickChatCode(raw?.code || "");
   const threadId = String(raw?.threadId || "").trim().slice(0, 128);
   const shareUrl = String(raw?.shareUrl || "").trim().slice(0, 2000);
   if (!target || !code || !threadId || !shareUrl) return null;
@@ -5598,7 +5601,7 @@ function resolveGuestTransferRequestForUser(username = "", requestId = "", actio
     request,
     openUrl: decision === "accept" ? buildGuestOpenUrlForUser(request, name) : "",
     threadId: String(request?.threadId || "").trim(),
-    code: String(request?.code || "").replace(/\D/g, "").slice(0, 6),
+    code: normalizeQuickChatCode(request?.code || ""),
     threadName: String(request?.threadName || "").trim(),
     recipient: String(request?.recipient || "").trim(),
     shareUrl: String(request?.shareUrl || "").trim(),
