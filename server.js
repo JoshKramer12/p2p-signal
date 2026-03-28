@@ -1829,16 +1829,117 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      const safeName = safeBasename(String(body?.name || intent.fileName || "file"));
+      const mime = contentTypeForName(safeName);
+      const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${safeName}`;
+      const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName);
+      const hintedUploadId = String(body?.uploadId || "").trim();
+      let existingSession = normalizeObjectUploadSession(intent.objectUploadSession);
+      let canReuseExisting = Boolean(
+        existingSession &&
+        String(intent.storedObjectKey || "").trim() &&
+        existingSession.objectKey === String(intent.storedObjectKey || "").trim()
+      );
+
+      if (canReuseExisting && existingSession?.mode === "multipart" && hintedUploadId) {
+        if (hintedUploadId !== String(existingSession.uploadId || "").trim()) {
+          canReuseExisting = false;
+        }
+      }
+
+      if (canReuseExisting && existingSession) {
+        try {
+          if (existingSession.mode === "multipart") {
+            const listedParts = await objectStorage.listMultipartUploadParts(
+              existingSession.objectKey,
+              existingSession.uploadId
+            ).catch((err) => {
+              const msg = String(err?.message || "").toLowerCase();
+              if (msg.includes("no such upload") || msg.includes("uploadid")) return null;
+              throw err;
+            });
+            if (!listedParts) {
+              canReuseExisting = false;
+            } else {
+              existingSession = mergeObjectMultipartPartsIntoSession(existingSession, listedParts);
+            }
+          } else {
+            const head = await objectStorage.headObject(existingSession.objectKey).catch(() => null);
+            const confirmed = Math.max(0, Number(head?.size || 0));
+            existingSession.uploadedBytesConfirmed = Math.max(0, Math.min(expectedBytes, confirmed));
+            existingSession.updatedAt = Date.now();
+          }
+        } catch {
+          canReuseExisting = false;
+        }
+      }
+
+      if (canReuseExisting && existingSession) {
+        let uploadPlan = null;
+        if (existingSession.mode === "multipart") {
+          uploadPlan = {
+            mode: "multipart",
+            uploadId: existingSession.uploadId,
+            partSize: existingSession.partSize,
+            totalParts: Math.max(1, Number(existingSession.totalParts || 1)),
+            maxConcurrency: Math.max(1, Number(existingSession.maxConcurrency || 1))
+          };
+        } else {
+          const singleUploadPlan = await objectStorage.createUploadUrl(
+            existingSession.objectKey,
+            String(existingSession.contentType || mime || "application/octet-stream")
+          );
+          if (!singleUploadPlan?.url) {
+            res.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+            res.end(JSON.stringify({ ok: false, message: "Could not create upload URL" }));
+            return;
+          }
+          uploadPlan = {
+            mode: "single",
+            ...singleUploadPlan
+          };
+        }
+
+        const statusPayload = buildIntentObjectUploadStatusPayload(intent, existingSession) || null;
+        const confirmedBytes = Math.max(0, Number(statusPayload?.bytesUploadedConfirmed || 0));
+        intent.stored = false;
+        intent.storedFile = storedFileName;
+        intent.storedObjectKey = existingSession.objectKey;
+        intent.objectUploadSession = existingSession;
+        intent.storedBytes = confirmedBytes;
+        intent.plainStoredBytes = uploadBytesToPlainBytes(intent, confirmedBytes);
+        intent.status = "uploading";
+        intent.transferState = "uploading";
+        intent.updatedAt = Date.now();
+        saveIntent(intent);
+        emitTransferState(intent, "uploading", {
+          sentBytes: confirmedBytes,
+          totalBytes: expectedBytes,
+          plainSentBytes: intent.plainStoredBytes,
+          plainTotalBytes: Number(intent.fileSize || 0)
+        });
+
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          enabled: true,
+          resumed: true,
+          intentId,
+          upload: uploadPlan,
+          status: statusPayload,
+          bytesExpected: expectedBytes,
+          plainBytesExpected: Number(intent.fileSize || 0),
+          storedFile: storedFileName
+        }));
+        return;
+      }
+
       await clearIntentObjectUploadSession(intent, { abortRemote: true });
       if (intent.storedObjectKey) {
         try { await objectStorage.deleteObject(intent.storedObjectKey); } catch {}
       }
       removeIntentCachedObjectFile(intent.id);
 
-      const safeName = safeBasename(String(body?.name || intent.fileName || "file"));
-      const mime = contentTypeForName(safeName);
-      const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${safeName}`;
-      const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName);
       const useMultipart = expectedBytes >= OBJECT_MULTIPART_THRESHOLD_BYTES;
       let uploadPlan = null;
       let objectUploadSession = null;
@@ -1891,7 +1992,12 @@ const server = http.createServer(async (req, res) => {
           contentType: mime,
           partSize,
           totalParts,
-          createdAt: Date.now()
+          maxConcurrency,
+          uploadedBytesConfirmed: 0,
+          completedPartsByNumber: {},
+          finalizing: false,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
         };
         uploadPlan = {
           mode: "multipart",
@@ -1911,7 +2017,10 @@ const server = http.createServer(async (req, res) => {
           mode: "single",
           objectKey,
           contentType: mime,
-          createdAt: Date.now()
+          uploadedBytesConfirmed: 0,
+          finalizing: false,
+          createdAt: Date.now(),
+          updatedAt: Date.now()
         };
         uploadPlan = {
           mode: "single",
@@ -1936,12 +2045,16 @@ const server = http.createServer(async (req, res) => {
         plainTotalBytes: Number(intent.fileSize || 0)
       });
 
+      const statusPayload = buildIntentObjectUploadStatusPayload(intent, objectUploadSession) || null;
+
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       res.end(JSON.stringify({
         ok: true,
         enabled: true,
+        resumed: false,
         intentId,
         upload: uploadPlan,
+        status: statusPayload,
         bytesExpected: expectedBytes,
         plainBytesExpected: Number(intent.fileSize || 0),
         storedFile: storedFileName
@@ -2051,6 +2164,127 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    const accountIntentUploadStatusMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/object-upload\/status$/i)
+      : null;
+    if (accountIntentUploadStatusMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+      if (!objectStorage.isEnabled()) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Object storage is not configured" }));
+        return;
+      }
+
+      const intentId = String(accountIntentUploadStatusMatch[1] || "").trim();
+      const intent = loadIntent(intentId);
+      if (!intent) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Intent not found" }));
+        return;
+      }
+      if (intent.from !== username) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
+        return;
+      }
+
+      if (intent.stored && hasStoredAsset(intent) && String(intent.transferState || "").toLowerCase() !== "uploading") {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          intentId: intent.id,
+          finalized: true,
+          alreadyStored: true,
+          bytesExpected: Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0),
+          bytesUploadedConfirmed: Number(intent.storedBytes || 0),
+          plainBytesExpected: Number(intent.fileSize || 0),
+          completedParts: [],
+          canFinalize: false
+        }));
+        return;
+      }
+
+      let body = {};
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch (err) {
+        const status = Number(err?.status || 400);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Invalid request body") }));
+        return;
+      }
+
+      let session = normalizeObjectUploadSession(intent.objectUploadSession);
+      if (!session) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
+        return;
+      }
+      const expectedUploadId = String(body?.uploadId || "").trim();
+      if (session.mode === "multipart" && expectedUploadId && expectedUploadId !== session.uploadId) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload session changed" }));
+        return;
+      }
+
+      try {
+        if (session.mode === "multipart") {
+          const listedParts = await objectStorage.listMultipartUploadParts(session.objectKey, session.uploadId).catch((err) => {
+            const msg = String(err?.message || "").toLowerCase();
+            if (msg.includes("no such upload") || msg.includes("uploadid")) return null;
+            throw err;
+          });
+          if (!listedParts) {
+            intent.objectUploadSession = null;
+            saveIntent(intent);
+            res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+            res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
+            return;
+          }
+          session = mergeObjectMultipartPartsIntoSession(session, listedParts);
+        } else {
+          const head = await objectStorage.headObject(session.objectKey).catch(() => null);
+          const expectedBytes = Math.max(0, Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0));
+          session.uploadedBytesConfirmed = Math.max(
+            0,
+            Math.min(expectedBytes || Number.MAX_SAFE_INTEGER, Number(head?.size || 0))
+          );
+          session.updatedAt = Date.now();
+        }
+
+        intent.objectUploadSession = session;
+        const confirmedBytes = Math.max(0, Number(session.uploadedBytesConfirmed || 0));
+        const expectedBytes = Math.max(0, Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0));
+        intent.storedBytes = confirmedBytes;
+        intent.plainStoredBytes = uploadBytesToPlainBytes(intent, confirmedBytes);
+        intent.status = "uploading";
+        intent.transferState = "uploading";
+        intent.updatedAt = Date.now();
+        saveIntent(intent);
+
+        const payload = buildIntentObjectUploadStatusPayload(intent, session) || { ok: false };
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ...payload,
+          bytesExpected: expectedBytes,
+          bytesUploadedConfirmed: Number(payload?.bytesUploadedConfirmed || confirmedBytes)
+        }));
+        return;
+      } catch {
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Could not load upload status" }));
+        return;
+      }
+    }
+
     const accountIntentUploadCompleteMatch = req.method === "POST"
       ? url.pathname.match(/^\/api\/intents\/([^/]+)\/object-upload\/complete$/i)
       : null;
@@ -2111,124 +2345,177 @@ const server = http.createServer(async (req, res) => {
       }
 
       const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
-      const session = normalizeObjectUploadSession(intent.objectUploadSession);
-      if (session?.mode === "multipart") {
-        const bodyUploadId = String(body?.uploadId || "").trim();
-        if (bodyUploadId && bodyUploadId !== session.uploadId) {
-          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-          res.end(JSON.stringify({ ok: false, message: "Upload session changed" }));
-          return;
-        }
-        const requestedParts = Array.isArray(body?.parts)
-          ? body.parts
-            .map((part) => ({
-              partNumber: Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.partNumber || part?.PartNumber || 0))),
-              etag: String(part?.etag || part?.ETag || "").trim().replace(/"/g, ""),
-              size: Math.max(0, Number(part?.size || part?.Size || 0))
-            }))
-            .filter((part) => Number.isFinite(part.partNumber))
-            .sort((a, b) => a.partNumber - b.partNumber)
-          : [];
-
-        let listedParts = [];
-        const needsLookup = !requestedParts.length || requestedParts.some((part) => !part.etag);
-        if (needsLookup) {
-          listedParts = await objectStorage.listMultipartUploadParts(session.objectKey, session.uploadId).catch(() => []);
-        }
-
-        const listedByPartNumber = new Map();
-        listedParts.forEach((part) => {
-          const number = Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.PartNumber || part?.partNumber || 0)));
-          const etag = String(part?.ETag || part?.etag || "").trim().replace(/"/g, "");
-          if (!Number.isFinite(number) || !etag) return;
-          listedByPartNumber.set(number, {
-            etag,
-            size: Math.max(0, Number(part?.Size || part?.size || 0))
-          });
-        });
-
-        let completionParts = [];
-        if (requestedParts.length) {
-          completionParts = requestedParts
-            .map((part) => {
-              const listed = listedByPartNumber.get(part.partNumber) || null;
-              return {
-                partNumber: part.partNumber,
-                etag: String(part.etag || listed?.etag || "").trim(),
-                size: Math.max(0, Number(part.size || listed?.size || 0))
-              };
-            })
-            .filter((part) => Number.isFinite(part.partNumber) && part.etag)
-            .sort((a, b) => a.partNumber - b.partNumber);
-        } else {
-          completionParts = Array.from(listedByPartNumber.entries())
-            .map(([partNumber, part]) => ({
-              partNumber,
-              etag: String(part?.etag || "").trim(),
-              size: Math.max(0, Number(part?.size || 0))
-            }))
-            .filter((part) => Number.isFinite(part.partNumber) && part.etag)
-            .sort((a, b) => a.partNumber - b.partNumber);
-        }
-
-        if (!completionParts.length) {
-          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-          res.end(JSON.stringify({ ok: false, message: "No uploaded multipart parts were found" }));
-          return;
-        }
-
-        const knownPartBytes = completionParts.reduce((sum, part) => sum + Math.max(0, Number(part.size || 0)), 0);
-        if (expectedBytes > 0 && knownPartBytes > 0 && knownPartBytes !== expectedBytes) {
-          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-          res.end(JSON.stringify({ ok: false, message: "Uploaded multipart size does not match intent" }));
-          return;
-        }
-
-        try {
-          await objectStorage.completeMultipartUpload(
-            session.objectKey,
-            session.uploadId,
-            completionParts.map((part) => ({ PartNumber: part.partNumber, ETag: part.etag }))
-          );
-        } catch (err) {
-          const msg = String(err?.message || "").toLowerCase();
-          if (msg.includes("invalidpart") || msg.includes("invalid part") || msg.includes("no such upload")) {
-            res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-            res.end(JSON.stringify({ ok: false, message: "Multipart upload could not be completed. Retry send." }));
-            return;
-          }
-          throw err;
-        }
-      }
-
-      const reportedBytes = Math.max(0, Number(body?.size || 0));
-      let actualBytes = reportedBytes;
-      if (actualBytes <= 0) {
-        const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
-        if (!head) {
-          res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-          res.end(JSON.stringify({ ok: false, message: "Uploaded file not found" }));
-          return;
-        }
-        actualBytes = Math.max(0, Number(head.size || 0));
-      }
-      if (expectedBytes > 0 && actualBytes !== expectedBytes) {
+      let session = normalizeObjectUploadSession(intent.objectUploadSession);
+      if (!session) {
         res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-        res.end(JSON.stringify({ ok: false, message: "Uploaded file size does not match intent" }));
+        res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
         return;
       }
+      if (session.finalizing) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload is already finalizing" }));
+        return;
+      }
+      session.finalizing = true;
+      session.updatedAt = Date.now();
+      intent.objectUploadSession = session;
+      saveIntent(intent);
+      const clearFinalizing = () => {
+        const latestIntent = loadIntent(intentId) || intent;
+        const latestSession = normalizeObjectUploadSession(latestIntent.objectUploadSession);
+        if (!latestSession) return;
+        latestSession.finalizing = false;
+        latestSession.updatedAt = Date.now();
+        latestIntent.objectUploadSession = latestSession;
+        latestIntent.updatedAt = Date.now();
+        saveIntent(latestIntent);
+      };
 
-      finalizeObjectUploadIntent(intent, actualBytes, expectedBytes || actualBytes);
+      let completionParts = [];
+      try {
+        if (session.mode === "multipart") {
+          const bodyUploadId = String(body?.uploadId || "").trim();
+          if (bodyUploadId && bodyUploadId !== session.uploadId) {
+            clearFinalizing();
+            res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+            res.end(JSON.stringify({ ok: false, message: "Upload session changed" }));
+            return;
+          }
+          const requestedParts = Array.isArray(body?.parts)
+            ? body.parts
+              .map((part) => ({
+                partNumber: Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.partNumber || part?.PartNumber || 0))),
+                etag: String(part?.etag || part?.ETag || "").trim().replace(/"/g, ""),
+                size: Math.max(0, Number(part?.size || part?.Size || 0))
+              }))
+              .filter((part) => Number.isFinite(part.partNumber))
+              .sort((a, b) => a.partNumber - b.partNumber)
+            : [];
 
-      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      res.end(JSON.stringify({
-        ok: true,
-        intentId: intent.id,
-        storedFile: intent.storedFile || null,
-        bytesStored: actualBytes,
-        deliveryHeld: isIntentDeliveryHeld(intent)
-      }));
-      return;
+          let listedParts = [];
+          const needsLookup = !requestedParts.length || requestedParts.some((part) => !part.etag);
+          if (needsLookup) {
+            listedParts = await objectStorage.listMultipartUploadParts(session.objectKey, session.uploadId).catch(() => []);
+          }
+
+          const listedByPartNumber = new Map();
+          listedParts.forEach((part) => {
+            const number = Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.PartNumber || part?.partNumber || 0)));
+            const etag = String(part?.ETag || part?.etag || "").trim().replace(/"/g, "");
+            if (!Number.isFinite(number) || !etag) return;
+            listedByPartNumber.set(number, {
+              etag,
+              size: Math.max(0, Number(part?.Size || part?.size || 0))
+            });
+          });
+
+          completionParts = requestedParts.length
+            ? requestedParts
+              .map((part) => {
+                const listed = listedByPartNumber.get(part.partNumber) || null;
+                return {
+                  partNumber: part.partNumber,
+                  etag: String(part.etag || listed?.etag || "").trim(),
+                  size: Math.max(0, Number(part.size || listed?.size || 0))
+                };
+              })
+              .filter((part) => Number.isFinite(part.partNumber) && part.etag)
+              .sort((a, b) => a.partNumber - b.partNumber)
+            : Array.from(listedByPartNumber.entries())
+              .map(([partNumber, part]) => ({
+                partNumber,
+                etag: String(part?.etag || "").trim(),
+                size: Math.max(0, Number(part?.size || 0))
+              }))
+              .filter((part) => Number.isFinite(part.partNumber) && part.etag)
+              .sort((a, b) => a.partNumber - b.partNumber);
+
+          if (!completionParts.length) {
+            clearFinalizing();
+            res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+            res.end(JSON.stringify({ ok: false, message: "No uploaded multipart parts were found" }));
+            return;
+          }
+
+          const knownPartBytes = completionParts.reduce((sum, part) => sum + Math.max(0, Number(part.size || 0)), 0);
+          if (expectedBytes > 0 && knownPartBytes > 0 && knownPartBytes !== expectedBytes) {
+            clearFinalizing();
+            res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+            res.end(JSON.stringify({ ok: false, message: "Uploaded multipart size does not match intent" }));
+            return;
+          }
+
+          try {
+            await objectStorage.completeMultipartUpload(
+              session.objectKey,
+              session.uploadId,
+              completionParts.map((part) => ({ PartNumber: part.partNumber, ETag: part.etag }))
+            );
+          } catch (err) {
+            const msg = String(err?.message || "").toLowerCase();
+            if (msg.includes("invalidpart") || msg.includes("invalid part") || msg.includes("no such upload")) {
+              clearFinalizing();
+              res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+              res.end(JSON.stringify({ ok: false, message: "Multipart upload could not be completed. Retry send." }));
+              return;
+            }
+            throw err;
+          }
+          session = mergeObjectMultipartPartsIntoSession(session, completionParts);
+          intent.objectUploadSession = session;
+          saveIntent(intent);
+        }
+
+        const reportedBytes = Math.max(0, Number(body?.size || 0));
+        let actualBytes = reportedBytes;
+        if (actualBytes <= 0) {
+          const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
+          if (!head) {
+            clearFinalizing();
+            res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+            res.end(JSON.stringify({ ok: false, message: "Uploaded file not found" }));
+            return;
+          }
+          actualBytes = Math.max(0, Number(head.size || 0));
+        }
+        if (expectedBytes > 0 && actualBytes !== expectedBytes) {
+          clearFinalizing();
+          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ ok: false, message: "Uploaded file size does not match intent" }));
+          return;
+        }
+
+        finalizeObjectUploadIntent(intent, actualBytes, expectedBytes || actualBytes);
+
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          intentId: intent.id,
+          storedFile: intent.storedFile || null,
+          bytesStored: actualBytes,
+          deliveryHeld: isIntentDeliveryHeld(intent)
+        }));
+        return;
+      } catch (err) {
+        const staleIntent = loadIntent(intentId) || intent;
+        const staleSession = normalizeObjectUploadSession(staleIntent.objectUploadSession);
+        if (staleSession) {
+          staleSession.finalizing = false;
+          staleSession.updatedAt = Date.now();
+          staleIntent.objectUploadSession = staleSession;
+          staleIntent.updatedAt = Date.now();
+          saveIntent(staleIntent);
+        }
+        const msg = String(err?.message || "").toLowerCase();
+        if (msg.includes("upload session changed") || msg.includes("expired")) {
+          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
+          return;
+        }
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Could not finalize upload" }));
+        return;
+      }
     }
 
     const accountIntentCancelMatch = req.method === "POST"
@@ -2849,6 +3136,75 @@ function removeIntentCachedObjectFile(intentId = "") {
   } catch {}
 }
 
+function normalizeObjectMultipartPartRows(raw = null) {
+  const normalized = [];
+  const pushPart = (partNumberRaw = 0, etagRaw = "", sizeRaw = 0, updatedAtRaw = 0) => {
+    const partNumber = Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(partNumberRaw || 0)));
+    const etag = String(etagRaw || "").trim().replace(/"/g, "");
+    const size = Math.max(0, Number(sizeRaw || 0));
+    if (!Number.isFinite(partNumber) || !etag) return;
+    normalized.push({
+      partNumber,
+      etag,
+      size,
+      updatedAt: Math.max(0, Number(updatedAtRaw || 0)) || Date.now()
+    });
+  };
+
+  if (Array.isArray(raw)) {
+    raw.forEach((part) => {
+      pushPart(
+        part?.partNumber || part?.PartNumber || 0,
+        part?.etag || part?.ETag || "",
+        part?.size || part?.Size || 0,
+        part?.updatedAt || 0
+      );
+    });
+  } else if (raw && typeof raw === "object") {
+    Object.entries(raw).forEach(([key, part]) => {
+      pushPart(
+        part?.partNumber || key,
+        part?.etag || part?.ETag || "",
+        part?.size || part?.Size || 0,
+        part?.updatedAt || 0
+      );
+    });
+  }
+
+  normalized.sort((a, b) => a.partNumber - b.partNumber);
+  const deduped = [];
+  const seen = new Set();
+  normalized.forEach((part) => {
+    if (seen.has(part.partNumber)) return;
+    seen.add(part.partNumber);
+    deduped.push(part);
+  });
+  return deduped;
+}
+
+function objectMultipartPartRowsToMap(rows = []) {
+  const map = {};
+  normalizeObjectMultipartPartRows(rows).forEach((part) => {
+    const key = String(part.partNumber || "");
+    if (!key) return;
+    map[key] = {
+      partNumber: part.partNumber,
+      etag: part.etag,
+      size: part.size,
+      updatedAt: part.updatedAt
+    };
+  });
+  return map;
+}
+
+function objectMultipartPartRowsFromMap(raw = null) {
+  return normalizeObjectMultipartPartRows(raw);
+}
+
+function objectUploadedBytesFromPartRows(rows = []) {
+  return normalizeObjectMultipartPartRows(rows).reduce((sum, part) => sum + Math.max(0, Number(part?.size || 0)), 0);
+}
+
 function normalizeObjectUploadSession(raw = null) {
   if (!raw || typeof raw !== "object") return null;
   const mode = String(raw.mode || "").trim().toLowerCase();
@@ -2863,7 +3219,13 @@ function normalizeObjectUploadSession(raw = null) {
       uploadId,
       contentType: String(raw.contentType || "application/octet-stream").trim() || "application/octet-stream",
       partSize: Math.max(5 * 1024 * 1024, Number(raw.partSize || OBJECT_MULTIPART_PART_SIZE_BYTES)),
-      createdAt: Number(raw.createdAt || Date.now()) || Date.now()
+      totalParts: Math.max(1, Number(raw.totalParts || 1)),
+      maxConcurrency: Math.max(1, Math.min(10, Number(raw.maxConcurrency || OBJECT_MULTIPART_CLIENT_CONCURRENCY || 4))),
+      uploadedBytesConfirmed: Math.max(0, Number(raw.uploadedBytesConfirmed || 0)),
+      completedPartsByNumber: objectMultipartPartRowsToMap(raw.completedPartsByNumber || raw.completedParts || {}),
+      finalizing: Boolean(raw.finalizing),
+      createdAt: Number(raw.createdAt || Date.now()) || Date.now(),
+      updatedAt: Number(raw.updatedAt || Date.now()) || Date.now()
     };
   }
   if (mode === "single") {
@@ -2871,10 +3233,72 @@ function normalizeObjectUploadSession(raw = null) {
       mode,
       objectKey,
       contentType: String(raw.contentType || "application/octet-stream").trim() || "application/octet-stream",
-      createdAt: Number(raw.createdAt || Date.now()) || Date.now()
+      uploadedBytesConfirmed: Math.max(0, Number(raw.uploadedBytesConfirmed || 0)),
+      finalizing: Boolean(raw.finalizing),
+      createdAt: Number(raw.createdAt || Date.now()) || Date.now(),
+      updatedAt: Number(raw.updatedAt || Date.now()) || Date.now()
     };
   }
   return null;
+}
+
+function mergeObjectMultipartPartsIntoSession(uploadSession = null, parts = []) {
+  const session = normalizeObjectUploadSession(uploadSession);
+  if (!session || session.mode !== "multipart") return session;
+  const mergedRows = objectMultipartPartRowsFromMap(session.completedPartsByNumber || {});
+  const mergedByNumber = new Map();
+  mergedRows.forEach((part) => {
+    mergedByNumber.set(part.partNumber, {
+      partNumber: part.partNumber,
+      etag: part.etag,
+      size: part.size,
+      updatedAt: part.updatedAt
+    });
+  });
+  normalizeObjectMultipartPartRows(parts).forEach((part) => {
+    mergedByNumber.set(part.partNumber, {
+      partNumber: part.partNumber,
+      etag: part.etag,
+      size: part.size,
+      updatedAt: Date.now()
+    });
+  });
+  const nextRows = Array.from(mergedByNumber.values()).sort((a, b) => a.partNumber - b.partNumber);
+  session.completedPartsByNumber = objectMultipartPartRowsToMap(nextRows);
+  session.uploadedBytesConfirmed = Math.max(0, objectUploadedBytesFromPartRows(nextRows));
+  session.updatedAt = Date.now();
+  return session;
+}
+
+function buildIntentObjectUploadStatusPayload(intent = null, uploadSession = null, options = {}) {
+  if (!intent || typeof intent !== "object") return null;
+  const session = normalizeObjectUploadSession(uploadSession);
+  if (!session) return null;
+  const expectedBytes = Math.max(0, Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0));
+  const completedParts = normalizeObjectMultipartPartRows(options?.completedParts || session.completedPartsByNumber || []);
+  const bytesUploadedConfirmedRaw = Number(
+    options?.bytesUploadedConfirmed != null
+      ? options.bytesUploadedConfirmed
+      : (session.uploadedBytesConfirmed || objectUploadedBytesFromPartRows(completedParts))
+  );
+  const bytesUploadedConfirmed = Math.max(0, Math.min(expectedBytes || Number.MAX_SAFE_INTEGER, bytesUploadedConfirmedRaw));
+  const canFinalize = expectedBytes > 0 && bytesUploadedConfirmed >= expectedBytes;
+  return {
+    ok: true,
+    intentId: String(intent.id || "").trim(),
+    mode: session.mode,
+    uploadId: session.mode === "multipart" ? session.uploadId : "",
+    partSize: session.mode === "multipart" ? session.partSize : 0,
+    totalParts: session.mode === "multipart" ? Math.max(1, Number(session.totalParts || 1)) : 1,
+    maxConcurrency: session.mode === "multipart" ? Math.max(1, Number(session.maxConcurrency || 1)) : 1,
+    bytesExpected: expectedBytes,
+    bytesUploadedConfirmed,
+    plainBytesExpected: Number(intent.fileSize || 0),
+    finalizing: Boolean(session.finalizing),
+    finalized: Boolean(intent.stored && hasStoredAsset(intent) && String(intent.transferState || "").toLowerCase() !== "uploading"),
+    canFinalize,
+    completedParts
+  };
 }
 
 async function clearIntentObjectUploadSession(intent = null, options = {}) {
