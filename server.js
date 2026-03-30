@@ -8070,9 +8070,24 @@ if (data.type === "upload_progress") {
   if (!intent) return;
   if (intent.from !== ws.username) return;
   if (!intent.storedObjectKey || !objectStorage.isEnabled()) return;
+  const transferState = String(intent.transferState || "").trim().toLowerCase();
+  if (
+    intent.stored ||
+    transferState === "delivered" ||
+    transferState === "read" ||
+    transferState === "failed" ||
+    transferState === "canceled"
+  ) {
+    // Ignore late progress packets once intent reached a terminal state.
+    return;
+  }
   const nowTs = Date.now();
   const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
-  const sentBytes = Math.max(0, Math.min(Number(data.sentBytes || 0), expectedBytes || Number(data.sentBytes || 0)));
+  const sentCandidate = Math.max(0, Number(data.sentBytes || 0));
+  const sentBytes = Math.max(
+    0,
+    Math.max(Number(intent.storedBytes || 0), Math.min(sentCandidate, expectedBytes || sentCandidate))
+  );
   const previousCheckpointBytes = Math.max(0, Number(intent.storedBytes || 0));
   const previousCheckpointTs = Math.max(0, Number(intent.updatedAt || 0));
   const checkpointDueByBytes =
