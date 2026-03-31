@@ -63,12 +63,15 @@ const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
   256 * 1024,
-  Number(process.env.UPLOAD_CHECKPOINT_EVERY_BYTES || 8 * 1024 * 1024)
+  Number(process.env.UPLOAD_CHECKPOINT_EVERY_BYTES || 16 * 1024 * 1024)
 );
 const UPLOAD_CHECKPOINT_MIN_INTERVAL_MS = Math.max(
   250,
-  Number(process.env.UPLOAD_CHECKPOINT_MIN_INTERVAL_MS || 2500)
+  Number(process.env.UPLOAD_CHECKPOINT_MIN_INTERVAL_MS || 4000)
 );
+const UPLOAD_DIAGNOSTICS_ENABLED = String(
+  process.env.UPLOAD_DIAGNOSTICS || process.env.UPLOAD_DIAG || "0"
+).trim() !== "0";
 const INTENT_UNLOCK_TTL_ONCE_MS = Math.max(
   60 * 1000,
   Number(process.env.INTENT_UNLOCK_TTL_ONCE_MS || 12 * 60 * 60 * 1000)
@@ -118,6 +121,20 @@ function isAdminUsername(username = "") {
 
 function isAdminSocket(ws = null) {
   return Boolean(ws && isAdminUsername(ws.username));
+}
+
+function uploadDiagLog(eventName = "", payload = null) {
+  if (!UPLOAD_DIAGNOSTICS_ENABLED) return;
+  const label = String(eventName || "").trim() || "event";
+  if (payload && typeof payload === "object") {
+    try {
+      console.log(`[UPLOAD_DIAG] ${label}`, JSON.stringify(payload));
+      return;
+    } catch {}
+  }
+  try {
+    console.log(`[UPLOAD_DIAG] ${label}`);
+  } catch {}
 }
 
 // username -> ws
@@ -2112,6 +2129,11 @@ const server = http.createServer(async (req, res) => {
       }
       const expectedUploadId = String(body?.uploadId || "").trim();
       if (expectedUploadId && expectedUploadId !== session.uploadId) {
+        uploadDiagLog("part-session-changed", {
+          intentId,
+          expectedUploadId,
+          activeUploadId: String(session.uploadId || "")
+        });
         res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: "Upload session changed" }));
         return;
@@ -2139,6 +2161,11 @@ const server = http.createServer(async (req, res) => {
           lowered.includes("uploadid") ||
           lowered.includes("invalidpart")
         ) {
+          uploadDiagLog("part-session-expired", {
+            intentId,
+            uploadId: String(session.uploadId || ""),
+            message: msg
+          });
           intent.objectUploadSession = null;
           saveIntent(intent);
           res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -2224,12 +2251,18 @@ const server = http.createServer(async (req, res) => {
 
       let session = normalizeObjectUploadSession(intent.objectUploadSession);
       if (!session) {
+        uploadDiagLog("status-session-expired", { intentId, reason: "missing_session" });
         res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
         return;
       }
       const expectedUploadId = String(body?.uploadId || "").trim();
       if (session.mode === "multipart" && expectedUploadId && expectedUploadId !== session.uploadId) {
+        uploadDiagLog("status-session-changed", {
+          intentId,
+          expectedUploadId,
+          activeUploadId: String(session.uploadId || "")
+        });
         res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: "Upload session changed" }));
         return;
@@ -2243,6 +2276,11 @@ const server = http.createServer(async (req, res) => {
             throw err;
           });
           if (!listedParts) {
+            uploadDiagLog("status-session-expired", {
+              intentId,
+              uploadId: String(session.uploadId || ""),
+              reason: "remote_parts_missing"
+            });
             intent.objectUploadSession = null;
             saveIntent(intent);
             res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -2347,6 +2385,7 @@ const server = http.createServer(async (req, res) => {
       const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
       let session = normalizeObjectUploadSession(intent.objectUploadSession);
       if (!session) {
+        uploadDiagLog("complete-session-expired", { intentId, reason: "missing_session" });
         res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
         return;
@@ -8079,6 +8118,12 @@ if (data.type === "upload_progress") {
     transferState === "canceled"
   ) {
     // Ignore late progress packets once intent reached a terminal state.
+    uploadDiagLog("progress-ignored-terminal", {
+      intentId,
+      state: transferState || (intent.stored ? "stored" : ""),
+      sentBytes: Number(data.sentBytes || 0),
+      totalBytes: Number(data.totalBytes || 0)
+    });
     return;
   }
   const nowTs = Date.now();
@@ -8101,6 +8146,14 @@ if (data.type === "upload_progress") {
       status: "uploading",
       transferState: "uploading"
     });
+    uploadDiagLog("progress-checkpoint", {
+      intentId,
+      sentBytes,
+      expectedBytes,
+      previousCheckpointBytes,
+      previousCheckpointTs,
+      nowTs
+    });
   }
   emitTransferState(intent, "uploading", {
     sentBytes,
@@ -8115,6 +8168,11 @@ if (data.type === "upload_progress") {
     !intent.stored &&
     String(intent.transferState || "").toLowerCase() !== "delivered"
   ) {
+    uploadDiagLog("progress-finalize-check", {
+      intentId,
+      sentBytes,
+      expectedBytes
+    });
     const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
     const headSize = Math.max(0, Number(head?.size || 0));
     if (head && headSize === expectedBytes) {
