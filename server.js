@@ -56,9 +56,13 @@ const OBJECT_MULTIPART_PART_SIZE_BYTES = Math.max(
   Number(process.env.OBJECT_MULTIPART_PART_SIZE_BYTES || 8 * 1024 * 1024)
 );
 const OBJECT_MULTIPART_MAX_PARTS = 10000;
+const OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX = Math.max(
+  1,
+  Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX || 16)
+);
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
   1,
-  Math.min(10, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 10))
+  Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 14))
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
@@ -2294,15 +2298,19 @@ const server = http.createServer(async (req, res) => {
         }
         const partSize = Math.max(tunedPartSize, maxPartSizeByCount);
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
-        const recommendedConcurrency = expectedBytes >= 4 * 1024 * 1024 * 1024
-          ? 10
-          : (expectedBytes >= 2 * 1024 * 1024 * 1024
-            ? 9
-            : (expectedBytes >= 768 * 1024 * 1024
-              ? 8
-              : (expectedBytes >= 256 * 1024 * 1024
-                ? 7
-                : (expectedBytes >= 64 * 1024 * 1024 ? 6 : 5))));
+        const recommendedConcurrency = expectedBytes >= 8 * 1024 * 1024 * 1024
+          ? 16
+          : (expectedBytes >= 4 * 1024 * 1024 * 1024
+            ? 15
+            : (expectedBytes >= 2 * 1024 * 1024 * 1024
+              ? 14
+              : (expectedBytes >= 1024 * 1024 * 1024
+                ? 13
+                : (expectedBytes >= 512 * 1024 * 1024
+                  ? 12
+                  : (expectedBytes >= 256 * 1024 * 1024
+                    ? 10
+                    : (expectedBytes >= 64 * 1024 * 1024 ? 8 : 6))))));
         const maxConcurrency = Math.max(
           1,
           Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency, totalParts)
@@ -3591,7 +3599,10 @@ function normalizeObjectUploadSession(raw = null) {
       contentType: String(raw.contentType || "application/octet-stream").trim() || "application/octet-stream",
       partSize: Math.max(5 * 1024 * 1024, Number(raw.partSize || OBJECT_MULTIPART_PART_SIZE_BYTES)),
       totalParts: Math.max(1, Number(raw.totalParts || 1)),
-      maxConcurrency: Math.max(1, Math.min(10, Number(raw.maxConcurrency || OBJECT_MULTIPART_CLIENT_CONCURRENCY || 4))),
+      maxConcurrency: Math.max(
+        1,
+        Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX, Number(raw.maxConcurrency || OBJECT_MULTIPART_CLIENT_CONCURRENCY || 4))
+      ),
       uploadedBytesConfirmed: Math.max(0, Number(raw.uploadedBytesConfirmed || 0)),
       completedPartsByNumber: objectMultipartPartRowsToMap(raw.completedPartsByNumber || raw.completedParts || {}),
       finalizing: Boolean(raw.finalizing),
