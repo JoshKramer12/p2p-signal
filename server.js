@@ -72,6 +72,21 @@ const UPLOAD_CHECKPOINT_MIN_INTERVAL_MS = Math.max(
 const UPLOAD_DIAGNOSTICS_ENABLED = String(
   process.env.UPLOAD_DIAGNOSTICS || process.env.UPLOAD_DIAG || "0"
 ).trim() !== "0";
+const PREVIEW_DIAGNOSTICS_ENABLED = String(
+  process.env.PREVIEW_DIAGNOSTICS
+  || process.env.PREVIEW_DIAG
+  || process.env.UPLOAD_DIAGNOSTICS
+  || process.env.UPLOAD_DIAG
+  || "0"
+).trim() !== "0";
+const OBJECT_ARCHIVE_READ_CHUNK_BYTES = Math.max(
+  128 * 1024,
+  Number(process.env.OBJECT_ARCHIVE_READ_CHUNK_BYTES || 512 * 1024)
+);
+const OBJECT_ARCHIVE_READ_CACHE_BLOCKS = Math.max(
+  2,
+  Number(process.env.OBJECT_ARCHIVE_READ_CACHE_BLOCKS || 12)
+);
 const INTENT_UNLOCK_TTL_ONCE_MS = Math.max(
   60 * 1000,
   Number(process.env.INTENT_UNLOCK_TTL_ONCE_MS || 12 * 60 * 60 * 1000)
@@ -811,6 +826,245 @@ function normalizeZipPath(value = "") {
   return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "");
 }
 
+function buildIntentStoredSizeHint(intent = null) {
+  return Math.max(
+    0,
+    Number(intent?.storedBytes || intent?.uploadBytesExpected || intent?.fileSize || 0)
+  );
+}
+
+function buildArchiveStatRecord(size = 0, mtimeMs = 0) {
+  const totalSize = Math.max(0, Number(size || 0));
+  const modifiedAt = Math.max(0, Number(mtimeMs || 0));
+  return {
+    size: totalSize,
+    mtimeMs: modifiedAt,
+    isFile() {
+      return true;
+    }
+  };
+}
+
+function collectReadableBuffer(readable = null) {
+  if (!readable) return Promise.resolve(Buffer.alloc(0));
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    readable.on("data", (chunk) => {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    });
+    readable.on("end", () => resolve(Buffer.concat(chunks)));
+    readable.on("error", reject);
+  });
+}
+
+async function readObjectStorageRangeBuffer(objectKey = "", start = 0, endExclusive = 0) {
+  const key = String(objectKey || "").trim();
+  const rangeStart = Math.max(0, Number(start || 0));
+  const rangeEndExclusive = Math.max(rangeStart, Number(endExclusive || 0));
+  if (!key || rangeEndExclusive <= rangeStart) return Buffer.alloc(0);
+  const remote = await objectStorage.getObjectStream(key, {
+    range: {
+      start: rangeStart,
+      end: Math.max(rangeStart, rangeEndExclusive - 1)
+    }
+  });
+  const body = remote?.body || null;
+  if (!body) {
+    throw new Error("File missing");
+  }
+  const buffer = await collectReadableBuffer(body);
+  const expectedBytes = Math.max(0, rangeEndExclusive - rangeStart);
+  if (buffer.length < expectedBytes) {
+    throw new Error("unexpected EOF");
+  }
+  return expectedBytes === buffer.length ? buffer : buffer.subarray(0, expectedBytes);
+}
+
+class ObjectStorageRandomAccessReader extends yauzl.RandomAccessReader {
+  constructor(objectKey = "", totalSize = 0, options = {}) {
+    super();
+    this.objectKey = String(objectKey || "").trim();
+    this.totalSize = Math.max(0, Number(totalSize || 0));
+    this.blockSize = Math.max(64 * 1024, Number(options.blockSize || OBJECT_ARCHIVE_READ_CHUNK_BYTES));
+    this.maxCachedBlocks = Math.max(2, Number(options.maxCachedBlocks || OBJECT_ARCHIVE_READ_CACHE_BLOCKS));
+    this.blockCache = new Map();
+  }
+
+  touchCacheKey(cacheKey = "") {
+    const key = String(cacheKey || "").trim();
+    if (!key || !this.blockCache.has(key)) return;
+    const value = this.blockCache.get(key);
+    this.blockCache.delete(key);
+    this.blockCache.set(key, value);
+  }
+
+  pruneCache() {
+    while (this.blockCache.size > this.maxCachedBlocks) {
+      const firstKey = this.blockCache.keys().next().value;
+      if (!firstKey) break;
+      this.blockCache.delete(firstKey);
+    }
+  }
+
+  async readCachedBlock(blockStart = 0, blockEnd = 0) {
+    const start = Math.max(0, Number(blockStart || 0));
+    const end = Math.max(start, Math.min(this.totalSize, Number(blockEnd || 0)));
+    const cacheKey = `${start}:${end}`;
+    let job = this.blockCache.get(cacheKey);
+    if (!job) {
+      job = readObjectStorageRangeBuffer(this.objectKey, start, end)
+        .catch((err) => {
+          this.blockCache.delete(cacheKey);
+          throw err;
+        });
+      this.blockCache.set(cacheKey, job);
+      this.pruneCache();
+    } else {
+      this.touchCacheKey(cacheKey);
+    }
+    return await job;
+  }
+
+  async readRange(position = 0, length = 0) {
+    const start = Math.max(0, Number(position || 0));
+    const byteLength = Math.max(0, Number(length || 0));
+    const endExclusive = Math.max(start, Math.min(this.totalSize, start + byteLength));
+    if (byteLength <= 0 || endExclusive <= start) return Buffer.alloc(0);
+
+    if (byteLength >= this.blockSize) {
+      return await readObjectStorageRangeBuffer(this.objectKey, start, endExclusive);
+    }
+
+    const blockStart = Math.max(0, Math.floor(start / this.blockSize) * this.blockSize);
+    const blockEnd = Math.max(
+      endExclusive,
+      Math.min(this.totalSize, blockStart + this.blockSize)
+    );
+    const block = await this.readCachedBlock(blockStart, blockEnd);
+    const offset = Math.max(0, start - blockStart);
+    return block.subarray(offset, offset + byteLength);
+  }
+
+  _readStreamForRange(start, end) {
+    const output = new PassThrough();
+    const rangeStart = Math.max(0, Number(start || 0));
+    const rangeEndExclusive = Math.max(rangeStart, Math.min(this.totalSize, Number(end || 0)));
+    if (rangeEndExclusive <= rangeStart) {
+      queueMicrotask(() => output.end());
+      return output;
+    }
+    (async () => {
+      const remote = await objectStorage.getObjectStream(this.objectKey, {
+        range: {
+          start: rangeStart,
+          end: Math.max(rangeStart, rangeEndExclusive - 1)
+        }
+      });
+      const body = remote?.body || null;
+      if (!body) throw new Error("File missing");
+      body.on("error", (err) => output.destroy(err));
+      body.pipe(output);
+    })().catch((err) => {
+      output.destroy(err);
+    });
+    return output;
+  }
+
+  read(buffer, offset, length, position, callback) {
+    if (Math.max(0, Number(length || 0)) === 0) {
+      setImmediate(() => callback(null, 0, buffer));
+      return;
+    }
+    this.ref();
+    this.readRange(position, length)
+      .then((chunk) => {
+        chunk.copy(buffer, offset, 0, chunk.length);
+        callback(null, chunk.length, buffer);
+      }, (err) => callback(err))
+      .finally(() => {
+        this.unref();
+      });
+  }
+
+  close(callback) {
+    this.blockCache.clear();
+    setImmediate(() => {
+      if (typeof callback === "function") callback();
+    });
+  }
+}
+
+function openObjectStorageZipFile(objectKey = "", totalSize = 0, options = {}) {
+  const key = String(objectKey || "").trim();
+  const size = Math.max(0, Number(totalSize || 0));
+  if (!key || !size) {
+    return Promise.reject(new Error("Could not open package"));
+  }
+  const opts = {
+    lazyEntries: true,
+    autoClose: true,
+    decodeStrings: true,
+    validateEntrySizes: true,
+    ...options
+  };
+  return new Promise((resolve, reject) => {
+    const reader = new ObjectStorageRandomAccessReader(key, size);
+    yauzl.fromRandomAccessReader(reader, size, opts, (err, zipFile) => {
+      if (err || !zipFile) {
+        try { reader.close(() => {}); } catch {}
+        reject(err || new Error("Could not open package"));
+        return;
+      }
+      resolve(zipFile);
+    });
+  });
+}
+
+async function buildIntentArchiveSource(intent = null) {
+  if (!intent || typeof intent !== "object") return null;
+  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  if (storedObjectKey && objectStorage.isEnabled()) {
+    let size = buildIntentStoredSizeHint(intent);
+    let mtimeMs = Math.max(0, Number(intent.updatedAt || intent.createdAt || 0));
+    if (!size) {
+      const head = await objectStorage.headObject(storedObjectKey).catch(() => null);
+      if (!head) return null;
+      size = Math.max(0, Number(head.size || 0));
+      mtimeMs = Math.max(mtimeMs, Number(head.lastModified || 0));
+    }
+    if (!size) return null;
+    return {
+      type: "object-storage",
+      objectKey: storedObjectKey,
+      size,
+      mtimeMs,
+      label: "object-storage"
+    };
+  }
+
+  const filePath = await ensureIntentStoredFilePath(intent);
+  if (!filePath) return null;
+  let archiveStat = null;
+  try {
+    archiveStat = fs.statSync(filePath);
+  } catch {
+    archiveStat = null;
+  }
+  if (!archiveStat?.isFile?.()) return null;
+  return {
+    type: "file",
+    path: filePath,
+    size: Math.max(0, Number(archiveStat.size || 0)),
+    mtimeMs: Math.max(0, Number(archiveStat.mtimeMs || 0)),
+    label: "disk-cache"
+  };
+}
+
+function archiveStatFromSource(source = null) {
+  if (!source || typeof source !== "object") return null;
+  return buildArchiveStatRecord(source.size, source.mtimeMs);
+}
+
 function openZipFile(filePath, options = {}) {
   const opts = {
     lazyEntries: true,
@@ -828,6 +1082,14 @@ function openZipFile(filePath, options = {}) {
       resolve(zipFile);
     });
   });
+}
+
+function openArchiveZipFile(source = null, options = {}) {
+  if (source && typeof source === "object" && String(source.type || "").trim() === "object-storage") {
+    return openObjectStorageZipFile(source.objectKey, source.size, options);
+  }
+  const filePath = typeof source === "string" ? source : String(source?.path || "").trim();
+  return openZipFile(filePath, options);
 }
 
 function parseHttpRange(rangeRaw = "", totalSize = 0) {
@@ -1005,6 +1267,20 @@ function isGuestBridgeAuthorized(req) {
   }
 }
 
+function previewDiagLog(eventName = "", payload = null) {
+  if (!PREVIEW_DIAGNOSTICS_ENABLED) return;
+  const label = String(eventName || "").trim() || "event";
+  if (payload && typeof payload === "object") {
+    try {
+      console.log(`[PREVIEW_DIAG] ${label}`, JSON.stringify(payload));
+      return;
+    } catch {}
+  }
+  try {
+    console.log(`[PREVIEW_DIAG] ${label}`);
+  } catch {}
+}
+
 function pruneArchiveIndexCache(maxEntries = 200) {
   if (archiveIndexCache.size <= maxEntries) return;
   const now = Date.now();
@@ -1094,10 +1370,10 @@ function isImageArchiveEntryName(name = "") {
   ].includes(ext);
 }
 
-async function buildArchiveIndexEntries(zipPath = "") {
+async function buildArchiveIndexEntries(zipSource = null) {
   let zipFile;
   try {
-    zipFile = await openZipFile(zipPath, { lazyEntries: true, autoClose: true });
+    zipFile = await openArchiveZipFile(zipSource, { lazyEntries: true, autoClose: true });
   } catch (err) {
     const nextErr = err instanceof Error ? err : new Error("Could not read package");
     nextErr.status = 500;
@@ -1151,13 +1427,13 @@ async function buildArchiveIndexEntries(zipPath = "") {
   return entries;
 }
 
-async function getArchiveIndexEntries(intentId, zipPath, archiveStat) {
+async function getArchiveIndexEntries(intentId, zipSource, archiveStat) {
   const cached = getCachedArchiveIndex(intentId, archiveStat);
   if (cached) return cached;
 
   const key = archiveIndexBuildJobKey(intentId, archiveStat);
   if (!key) {
-    return buildArchiveIndexEntries(zipPath);
+    return buildArchiveIndexEntries(zipSource);
   }
 
   let job = archiveIndexBuildJobs.get(key);
@@ -1165,7 +1441,7 @@ async function getArchiveIndexEntries(intentId, zipPath, archiveStat) {
     job = (async () => {
       const existing = getCachedArchiveIndex(intentId, archiveStat);
       if (existing) return existing;
-      const rows = await buildArchiveIndexEntries(zipPath);
+      const rows = await buildArchiveIndexEntries(zipSource);
       setCachedArchiveIndex(intentId, archiveStat, rows);
       return rows;
     })().finally(() => {
@@ -1211,21 +1487,14 @@ async function warmIntentArchivePreview(intent = null) {
   );
   if (expectedBytes > ARCHIVE_PREVIEW_WARMUP_MAX_BYTES) return;
 
-  const filePath = await ensureIntentStoredFilePath(intent);
-  if (!filePath) return;
-
-  let archiveStat;
-  try {
-    archiveStat = fs.statSync(filePath);
-  } catch {
-    return;
-  }
-  if (!archiveStat?.isFile?.()) return;
+  const archiveSource = await buildIntentArchiveSource(intent);
+  const archiveStat = archiveStatFromSource(archiveSource);
+  if (!archiveSource || !archiveStat?.isFile?.()) return;
   if (Math.max(0, Number(archiveStat.size || 0)) > ARCHIVE_PREVIEW_MAX_BYTES) return;
 
   let entries = [];
   try {
-    entries = await getArchiveIndexEntries(intent.id, filePath, archiveStat);
+    entries = await getArchiveIndexEntries(intent.id, archiveSource, archiveStat);
   } catch {
     return;
   }
@@ -1238,7 +1507,7 @@ async function warmIntentArchivePreview(intent = null) {
     if (!entryPath || entryPath.includes("..") || entryPath.includes("\0")) continue;
     const safeName = safeBasename(path.basename(entryPath) || "file");
     try {
-      await ensureZipEntryExtracted(intent.id, filePath, entryPath, safeName);
+      await ensureZipEntryExtracted(intent.id, archiveSource, entryPath, safeName);
     } catch {}
   }
 }
@@ -1367,7 +1636,7 @@ function serveFileFromDisk(req, res, filePath, safeName, dispositionType = "atta
   rs.pipe(res);
 }
 
-async function serveFileFromObjectStorage(req, res, objectKey, safeName, dispositionType = "attachment") {
+async function serveFileFromObjectStorage(req, res, objectKey, safeName, dispositionType = "attachment", metadata = null) {
   const key = String(objectKey || "").trim();
   if (!key || !objectStorage.isEnabled()) {
     res.writeHead(404, { "content-type": "text/plain" });
@@ -1375,21 +1644,29 @@ async function serveFileFromObjectStorage(req, res, objectKey, safeName, disposi
     return;
   }
 
-  let meta = null;
-  try {
-    meta = await objectStorage.headObject(key);
-  } catch {
-    meta = null;
-  }
-  if (!meta) {
-    res.writeHead(404, { "content-type": "text/plain" });
-    res.end("File missing");
-    return;
+  let totalSize = Math.max(
+    0,
+    Number(metadata?.size || metadata?.storedBytes || metadata?.uploadBytesExpected || metadata?.fileSize || 0)
+  );
+  let contentType = String(metadata?.contentType || metadata?.mime || "").trim();
+  if (!totalSize) {
+    let meta = null;
+    try {
+      meta = await objectStorage.headObject(key);
+    } catch {
+      meta = null;
+    }
+    if (!meta) {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("File missing");
+      return;
+    }
+    totalSize = Math.max(0, Number(meta.size || 0));
+    contentType = contentType || String(meta.contentType || "").trim();
   }
 
-  const totalSize = Math.max(0, Number(meta.size || 0));
   const baseHeaders = {
-    "content-type": meta.contentType || contentTypeForName(safeName),
+    "content-type": contentType || contentTypeForName(safeName),
     "accept-ranges": "bytes",
     "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
   };
@@ -1423,6 +1700,19 @@ async function serveFileFromObjectStorage(req, res, objectKey, safeName, disposi
   if (hasRange) {
     headers["content-range"] = `bytes ${start}-${end}/${totalSize}`;
   }
+  let remote = null;
+  if (req.method !== "HEAD") {
+    try {
+      remote = await objectStorage.getObjectStream(key, hasRange ? { range: { start, end } } : {});
+    } catch {
+      remote = null;
+    }
+    if (!remote?.body) {
+      res.writeHead(404, { "content-type": "text/plain" });
+      res.end("File missing");
+      return;
+    }
+  }
   res.writeHead(hasRange ? 206 : 200, headers);
 
   if (req.method === "HEAD") {
@@ -1430,7 +1720,6 @@ async function serveFileFromObjectStorage(req, res, objectKey, safeName, disposi
     return;
   }
 
-  const remote = await objectStorage.getObjectStream(key, hasRange ? { range: { start, end } } : {});
   const body = remote?.body || null;
   if (!body) {
     try { res.end(); } catch {}
@@ -1448,14 +1737,17 @@ async function ensureIntentStoredFilePath(intent = null) {
   if (storedObjectKey && objectStorage.isEnabled()) {
     const outputPath = resolveIntentObjectCachePath(intent);
     if (!outputPath) return "";
-    let remoteMeta = null;
-    try {
-      remoteMeta = await objectStorage.headObject(storedObjectKey);
-    } catch {
-      remoteMeta = null;
+    let expectedSize = buildIntentStoredSizeHint(intent);
+    if (!expectedSize) {
+      let remoteMeta = null;
+      try {
+        remoteMeta = await objectStorage.headObject(storedObjectKey);
+      } catch {
+        remoteMeta = null;
+      }
+      if (!remoteMeta) return "";
+      expectedSize = Math.max(0, Number(remoteMeta.size || 0));
     }
-    if (!remoteMeta) return "";
-    const expectedSize = Math.max(0, Number(remoteMeta.size || 0));
     let shouldDownload = true;
     try {
       const localStat = fs.statSync(outputPath);
@@ -1518,7 +1810,10 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
   const safeName = safeBasename(String(intent?.fileName || "file"));
   const storedObjectKey = String(intent?.storedObjectKey || "").trim();
   if (storedObjectKey && objectStorage.isEnabled()) {
-    await serveFileFromObjectStorage(req, res, storedObjectKey, safeName, dispositionType);
+    await serveFileFromObjectStorage(req, res, storedObjectKey, safeName, dispositionType, {
+      size: buildIntentStoredSizeHint(intent),
+      mime: String(intent?.mime || "").trim() || contentTypeForName(safeName)
+    });
     return;
   }
   const storedFile = String(intent?.storedFile || "").trim();
@@ -1526,7 +1821,7 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
   serveFileFromDisk(req, res, filePath, safeName, dispositionType);
 }
 
-function extractZipEntryToPath(zipPath, entryPath, outputPath) {
+function extractZipEntryToPath(zipSource, entryPath, outputPath) {
   const normalizedEntry = normalizeZipPath(entryPath);
   if (!normalizedEntry) {
     const err = new Error("Entry not found");
@@ -1549,7 +1844,7 @@ function extractZipEntryToPath(zipPath, entryPath, outputPath) {
     };
 
     try {
-      zipFile = await openZipFile(zipPath, { lazyEntries: true, autoClose: false });
+      zipFile = await openArchiveZipFile(zipSource, { lazyEntries: true, autoClose: false });
     } catch (err) {
       finish(err || new Error("Could not open package"));
       return;
@@ -1625,19 +1920,19 @@ function extractZipEntryToPath(zipPath, entryPath, outputPath) {
   });
 }
 
-async function ensureZipEntryExtracted(intentId, zipPath, entryPath, safeName) {
+async function ensureZipEntryExtracted(intentId, zipSource, entryPath, safeName) {
   const cachePath = buildPreviewEntryCachePath(intentId, entryPath, safeName);
   try {
     const stat = fs.statSync(cachePath);
     if (stat.isFile()) {
       touchFile(cachePath);
-      return { cachePath, size: Number(stat.size || 0) };
+      return { cachePath, size: Number(stat.size || 0), cacheHit: true };
     }
   } catch {}
 
   let job = previewExtractJobs.get(cachePath);
   if (!job) {
-    job = extractZipEntryToPath(zipPath, entryPath, cachePath)
+    job = extractZipEntryToPath(zipSource, entryPath, cachePath)
       .finally(() => previewExtractJobs.delete(cachePath));
     previewExtractJobs.set(cachePath, job);
   }
@@ -1645,7 +1940,7 @@ async function ensureZipEntryExtracted(intentId, zipPath, entryPath, safeName) {
 
   const stat = fs.statSync(cachePath);
   touchFile(cachePath);
-  return { cachePath, size: Number(stat?.size || 0) };
+  return { cachePath, size: Number(stat?.size || 0), cacheHit: false };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1792,6 +2087,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const intentId = String(accountIntentUploadInitMatch[1] || "").trim();
+      const uploadInitStartedAt = Date.now();
       const intent = loadIntent(intentId);
       if (!intent) {
         res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -1834,6 +2130,13 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (intent.stored && hasStoredAsset(intent) && String(intent.transferState || "") !== "uploading") {
+        uploadDiagLog("init-response", {
+          intentId,
+          resumed: false,
+          alreadyStored: true,
+          elapsedMs: Math.max(0, Date.now() - uploadInitStartedAt),
+          bytesExpected: expectedBytes
+        });
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({
           ok: true,
@@ -1936,6 +2239,14 @@ const server = http.createServer(async (req, res) => {
           plainTotalBytes: Number(intent.fileSize || 0)
         });
 
+        uploadDiagLog("init-response", {
+          intentId,
+          resumed: true,
+          mode: String(existingSession.mode || "").trim() || "single",
+          elapsedMs: Math.max(0, Date.now() - uploadInitStartedAt),
+          bytesExpected: expectedBytes,
+          bytesUploadedConfirmed: confirmedBytes
+        });
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({
           ok: true,
@@ -2064,6 +2375,13 @@ const server = http.createServer(async (req, res) => {
 
       const statusPayload = buildIntentObjectUploadStatusPayload(intent, objectUploadSession) || null;
 
+      uploadDiagLog("init-response", {
+        intentId,
+        resumed: false,
+        mode: String(objectUploadSession?.mode || "").trim() || "single",
+        elapsedMs: Math.max(0, Date.now() - uploadInitStartedAt),
+        bytesExpected: expectedBytes
+      });
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       res.end(JSON.stringify({
         ok: true,
@@ -2343,6 +2661,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const intentId = String(accountIntentUploadCompleteMatch[1] || "").trim();
+      const uploadCompleteStartedAt = Date.now();
       const intent = loadIntent(intentId);
       if (!intent) {
         res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -2526,6 +2845,12 @@ const server = http.createServer(async (req, res) => {
 
         finalizeObjectUploadIntent(intent, actualBytes, expectedBytes || actualBytes);
 
+        uploadDiagLog("complete-response", {
+          intentId,
+          mode: String(session?.mode || "").trim() || "single",
+          bytesStored: actualBytes,
+          elapsedMs: Math.max(0, Date.now() - uploadCompleteStartedAt)
+        });
         res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({
           ok: true,
@@ -2784,8 +3109,10 @@ const server = http.createServer(async (req, res) => {
       const filePath = storedFile ? path.join(FILE_HOLDER_DIR, storedFile) : "";
       let missing = false;
       if (storedObjectKey && objectStorage.isEnabled()) {
-        const head = await objectStorage.headObject(storedObjectKey).catch(() => null);
-        missing = !head;
+        if (Math.max(0, Number(item?.size || 0)) <= 0) {
+          const head = await objectStorage.headObject(storedObjectKey).catch(() => null);
+          missing = !head;
+        }
       } else {
         missing = !storedFile || !fs.existsSync(filePath);
       }
@@ -2803,7 +3130,10 @@ const server = http.createServer(async (req, res) => {
       }
       const dispositionType = String(url.searchParams.get("mode") || "").toLowerCase() === "inline" ? "inline" : "attachment";
       if (storedObjectKey && objectStorage.isEnabled()) {
-        await serveFileFromObjectStorage(req, res, storedObjectKey, String(item?.name || "file"), dispositionType);
+        await serveFileFromObjectStorage(req, res, storedObjectKey, String(item?.name || "file"), dispositionType, {
+          size: Math.max(0, Number(item?.size || 0)),
+          mime: String(item?.mime || "").trim()
+        });
         return;
       }
       serveFileFromDisk(req, res, filePath, String(item?.name || "file"), dispositionType);
@@ -2885,16 +3215,9 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const filePath = await ensureIntentStoredFilePath(intent);
-      if (!filePath) {
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("File missing");
-        return;
-      }
-      let archiveStat;
-      try {
-        archiveStat = fs.statSync(filePath);
-      } catch {
+      const archiveSource = await buildIntentArchiveSource(intent);
+      const archiveStat = archiveStatFromSource(archiveSource);
+      if (!archiveSource || !archiveStat) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("File missing");
         return;
@@ -2913,13 +3236,20 @@ const server = http.createServer(async (req, res) => {
       }
 
       let entries = [];
+      const previewStartedAt = Date.now();
       try {
-        entries = await getArchiveIndexEntries(intentId, filePath, archiveStat);
+        entries = await getArchiveIndexEntries(intentId, archiveSource, archiveStat);
       } catch {
         res.writeHead(500, { "content-type": "text/plain" });
         res.end("Could not read package");
         return;
       }
+      previewDiagLog("archive-index-ready", {
+        intentId,
+        source: String(archiveSource.label || archiveSource.type || "").trim() || "unknown",
+        entryCount: Array.isArray(entries) ? entries.length : 0,
+        elapsedMs: Math.max(0, Date.now() - previewStartedAt)
+      });
       queueIntentArchivePreviewWarmup(intent);
 
       res.writeHead(200, {
@@ -2984,16 +3314,9 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const filePath = await ensureIntentStoredFilePath(intent);
-      if (!filePath) {
-        res.writeHead(404, { "content-type": "text/plain" });
-        res.end("File missing");
-        return;
-      }
-      let archiveStat;
-      try {
-        archiveStat = fs.statSync(filePath);
-      } catch {
+      const archiveSource = await buildIntentArchiveSource(intent);
+      const archiveStat = archiveStatFromSource(archiveSource);
+      if (!archiveSource || !archiveStat) {
         res.writeHead(404, { "content-type": "text/plain" });
         res.end("File missing");
         return;
@@ -3013,8 +3336,9 @@ const server = http.createServer(async (req, res) => {
 
       const safeName = safeBasename(path.basename(entryPath) || "file");
       let extracted;
+      const previewStartedAt = Date.now();
       try {
-        extracted = await ensureZipEntryExtracted(intentId, filePath, entryPath, safeName);
+        extracted = await ensureZipEntryExtracted(intentId, archiveSource, entryPath, safeName);
       } catch (err) {
         const status = Number(err?.status || 500);
         const message = String(err?.message || "").trim();
@@ -3026,6 +3350,13 @@ const server = http.createServer(async (req, res) => {
         }
         return;
       }
+      previewDiagLog("archive-entry-ready", {
+        intentId,
+        entryPath,
+        source: String(archiveSource.label || archiveSource.type || "").trim() || "unknown",
+        cacheHit: Boolean(extracted?.cacheHit),
+        elapsedMs: Math.max(0, Date.now() - previewStartedAt)
+      });
 
       if (!extracted?.cachePath || !fs.existsSync(extracted.cachePath)) {
         res.writeHead(500, { "content-type": "text/plain; charset=utf-8" });
@@ -3094,6 +3425,7 @@ const wss = new WebSocket.Server({
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { PassThrough } = require("stream");
 const bcrypt = require("bcryptjs");
 const objectStorage = require("./object-storage");
 
