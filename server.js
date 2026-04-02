@@ -2284,15 +2284,15 @@ const server = http.createServer(async (req, res) => {
         if (expectedBytes >= 8 * 1024 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 40 * 1024 * 1024);
         } else if (expectedBytes >= 4 * 1024 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 36 * 1024 * 1024);
-        } else if (expectedBytes >= 2 * 1024 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 32 * 1024 * 1024);
+        } else if (expectedBytes >= 2 * 1024 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 28 * 1024 * 1024);
         } else if (expectedBytes >= 1024 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 24 * 1024 * 1024);
         } else if (expectedBytes >= 512 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 20 * 1024 * 1024);
         } else if (expectedBytes >= 128 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 16 * 1024 * 1024);
+          tunedPartSize = Math.max(tunedPartSize, 14 * 1024 * 1024);
         } else if (expectedBytes >= 32 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 10 * 1024 * 1024);
         }
@@ -2309,7 +2309,7 @@ const server = http.createServer(async (req, res) => {
                 : (expectedBytes >= 512 * 1024 * 1024
                   ? 12
                   : (expectedBytes >= 256 * 1024 * 1024
-                    ? 10
+                    ? 9
                     : (expectedBytes >= 64 * 1024 * 1024 ? 8 : 6))))));
         const maxConcurrency = Math.max(
           1,
@@ -2408,6 +2408,134 @@ const server = http.createServer(async (req, res) => {
     const accountIntentUploadPartMatch = req.method === "POST"
       ? url.pathname.match(/^\/api\/intents\/([^/]+)\/object-upload\/part$/i)
       : null;
+    const accountIntentUploadPartsMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/object-upload\/parts$/i)
+      : null;
+    if (accountIntentUploadPartsMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+      if (!objectStorage.isEnabled()) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Object storage is not configured" }));
+        return;
+      }
+
+      const intentId = String(accountIntentUploadPartsMatch[1] || "").trim();
+      const intent = loadIntent(intentId);
+      if (!intent) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Intent not found" }));
+        return;
+      }
+      if (intent.from !== username) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
+        return;
+      }
+
+      let body = {};
+      try {
+        body = await readJsonBody(req, 512 * 1024);
+      } catch (err) {
+        const status = Number(err?.status || 400);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Invalid request body") }));
+        return;
+      }
+
+      const session = normalizeObjectUploadSession(intent.objectUploadSession);
+      if (!session || session.mode !== "multipart") {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Multipart upload is not initialized" }));
+        return;
+      }
+      const expectedUploadId = String(body?.uploadId || "").trim();
+      if (expectedUploadId && expectedUploadId !== session.uploadId) {
+        uploadDiagLog("parts-session-changed", {
+          intentId,
+          expectedUploadId,
+          activeUploadId: String(session.uploadId || "")
+        });
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload session changed" }));
+        return;
+      }
+
+      const rawPartNumbers = Array.isArray(body?.partNumbers) ? body.partNumbers : [];
+      const totalParts = Math.max(1, Number(session.totalParts || 1));
+      const normalizedPartNumbers = Array.from(new Set(
+        rawPartNumbers
+          .map((partRaw) => Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(partRaw || 0))))
+          .filter((partNumber) => Number.isFinite(partNumber) && partNumber <= totalParts)
+      ))
+        .sort((a, b) => a - b)
+        .slice(0, 1024);
+      if (!normalizedPartNumbers.length) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "No valid part numbers were provided" }));
+        return;
+      }
+
+      let partPlans = [];
+      try {
+        partPlans = await Promise.all(
+          normalizedPartNumbers.map(async (partNumber) => {
+            const upload = await objectStorage.createMultipartUploadPartUrl(
+              session.objectKey,
+              session.uploadId,
+              partNumber
+            );
+            if (!upload?.url) {
+              const uploadErr = new Error("Could not create part upload URL");
+              uploadErr.code = "MISSING_UPLOAD_URL";
+              throw uploadErr;
+            }
+            return {
+              partNumber,
+              upload
+            };
+          })
+        );
+      } catch (err) {
+        const msg = String(err?.message || "");
+        const lowered = msg.toLowerCase();
+        if (
+          lowered.includes("no such upload") ||
+          lowered.includes("uploadid") ||
+          lowered.includes("invalidpart")
+        ) {
+          uploadDiagLog("parts-session-expired", {
+            intentId,
+            uploadId: String(session.uploadId || ""),
+            message: msg
+          });
+          intent.objectUploadSession = null;
+          saveIntent(intent);
+          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
+          return;
+        }
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Could not create part upload URLs" }));
+        return;
+      }
+
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        intentId,
+        uploadId: session.uploadId,
+        parts: partPlans
+      }));
+      return;
+    }
     if (accountIntentUploadPartMatch) {
       setCors(res);
       const username = extractUsernameFromRequest(req, url);
