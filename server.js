@@ -10,8 +10,14 @@ const yauzl = require("yauzl");
 
 const PORT = process.env.PORT || 8080;
 
-const RETENTION_DAYS = Number(process.env.RETENTION_DAYS || 30);
-const RETENTION_MS = RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const RETENTION_DAYS = Math.max(0, Number(process.env.RETENTION_DAYS || 0));
+const RETENTION_MS = RETENTION_DAYS > 0 ? (RETENTION_DAYS * 24 * 60 * 60 * 1000) : 0;
+const APPLY_DEFAULT_INTENT_RETENTION = String(process.env.APPLY_DEFAULT_INTENT_RETENTION || "0") !== "0";
+const CUSTOM_INTENT_EXPIRY_MAX_DAYS = Math.max(
+  1,
+  Number(process.env.CUSTOM_INTENT_EXPIRY_MAX_DAYS || (RETENTION_DAYS > 0 ? RETENTION_DAYS : 3650))
+);
+const CUSTOM_INTENT_EXPIRY_MAX_MS = CUSTOM_INTENT_EXPIRY_MAX_DAYS * 24 * 60 * 60 * 1000;
 const MIN_INTENT_TTL_MS = Math.max(60 * 1000, Number(process.env.MIN_INTENT_TTL_MS || 60 * 1000));
 const TRANSFER_IDLE_TIMEOUT_MS = Number(process.env.TRANSFER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
 const TRANSFER_SWEEP_INTERVAL_MS = Number(process.env.TRANSFER_SWEEP_INTERVAL_MS || 15 * 1000);
@@ -3997,8 +4003,11 @@ function cleanupExpiredIntents() {
         continue;
       }
       const createdAt = Number(intent?.createdAt || 0);
-      const expiresAt = Number(intent?.expiresAt || 0);
-      const createdAtExpiry = createdAt > 0 ? createdAt + RETENTION_MS : 0;
+      const hasExplicitExpiry = hasIntentCustomExpiry(intent);
+      const expiresAt = hasExplicitExpiry ? Number(intent?.expiresAt || 0) : 0;
+      const createdAtExpiry = (APPLY_DEFAULT_INTENT_RETENTION && RETENTION_MS > 0 && createdAt > 0)
+        ? (createdAt + RETENTION_MS)
+        : 0;
       let effectiveExpiry = 0;
       if (expiresAt > 0 && createdAtExpiry > 0) {
         effectiveExpiry = Math.min(expiresAt, createdAtExpiry);
@@ -4371,7 +4380,7 @@ function verifyIntentUnlockToken(intent, providedToken = "") {
 function sanitizeIntentExpiresAt(rawExpiresAt, now = Date.now()) {
   const raw = Number(rawExpiresAt || 0);
   if (!Number.isFinite(raw) || raw <= 0) return 0;
-  const maxExpiry = now + RETENTION_MS;
+  const maxExpiry = now + CUSTOM_INTENT_EXPIRY_MAX_MS;
   const minExpiry = now + MIN_INTENT_TTL_MS;
   const bounded = Math.min(maxExpiry, Math.max(minExpiry, Math.floor(raw)));
   return bounded;
