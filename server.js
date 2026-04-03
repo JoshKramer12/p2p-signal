@@ -2299,18 +2299,18 @@ const server = http.createServer(async (req, res) => {
         const partSize = Math.max(tunedPartSize, maxPartSizeByCount);
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
         const recommendedConcurrency = expectedBytes >= 8 * 1024 * 1024 * 1024
-          ? 16
+          ? 12
           : (expectedBytes >= 4 * 1024 * 1024 * 1024
-            ? 15
+            ? 11
             : (expectedBytes >= 2 * 1024 * 1024 * 1024
-              ? 14
+              ? 10
               : (expectedBytes >= 1024 * 1024 * 1024
-                ? 13
+                ? 8
                 : (expectedBytes >= 512 * 1024 * 1024
-                  ? 12
+                  ? 7
                   : (expectedBytes >= 256 * 1024 * 1024
-                    ? 9
-                    : (expectedBytes >= 64 * 1024 * 1024 ? 8 : 6))))));
+                    ? 6
+                    : (expectedBytes >= 64 * 1024 * 1024 ? 5 : 4))))));
         const maxConcurrency = Math.max(
           1,
           Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency, totalParts)
