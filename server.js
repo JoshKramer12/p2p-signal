@@ -58,20 +58,20 @@ const OBJECT_MULTIPART_PART_SIZE_BYTES = Math.max(
 const OBJECT_MULTIPART_MAX_PARTS = 10000;
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX = Math.max(
   1,
-  Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX || 16)
+  Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX || 10)
 );
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
   1,
-  Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 14))
+  Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 8))
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
   256 * 1024,
-  Number(process.env.UPLOAD_CHECKPOINT_EVERY_BYTES || 16 * 1024 * 1024)
+  Number(process.env.UPLOAD_CHECKPOINT_EVERY_BYTES || 8 * 1024 * 1024)
 );
 const UPLOAD_CHECKPOINT_MIN_INTERVAL_MS = Math.max(
   250,
-  Number(process.env.UPLOAD_CHECKPOINT_MIN_INTERVAL_MS || 4000)
+  Number(process.env.UPLOAD_CHECKPOINT_MIN_INTERVAL_MS || 2500)
 );
 const UPLOAD_DIAGNOSTICS_ENABLED = String(
   process.env.UPLOAD_DIAGNOSTICS || process.env.UPLOAD_DIAG || "0"
@@ -2281,36 +2281,26 @@ const server = http.createServer(async (req, res) => {
           Math.ceil(expectedBytes / OBJECT_MULTIPART_MAX_PARTS)
         );
         let tunedPartSize = OBJECT_MULTIPART_PART_SIZE_BYTES;
-        if (expectedBytes >= 8 * 1024 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 40 * 1024 * 1024);
-        } else if (expectedBytes >= 4 * 1024 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 32 * 1024 * 1024);
-        } else if (expectedBytes >= 2 * 1024 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 28 * 1024 * 1024);
-        } else if (expectedBytes >= 1024 * 1024 * 1024) {
+        if (expectedBytes >= 2 * 1024 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 24 * 1024 * 1024);
+        } else if (expectedBytes >= 1024 * 1024 * 1024) {
+          tunedPartSize = Math.max(tunedPartSize, 20 * 1024 * 1024);
         } else if (expectedBytes >= 512 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 20 * 1024 * 1024);
         } else if (expectedBytes >= 128 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 14 * 1024 * 1024);
+          tunedPartSize = Math.max(tunedPartSize, 16 * 1024 * 1024);
         } else if (expectedBytes >= 32 * 1024 * 1024) {
           tunedPartSize = Math.max(tunedPartSize, 10 * 1024 * 1024);
         }
         const partSize = Math.max(tunedPartSize, maxPartSizeByCount);
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
-        const recommendedConcurrency = expectedBytes >= 8 * 1024 * 1024 * 1024
-          ? 12
-          : (expectedBytes >= 4 * 1024 * 1024 * 1024
-            ? 11
-            : (expectedBytes >= 2 * 1024 * 1024 * 1024
-              ? 10
-              : (expectedBytes >= 1024 * 1024 * 1024
-                ? 8
-                : (expectedBytes >= 512 * 1024 * 1024
-                  ? 7
-                  : (expectedBytes >= 256 * 1024 * 1024
-                    ? 6
-                    : (expectedBytes >= 64 * 1024 * 1024 ? 5 : 4))))));
+        const recommendedConcurrency = expectedBytes >= 1024 * 1024 * 1024
+          ? 8
+          : (expectedBytes >= 384 * 1024 * 1024
+            ? 7
+            : (expectedBytes >= 128 * 1024 * 1024
+              ? 6
+              : (expectedBytes >= 32 * 1024 * 1024 ? 5 : 4)));
         const maxConcurrency = Math.max(
           1,
           Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency, totalParts)
