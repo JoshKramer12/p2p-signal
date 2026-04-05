@@ -1586,7 +1586,29 @@ function cleanupPreviewCache() {
   } catch {}
 }
 
+function buildDownloadPresentation(fileName = "file", mime = "") {
+  const safeName = safeBasename(String(fileName || "file"));
+  const rawMime = String(mime || "").trim();
+  const lowerMime = rawMime.toLowerCase();
+  const isFolderBundle = safeName.toLowerCase().endsWith(".folder") || lowerMime.includes("x-merm-folder");
+  if (!isFolderBundle) {
+    return {
+      fileName: safeName,
+      mime: rawMime || contentTypeForName(safeName)
+    };
+  }
+  const exportName = safeName.toLowerCase().endsWith(".folder")
+    ? `${safeName.slice(0, -(".folder".length))}.zip`
+    : `${safeName}.zip`;
+  return {
+    fileName: safeBasename(exportName),
+    mime: "application/zip"
+  };
+}
+
 function serveFileFromDisk(req, res, filePath, safeName, dispositionType = "attachment") {
+  const presentation = buildDownloadPresentation(safeName, "");
+  const exportName = presentation.fileName;
   let stat;
   try {
     stat = fs.statSync(filePath);
@@ -1598,9 +1620,9 @@ function serveFileFromDisk(req, res, filePath, safeName, dispositionType = "atta
 
   const totalSize = Number(stat?.size || 0);
   const baseHeaders = {
-    "content-type": contentTypeForName(safeName),
+    "content-type": presentation.mime,
     "accept-ranges": "bytes",
-    "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
+    "content-disposition": `${dispositionType}; filename="${exportName}"; filename*=UTF-8''${encodeURIComponent(exportName)}`
   };
 
   if (!Number.isFinite(totalSize) || totalSize <= 0) {
@@ -1675,10 +1697,13 @@ async function serveFileFromObjectStorage(req, res, objectKey, safeName, disposi
     contentType = contentType || String(meta.contentType || "").trim();
   }
 
+  const presentation = buildDownloadPresentation(safeName, contentType);
+  const exportName = presentation.fileName;
+
   const baseHeaders = {
-    "content-type": contentType || contentTypeForName(safeName),
+    "content-type": presentation.mime,
     "accept-ranges": "bytes",
-    "content-disposition": `${dispositionType}; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`
+    "content-disposition": `${dispositionType}; filename="${exportName}"; filename*=UTF-8''${encodeURIComponent(exportName)}`
   };
 
   if (!Number.isFinite(totalSize) || totalSize <= 0) {
