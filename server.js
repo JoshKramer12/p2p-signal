@@ -6,6 +6,7 @@ const http2 = require("http2");
 const WebSocket = require("ws");
 const { randomUUID, createHash, createHmac, timingSafeEqual, createSign } = require("crypto");
 const net = require("net");
+const JSZip = require("jszip");
 const yauzl = require("yauzl");
 
 const PORT = process.env.PORT || 8080;
@@ -28,6 +29,7 @@ const ARCHIVE_PREVIEW_MAX_BYTES = Math.max(
 );
 const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
+const FOLDER_BUNDLE_MANIFEST = "__merm_bundle_meta__.json";
 const ARCHIVE_PREVIEW_WARMUP_MAX_BYTES = Math.max(
   0,
   Number(process.env.ARCHIVE_PREVIEW_WARMUP_MAX_BYTES || 3 * 1024 * 1024 * 1024)
@@ -1594,7 +1596,8 @@ function buildDownloadPresentation(fileName = "file", mime = "") {
   if (!isFolderBundle) {
     return {
       fileName: safeName,
-      mime: rawMime || contentTypeForName(safeName)
+      mime: rawMime || contentTypeForName(safeName),
+      isFolderBundle: false
     };
   }
   const exportName = safeName.toLowerCase().endsWith(".folder")
@@ -1602,8 +1605,59 @@ function buildDownloadPresentation(fileName = "file", mime = "") {
     : `${safeName}.zip`;
   return {
     fileName: safeBasename(exportName),
-    mime: "application/zip"
+    mime: "application/zip",
+    isFolderBundle: true
   };
+}
+
+function serveBufferDownload(req, res, buffer, safeName, mime = "", dispositionType = "attachment") {
+  const payload = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
+  const presentation = buildDownloadPresentation(safeName, mime);
+  const exportName = presentation.fileName;
+  const totalSize = Math.max(0, Number(payload.length || 0));
+  const baseHeaders = {
+    "content-type": presentation.mime,
+    "accept-ranges": "bytes",
+    "content-disposition": `${dispositionType}; filename="${exportName}"; filename*=UTF-8''${encodeURIComponent(exportName)}`
+  };
+
+  if (!Number.isFinite(totalSize) || totalSize <= 0) {
+    res.writeHead(200, {
+      ...baseHeaders,
+      "content-length": 0
+    });
+    res.end();
+    return;
+  }
+
+  const parsedRange = parseHttpRange(req.headers.range, totalSize);
+  if (!parsedRange.ok) {
+    res.writeHead(416, {
+      ...baseHeaders,
+      "content-range": `bytes */${totalSize}`
+    });
+    res.end();
+    return;
+  }
+
+  const start = parsedRange.start;
+  const end = parsedRange.end;
+  const hasRange = parsedRange.hasRange;
+  const headers = {
+    ...baseHeaders,
+    "content-length": hasRange ? Math.max(0, end - start + 1) : totalSize
+  };
+  if (hasRange) {
+    headers["content-range"] = `bytes ${start}-${end}/${totalSize}`;
+  }
+  res.writeHead(hasRange ? 206 : 200, headers);
+
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+
+  res.end(hasRange ? payload.subarray(start, end + 1) : payload);
 }
 
 function serveFileFromDisk(req, res, filePath, safeName, dispositionType = "attachment") {
@@ -1841,13 +1895,69 @@ async function ensureIntentStoredFilePath(intent = null) {
   return fs.existsSync(localPath) ? localPath : "";
 }
 
+async function loadIntentStoredFileBuffer(intent = null) {
+  if (!intent || typeof intent !== "object") return null;
+  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  if (storedObjectKey && objectStorage.isEnabled()) {
+    try {
+      return await objectStorage.readObjectBuffer(storedObjectKey);
+    } catch {
+      return null;
+    }
+  }
+  const storedFile = String(intent.storedFile || "").trim();
+  if (!storedFile) return null;
+  const localPath = path.join(FILES_DIR, storedFile);
+  if (!fs.existsSync(localPath)) return null;
+  try {
+    return fs.readFileSync(localPath);
+  } catch {
+    return null;
+  }
+}
+
+async function buildIntentFolderDownloadBuffer(intent = null) {
+  const raw = await loadIntentStoredFileBuffer(intent);
+  if (!raw) return null;
+  const sourceZip = await JSZip.loadAsync(raw);
+  const exportZip = new JSZip();
+  let added = 0;
+  const entries = Object.values(sourceZip?.files || {})
+    .sort((left, right) => String(left?.name || "").localeCompare(String(right?.name || "")));
+
+  for (const entry of entries) {
+    const fullPath = String(entry?.name || "").replace(/^\/+/, "");
+    if (!fullPath || entry?.dir) continue;
+    if (fullPath === FOLDER_BUNDLE_MANIFEST) continue;
+    const payload = await entry.async("nodebuffer");
+    exportZip.file(fullPath, payload, { compression: "STORE" });
+    added += 1;
+  }
+
+  if (!added) return raw;
+  return await exportZip.generateAsync({
+    type: "nodebuffer",
+    compression: "STORE",
+    streamFiles: true
+  });
+}
+
 async function serveStoredIntentDownload(req, res, intent = null, dispositionType = "attachment") {
   const safeName = safeBasename(String(intent?.fileName || "file"));
+  const rawMime = String(intent?.mime || "").trim() || contentTypeForName(safeName);
+  const presentation = buildDownloadPresentation(safeName, rawMime);
+  if (dispositionType !== "inline" && presentation.isFolderBundle) {
+    const exportBuffer = await buildIntentFolderDownloadBuffer(intent).catch(() => null);
+    if (exportBuffer) {
+      serveBufferDownload(req, res, exportBuffer, safeName, rawMime, dispositionType);
+      return;
+    }
+  }
   const storedObjectKey = String(intent?.storedObjectKey || "").trim();
   if (storedObjectKey && objectStorage.isEnabled()) {
     await serveFileFromObjectStorage(req, res, storedObjectKey, safeName, dispositionType, {
       size: buildIntentStoredSizeHint(intent),
-      mime: String(intent?.mime || "").trim() || contentTypeForName(safeName)
+      mime: rawMime
     });
     return;
   }
