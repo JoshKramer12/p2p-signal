@@ -674,6 +674,15 @@ function resolveAuthenticatedUsernameFromRequest(req, url) {
   return String(user?.username || "").trim();
 }
 
+function canAuthenticatedUserAccessIntent(intent = null, username = "") {
+  if (!intent || typeof intent !== "object") return false;
+  const name = String(username || "").trim();
+  if (!name) return false;
+  const from = String(intent.from || "").trim();
+  const to = String(intent.to || "").trim();
+  return name === from || name === to;
+}
+
 function markIntentDownloadedByRecipient(intent = null, downloaderUsername = "", options = {}) {
   if (!intent || typeof intent !== "object") return false;
   if (intent.isTextOnly || String(intent.messageType || "").toLowerCase() === "text") return false;
@@ -3643,9 +3652,9 @@ const server = http.createServer(async (req, res) => {
       setCors(res);
       const intentId = url.pathname.split("/")[2] || "";
       const token = url.searchParams.get("token") || "";
-      if (!intentId || !token) {
+      if (!intentId) {
         res.writeHead(400, { "content-type": "text/plain" });
-        res.end("Missing intentId or token");
+        res.end("Missing intentId");
         return;
       }
 
@@ -3656,7 +3665,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      if (intent.downloadToken !== token) {
+      const authenticatedUsername = resolveAuthenticatedUsernameFromRequest(req, url);
+      const sessionAuthorized = canAuthenticatedUserAccessIntent(intent, authenticatedUsername);
+      const tokenAuthorized = Boolean(token) && intent.downloadToken === token;
+      if (!tokenAuthorized && !sessionAuthorized) {
         res.writeHead(403, { "content-type": "text/plain" });
         res.end("Forbidden");
         return;
