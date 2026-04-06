@@ -1619,6 +1619,27 @@ function buildDownloadPresentation(fileName = "file", mime = "") {
   };
 }
 
+function folderExportRootName(fileName = "folder") {
+  const rawName = safeBasename(String(fileName || "folder"));
+  const withoutExt = rawName.toLowerCase().endsWith(".folder")
+    ? rawName.slice(0, -(".folder".length))
+    : rawName;
+  return safeBasename(withoutExt || "folder") || "folder";
+}
+
+function remapFolderBundleEntryPath(fullPath = "", desiredRoot = "folder") {
+  const normalized = String(fullPath || "").replace(/^\/+/, "");
+  if (!normalized) return "";
+  const parts = normalized.split("/").filter(Boolean);
+  const root = safeBasename(desiredRoot || "folder") || "folder";
+  if (!parts.length) return "";
+  if (parts.length === 1) {
+    return `${root}/${parts[0]}`;
+  }
+  parts[0] = root;
+  return parts.join("/");
+}
+
 function serveBufferDownload(req, res, buffer, safeName, mime = "", dispositionType = "attachment") {
   const payload = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || []);
   const presentation = buildDownloadPresentation(safeName, mime);
@@ -1930,6 +1951,7 @@ async function buildIntentFolderDownloadBuffer(intent = null) {
   if (!raw) return null;
   const sourceZip = await JSZip.loadAsync(raw);
   const exportZip = new JSZip();
+  const desiredRoot = folderExportRootName(String(intent?.fileName || "folder"));
   let added = 0;
   const entries = Object.values(sourceZip?.files || {})
     .sort((left, right) => String(left?.name || "").localeCompare(String(right?.name || "")));
@@ -1939,7 +1961,9 @@ async function buildIntentFolderDownloadBuffer(intent = null) {
     if (!fullPath || entry?.dir) continue;
     if (fullPath === FOLDER_BUNDLE_MANIFEST) continue;
     const payload = await entry.async("nodebuffer");
-    exportZip.file(fullPath, payload, { compression: "STORE" });
+    const exportPath = remapFolderBundleEntryPath(fullPath, desiredRoot);
+    if (!exportPath) continue;
+    exportZip.file(exportPath, payload, { compression: "STORE" });
     added += 1;
   }
 
