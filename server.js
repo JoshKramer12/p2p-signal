@@ -3203,45 +3203,42 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, intentId, status: "not_found", message: "Intent not found" }));
         return;
       }
-      if (intent.from !== username) {
+      const targetIntent = resolvePrimaryIntentForDeletion(intent) || intent;
+      if (targetIntent.from !== username) {
         res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
         return;
       }
 
-      const transfer = activeTransfers.get(intentId) || null;
-      const status = String(intent.status || "");
-      const canCancel = Boolean(transfer) || status === "pending" || status === "uploading" || !intent.stored;
+      const transfer = activeTransfers.get(targetIntent.id) || activeTransfers.get(intentId) || null;
+      const status = String(targetIntent.status || intent.status || "");
+      const canCancel = Boolean(transfer) || status === "pending" || status === "uploading" || !targetIntent.stored;
       if (!canCancel) {
         res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-        res.end(JSON.stringify({ ok: false, intentId, status: "ignored", message: "Intent is already finalized" }));
+        res.end(JSON.stringify({ ok: false, intentId: targetIntent.id, status: "ignored", message: "Intent is already finalized" }));
         return;
       }
 
       if (transfer) {
-        failActiveTransfer(intentId, "Upload canceled by sender", {
+        failActiveTransfer(targetIntent.id, "Upload canceled by sender", {
           notify: false,
           deleteIntent: false,
           suppressState: true
         });
       }
 
-      const storedFileName = String(intent.storedFile || "").trim();
-      if (storedFileName || intent.storedObjectKey) {
-        deleteStoredAssetForIntent(intent);
-      }
-      emitTransferState(intent, "canceled", {
-        sentBytes: Number(intent.storedBytes || 0),
-        totalBytes: Number(resolveUploadExpectedBytes(intent) || 0),
-        plainSentBytes: Number(intent.plainStoredBytes || 0),
-        plainTotalBytes: Number(intent.fileSize || 0),
+      emitTransferState(targetIntent, "canceled", {
+        sentBytes: Number(targetIntent.storedBytes || 0),
+        totalBytes: Number(resolveUploadExpectedBytes(targetIntent) || 0),
+        plainSentBytes: Number(targetIntent.plainStoredBytes || 0),
+        plainTotalBytes: Number(targetIntent.fileSize || 0),
         retryable: false,
         message: "Canceled by sender"
       });
-      deleteIntentAndNotify(intent);
+      deleteIntentFamilyAndNotify(targetIntent);
 
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      res.end(JSON.stringify({ ok: true, intentId, status: "canceled" }));
+      res.end(JSON.stringify({ ok: true, intentId: targetIntent.id, status: "canceled" }));
       return;
     }
 
@@ -3266,26 +3263,26 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, intentId, status: "not_found", message: "Intent not found" }));
         return;
       }
-      if (intent.from !== username && intent.to !== username) {
+      const targetIntent = resolvePrimaryIntentForDeletion(intent) || intent;
+      if (targetIntent.from !== username) {
         res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
         return;
       }
 
-      const transfer = activeTransfers.get(intentId) || null;
+      const transfer = activeTransfers.get(targetIntent.id) || activeTransfers.get(intentId) || null;
       if (transfer) {
-        failActiveTransfer(intentId, "Deleted by user", {
+        failActiveTransfer(targetIntent.id, "Deleted by user", {
           notify: false,
           deleteIntent: false,
           suppressState: true
         });
       }
 
-      deleteStoredAssetForIntent(intent);
-      deleteIntentAndNotify(intent);
+      deleteIntentFamilyAndNotify(targetIntent);
 
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      res.end(JSON.stringify({ ok: true, intentId, status: "deleted" }));
+      res.end(JSON.stringify({ ok: true, intentId: targetIntent.id, status: "deleted" }));
       return;
     }
 
@@ -4130,9 +4127,76 @@ function deleteStoredFileAndNotify(storedFile) {
   intents.forEach((intent) => deleteIntentAndNotify(intent));
 }
 
-function deleteIntentAndNotify(intent) {
+function resolvePrimaryIntentForDeletion(intent = null) {
+  if (!intent || typeof intent !== "object") return null;
+  const primaryId = String(intent.groupPrimaryIntentId || "").trim();
+  if (!primaryId) return intent;
+  return loadIntent(primaryId) || intent;
+}
+
+function collectIntentDeletionFamily(intent = null) {
+  const family = [];
+  const queue = [];
+  const seen = new Set();
+
+  const enqueue = (candidate = null) => {
+    const loaded = candidate && typeof candidate === "object"
+      ? candidate
+      : loadIntent(String(candidate || "").trim());
+    const id = String(loaded?.id || "").trim();
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    queue.push(loaded);
+  };
+
+  enqueue(resolvePrimaryIntentForDeletion(intent) || intent);
+
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current) continue;
+    family.push(current);
+    const primaryId = String(current.groupPrimaryIntentId || "").trim();
+    if (primaryId) enqueue(primaryId);
+    const mirrorIds = Array.isArray(current.groupMirrorIntentIds) ? current.groupMirrorIntentIds : [];
+    mirrorIds.forEach((mirrorId) => enqueue(String(mirrorId || "").trim()));
+  }
+
+  return family;
+}
+
+function intentDeletionAssetKey(intent = null) {
+  if (!intent || typeof intent !== "object") return "";
+  const objectKey = String(intent.storedObjectKey || intent.objectUploadSession?.objectKey || "").trim();
+  if (objectKey) return `object:${objectKey}`;
+  const storedFile = String(intent.storedFile || "").trim();
+  if (storedFile) return `file:${storedFile}`;
+  return "";
+}
+
+function deleteIntentFamilyAndNotify(intent = null) {
+  const family = collectIntentDeletionFamily(intent);
+  if (!family.length) return [];
+
+  const deletedAssetKeys = new Set();
+  family.forEach((entry) => {
+    const assetKey = intentDeletionAssetKey(entry);
+    if (assetKey && deletedAssetKeys.has(assetKey)) return;
+    deleteStoredAssetForIntent(entry);
+    if (assetKey) deletedAssetKeys.add(assetKey);
+  });
+
+  family.forEach((entry) => {
+    deleteIntentAndNotify(entry, { deleteStoredAsset: false });
+  });
+
+  return family;
+}
+
+function deleteIntentAndNotify(intent, options = {}) {
   if (!intent) return;
-  deleteStoredAssetForIntent(intent);
+  if (options?.deleteStoredAsset !== false) {
+    deleteStoredAssetForIntent(intent);
+  }
   const intentFile = path.join(INTENTS_DIR, `${intent.id}.json`);
   try { if (fs.existsSync(intentFile)) fs.unlinkSync(intentFile); } catch {}
   invalidateIntentListCacheForIntent(intent);
@@ -8435,42 +8499,38 @@ if (data.type === "cancel_send") {
   if (!intent) {
     return send(ws, { type: "cancel_send_ok", intentId, status: "not_found" });
   }
-  if (intent.from !== ws.username) {
+  const targetIntent = resolvePrimaryIntentForDeletion(intent) || intent;
+  if (targetIntent.from !== ws.username) {
     return send(ws, { type: "error", message: "Not authorized" });
   }
 
-  const transfer = activeTransfers.get(intentId) || null;
-  const status = String(intent.status || "");
-  const canCancel = Boolean(transfer) || status === "pending" || status === "uploading" || !intent.stored;
+  const transfer = activeTransfers.get(targetIntent.id) || activeTransfers.get(intentId) || null;
+  const status = String(targetIntent.status || intent.status || "");
+  const canCancel = Boolean(transfer) || status === "pending" || status === "uploading" || !targetIntent.stored;
   if (!canCancel) {
-    return send(ws, { type: "cancel_send_ok", intentId, status: "ignored" });
+    return send(ws, { type: "cancel_send_ok", intentId: targetIntent.id, status: "ignored" });
   }
 
   if (transfer) {
-    failActiveTransfer(intentId, "Upload canceled by sender", {
+    failActiveTransfer(targetIntent.id, "Upload canceled by sender", {
       notify: false,
       deleteIntent: false,
       suppressState: true
     });
-  } else if (ws.currentUploadIntentId === intentId) {
+  } else if (ws.currentUploadIntentId === targetIntent.id || ws.currentUploadIntentId === intentId) {
     ws.currentUploadIntentId = null;
   }
 
-  const storedFileName = String(intent.storedFile || "").trim();
-  if (storedFileName || intent.storedObjectKey) {
-    deleteStoredAssetForIntent(intent);
-  }
-
-  emitTransferState(intent, "canceled", {
-    sentBytes: Number(intent.storedBytes || 0),
-    totalBytes: Number(resolveUploadExpectedBytes(intent) || 0),
-    plainSentBytes: Number(intent.plainStoredBytes || 0),
-    plainTotalBytes: Number(intent.fileSize || 0),
+  emitTransferState(targetIntent, "canceled", {
+    sentBytes: Number(targetIntent.storedBytes || 0),
+    totalBytes: Number(resolveUploadExpectedBytes(targetIntent) || 0),
+    plainSentBytes: Number(targetIntent.plainStoredBytes || 0),
+    plainTotalBytes: Number(targetIntent.fileSize || 0),
     retryable: false,
     message: "Canceled by sender"
   });
-  deleteIntentAndNotify(intent);
-  send(ws, { type: "cancel_send_ok", intentId, status: "canceled" });
+  deleteIntentFamilyAndNotify(targetIntent);
+  send(ws, { type: "cancel_send_ok", intentId: targetIntent.id, status: "canceled" });
   sendStatsSnapshot(ws);
   return;
 }
@@ -8479,35 +8539,28 @@ if (data.type === "delete_message_everyone") {
   const intentId = String(data.intentId || "").trim();
   if (!intentId) return send(ws, { type: "error", message: "Missing intentId" });
 
-  const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
-  if (!fs.existsSync(intentFile)) {
+  const intent = loadIntent(intentId);
+  if (!intent) {
     return send(ws, { type: "error", message: "Intent not found" });
   }
-
-  let intent;
-  try { intent = JSON.parse(fs.readFileSync(intentFile, "utf8")); } catch {
-    return send(ws, { type: "error", message: "Intent corrupted" });
-  }
-
-  if (intent.from !== ws.username && intent.to !== ws.username) {
+  const targetIntent = resolvePrimaryIntentForDeletion(intent) || intent;
+  if (targetIntent.from !== ws.username) {
     return send(ws, { type: "error", message: "Not authorized" });
   }
 
-  const transfer = activeTransfers.get(intentId) || null;
+  const transfer = activeTransfers.get(targetIntent.id) || activeTransfers.get(intentId) || null;
   if (transfer) {
-    failActiveTransfer(intentId, "Deleted by user", {
+    failActiveTransfer(targetIntent.id, "Deleted by user", {
       notify: false,
       deleteIntent: false,
       suppressState: true
     });
-  } else if (ws.currentUploadIntentId === intentId) {
+  } else if (ws.currentUploadIntentId === targetIntent.id || ws.currentUploadIntentId === intentId) {
     ws.currentUploadIntentId = null;
   }
 
-  deleteStoredAssetForIntent(intent);
-
-  deleteIntentAndNotify(intent);
-  send(ws, { type: "delete_message_everyone_ok", intentId, status: "deleted" });
+  deleteIntentFamilyAndNotify(targetIntent);
+  send(ws, { type: "delete_message_everyone_ok", intentId: targetIntent.id, status: "deleted" });
 
   sendStatsSnapshot(ws);
   return;
