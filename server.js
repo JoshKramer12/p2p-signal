@@ -3210,35 +3210,33 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const transfer = activeTransfers.get(targetIntent.id) || activeTransfers.get(intentId) || null;
+      const transferIntentId = resolveActiveTransferId(targetIntent.id, intentId);
+      const transfer = transferIntentId ? activeTransfers.get(transferIntentId) : null;
       const status = String(targetIntent.status || intent.status || "");
       const canCancel = Boolean(transfer) || status === "pending" || status === "uploading" || !targetIntent.stored;
-      if (!canCancel) {
-        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-        res.end(JSON.stringify({ ok: false, intentId: targetIntent.id, status: "ignored", message: "Intent is already finalized" }));
-        return;
-      }
 
       if (transfer) {
-        failActiveTransfer(targetIntent.id, "Upload canceled by sender", {
+        failActiveTransfer(transferIntentId, "Upload canceled by sender", {
           notify: false,
           deleteIntent: false,
           suppressState: true
         });
       }
 
-      emitTransferState(targetIntent, "canceled", {
-        sentBytes: Number(targetIntent.storedBytes || 0),
-        totalBytes: Number(resolveUploadExpectedBytes(targetIntent) || 0),
-        plainSentBytes: Number(targetIntent.plainStoredBytes || 0),
-        plainTotalBytes: Number(targetIntent.fileSize || 0),
-        retryable: false,
-        message: "Canceled by sender"
-      });
+      if (canCancel) {
+        emitTransferState(targetIntent, "canceled", {
+          sentBytes: Number(targetIntent.storedBytes || 0),
+          totalBytes: Number(resolveUploadExpectedBytes(targetIntent) || 0),
+          plainSentBytes: Number(targetIntent.plainStoredBytes || 0),
+          plainTotalBytes: Number(targetIntent.fileSize || 0),
+          retryable: false,
+          message: "Canceled by sender"
+        });
+      }
       deleteIntentFamilyAndNotify(targetIntent);
 
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      res.end(JSON.stringify({ ok: true, intentId: targetIntent.id, status: "canceled" }));
+      res.end(JSON.stringify({ ok: true, intentId: targetIntent.id, status: canCancel ? "canceled" : "deleted" }));
       return;
     }
 
@@ -3270,9 +3268,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const transfer = activeTransfers.get(targetIntent.id) || activeTransfers.get(intentId) || null;
+      const transferIntentId = resolveActiveTransferId(targetIntent.id, intentId);
+      const transfer = transferIntentId ? activeTransfers.get(transferIntentId) : null;
       if (transfer) {
-        failActiveTransfer(targetIntent.id, "Deleted by user", {
+        failActiveTransfer(transferIntentId, "Deleted by user", {
           notify: false,
           deleteIntent: false,
           suppressState: true
@@ -5506,6 +5505,14 @@ function failActiveTransfer(intentId, message, options = {}) {
     deleteIntentAndNotify(intent);
   }
   return intent || null;
+}
+
+function resolveActiveTransferId(...intentIds) {
+  for (const rawId of intentIds) {
+    const id = String(rawId || "").trim();
+    if (id && activeTransfers.has(id)) return id;
+  }
+  return "";
 }
 
 function finalizeGroupRecipientCopies(primaryIntent, options = {}) {
@@ -8504,15 +8511,13 @@ if (data.type === "cancel_send") {
     return send(ws, { type: "error", message: "Not authorized" });
   }
 
-  const transfer = activeTransfers.get(targetIntent.id) || activeTransfers.get(intentId) || null;
+  const transferIntentId = resolveActiveTransferId(targetIntent.id, intentId);
+  const transfer = transferIntentId ? activeTransfers.get(transferIntentId) : null;
   const status = String(targetIntent.status || intent.status || "");
   const canCancel = Boolean(transfer) || status === "pending" || status === "uploading" || !targetIntent.stored;
-  if (!canCancel) {
-    return send(ws, { type: "cancel_send_ok", intentId: targetIntent.id, status: "ignored" });
-  }
 
   if (transfer) {
-    failActiveTransfer(targetIntent.id, "Upload canceled by sender", {
+    failActiveTransfer(transferIntentId, "Upload canceled by sender", {
       notify: false,
       deleteIntent: false,
       suppressState: true
@@ -8521,16 +8526,18 @@ if (data.type === "cancel_send") {
     ws.currentUploadIntentId = null;
   }
 
-  emitTransferState(targetIntent, "canceled", {
-    sentBytes: Number(targetIntent.storedBytes || 0),
-    totalBytes: Number(resolveUploadExpectedBytes(targetIntent) || 0),
-    plainSentBytes: Number(targetIntent.plainStoredBytes || 0),
-    plainTotalBytes: Number(targetIntent.fileSize || 0),
-    retryable: false,
-    message: "Canceled by sender"
-  });
+  if (canCancel) {
+    emitTransferState(targetIntent, "canceled", {
+      sentBytes: Number(targetIntent.storedBytes || 0),
+      totalBytes: Number(resolveUploadExpectedBytes(targetIntent) || 0),
+      plainSentBytes: Number(targetIntent.plainStoredBytes || 0),
+      plainTotalBytes: Number(targetIntent.fileSize || 0),
+      retryable: false,
+      message: "Canceled by sender"
+    });
+  }
   deleteIntentFamilyAndNotify(targetIntent);
-  send(ws, { type: "cancel_send_ok", intentId: targetIntent.id, status: "canceled" });
+  send(ws, { type: "cancel_send_ok", intentId: targetIntent.id, status: canCancel ? "canceled" : "deleted" });
   sendStatsSnapshot(ws);
   return;
 }
@@ -8548,9 +8555,10 @@ if (data.type === "delete_message_everyone") {
     return send(ws, { type: "error", message: "Not authorized" });
   }
 
-  const transfer = activeTransfers.get(targetIntent.id) || activeTransfers.get(intentId) || null;
+  const transferIntentId = resolveActiveTransferId(targetIntent.id, intentId);
+  const transfer = transferIntentId ? activeTransfers.get(transferIntentId) : null;
   if (transfer) {
-    failActiveTransfer(targetIntent.id, "Deleted by user", {
+    failActiveTransfer(transferIntentId, "Deleted by user", {
       notify: false,
       deleteIntent: false,
       suppressState: true
