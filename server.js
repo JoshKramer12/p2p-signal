@@ -5107,8 +5107,13 @@ function emitTransferState(intent, state, extra = {}) {
     retryable: Boolean(extra.retryable),
     message: String(extra.message || "")
   };
-  if (intent?.from) sendToUser(intent.from, payload);
-  if (intent?.to && !deliveryHeld) sendToUser(intent.to, payload);
+  const recipients = new Set();
+  if (intent?.from) recipients.add(String(intent.from || "").trim());
+  if (intent?.to && !deliveryHeld) recipients.add(String(intent.to || "").trim());
+  recipients.forEach((username) => {
+    if (!username) return;
+    sendToUser(username, payload);
+  });
 }
 
 function updateIntentUploadCheckpoint(intent, sentBytes, options = {}) {
