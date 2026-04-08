@@ -1619,6 +1619,33 @@ function buildDownloadPresentation(fileName = "file", mime = "") {
   };
 }
 
+async function maybeRedirectObjectStorageAttachment(req, res, objectKey = "", fileName = "file", mime = "") {
+  const key = String(objectKey || "").trim();
+  if (!key || !objectStorage.isEnabled()) return false;
+  if (String(req?.method || "GET").trim().toUpperCase() !== "GET") return false;
+  if (String(req?.headers?.range || "").trim()) return false;
+  if (!/[?&]direct=1(?:&|$)/.test(String(req?.url || ""))) return false;
+  const presentation = buildDownloadPresentation(fileName, mime);
+  const exportName = presentation.fileName;
+  const contentDisposition = `attachment; filename="${exportName}"; filename*=UTF-8''${encodeURIComponent(exportName)}`;
+  let signedUrl = "";
+  try {
+    signedUrl = await objectStorage.createDownloadUrl(key, {
+      contentDisposition,
+      contentType: presentation.mime
+    });
+  } catch {
+    signedUrl = "";
+  }
+  if (!signedUrl) return false;
+  res.writeHead(302, {
+    location: signedUrl,
+    "cache-control": "no-store"
+  });
+  res.end();
+  return true;
+}
+
 function folderExportRootName(fileName = "folder") {
   const rawName = safeBasename(String(fileName || "folder"));
   const withoutExt = rawName.toLowerCase().endsWith(".folder")
@@ -1979,6 +2006,15 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
   const safeName = safeBasename(String(intent?.fileName || "file"));
   const rawMime = String(intent?.mime || "").trim() || contentTypeForName(safeName);
   const presentation = buildDownloadPresentation(safeName, rawMime);
+  const storedObjectKey = String(intent?.storedObjectKey || "").trim();
+  if (
+    dispositionType === "attachment" &&
+    storedObjectKey &&
+    !Boolean(intent?.passwordProtected || isIntentPasswordProtected(intent))
+  ) {
+    const redirected = await maybeRedirectObjectStorageAttachment(req, res, storedObjectKey, safeName, rawMime);
+    if (redirected) return;
+  }
   if (dispositionType !== "inline" && presentation.isFolderBundle) {
     const exportBuffer = await buildIntentFolderDownloadBuffer(intent).catch(() => null);
     if (exportBuffer) {
@@ -1986,7 +2022,6 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
       return;
     }
   }
-  const storedObjectKey = String(intent?.storedObjectKey || "").trim();
   if (storedObjectKey && objectStorage.isEnabled()) {
     await serveFileFromObjectStorage(req, res, storedObjectKey, safeName, dispositionType, {
       size: buildIntentStoredSizeHint(intent),
