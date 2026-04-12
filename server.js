@@ -1420,6 +1420,10 @@ async function buildArchiveIndexEntries(zipSource = null) {
         zipFile.readEntry();
         return;
       }
+      if (rawName === FOLDER_BUNDLE_MANIFEST) {
+        zipFile.readEntry();
+        return;
+      }
 
       const dir = /\/$/.test(rawName);
       const name = dir ? rawName : rawName.replace(/\/+$/, "");
@@ -1626,6 +1630,8 @@ async function maybeRedirectObjectStorageAttachment(req, res, objectKey = "", fi
   if (String(req?.headers?.range || "").trim()) return false;
   if (!/[?&]direct=1(?:&|$)/.test(String(req?.url || ""))) return false;
   const presentation = buildDownloadPresentation(fileName, mime);
+  // Folder bundles must go through the server export path so internal metadata files are never exposed.
+  if (presentation.isFolderBundle) return false;
   const exportName = presentation.fileName;
   const contentDisposition = `attachment; filename="${exportName}"; filename*=UTF-8''${encodeURIComponent(exportName)}`;
   let signedUrl = "";
@@ -2037,6 +2043,11 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
 function extractZipEntryToPath(zipSource, entryPath, outputPath) {
   const normalizedEntry = normalizeZipPath(entryPath);
   if (!normalizedEntry) {
+    const err = new Error("Entry not found");
+    err.status = 404;
+    return Promise.reject(err);
+  }
+  if (normalizedEntry === FOLDER_BUNDLE_MANIFEST) {
     const err = new Error("Entry not found");
     err.status = 404;
     return Promise.reject(err);
@@ -3626,6 +3637,11 @@ const server = http.createServer(async (req, res) => {
       if (!intentId || !token || invalidEntryPath) {
         res.writeHead(400, { "content-type": "text/plain" });
         res.end("Missing intentId, token or entry path");
+        return;
+      }
+      if (entryPath === FOLDER_BUNDLE_MANIFEST) {
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Entry not found");
         return;
       }
 
