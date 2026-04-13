@@ -2025,8 +2025,7 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
   if (
     dispositionType === "attachment" &&
     storedObjectKey &&
-    !Boolean(intent?.passwordProtected || isIntentPasswordProtected(intent)) &&
-    !presentation.isFolderBundle
+    !Boolean(intent?.passwordProtected || isIntentPasswordProtected(intent))
   ) {
     const redirected = await maybeRedirectObjectStorageAttachment(req, res, storedObjectKey, safeName, rawMime);
     if (redirected) return;
