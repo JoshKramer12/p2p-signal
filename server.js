@@ -856,6 +856,12 @@ function isFolderBundleManifestPath(pathLike = "") {
   return leaf === FOLDER_BUNDLE_MANIFEST;
 }
 
+function isFolderBundleAsset(fileName = "", mime = "") {
+  const safeName = safeBasename(String(fileName || "file")).toLowerCase();
+  const lowerMime = String(mime || "").trim().toLowerCase();
+  return safeName.endsWith(".folder") || lowerMime.includes("x-merm-folder");
+}
+
 function buildIntentStoredSizeHint(intent = null) {
   return Math.max(
     0,
@@ -1986,6 +1992,96 @@ async function loadIntentStoredFileBuffer(intent = null) {
   } catch {
     return null;
   }
+}
+
+async function stripFolderBundleManifestBuffer(rawBuffer = null) {
+  const source = Buffer.isBuffer(rawBuffer) ? rawBuffer : Buffer.from(rawBuffer || []);
+  if (!source.length) {
+    return {
+      buffer: source,
+      changed: false,
+      removedCount: 0
+    };
+  }
+  const sourceZip = await JSZip.loadAsync(source);
+  const exportZip = new JSZip();
+  let removedCount = 0;
+  const entries = Object.values(sourceZip?.files || {})
+    .sort((left, right) => String(left?.name || "").localeCompare(String(right?.name || "")));
+  for (const entry of entries) {
+    const fullPath = normalizeZipPath(entry?.name || "");
+    if (!fullPath || entry?.dir) continue;
+    if (isFolderBundleManifestPath(fullPath)) {
+      removedCount += 1;
+      continue;
+    }
+    const payload = await entry.async("nodebuffer");
+    exportZip.file(fullPath, payload, { compression: "STORE" });
+  }
+  if (!removedCount) {
+    return {
+      buffer: source,
+      changed: false,
+      removedCount: 0
+    };
+  }
+  const rebuilt = await exportZip.generateAsync({
+    type: "nodebuffer",
+    compression: "STORE",
+    streamFiles: true
+  });
+  return {
+    buffer: rebuilt,
+    changed: true,
+    removedCount
+  };
+}
+
+async function maybeSanitizeIntentStoredFolderBundle(intent = null, options = {}) {
+  if (!intent || typeof intent !== "object") {
+    return { sanitized: false, bytes: 0 };
+  }
+  const fallbackBytes = Math.max(0, Number(options?.sizeHint || intent?.storedBytes || 0));
+  if (!isFolderBundleAsset(String(intent?.fileName || ""), String(intent?.mime || ""))) {
+    return { sanitized: false, bytes: fallbackBytes };
+  }
+
+  const raw = await loadIntentStoredFileBuffer(intent).catch(() => null);
+  if (!Buffer.isBuffer(raw) || !raw.length) {
+    return { sanitized: false, bytes: fallbackBytes };
+  }
+
+  const stripped = await stripFolderBundleManifestBuffer(raw).catch(() => null);
+  if (!stripped || !Buffer.isBuffer(stripped.buffer)) {
+    return { sanitized: false, bytes: Math.max(fallbackBytes, Number(raw.length || 0)) };
+  }
+  if (!stripped.changed) {
+    return { sanitized: false, bytes: Math.max(0, Number(stripped.buffer.length || 0)) };
+  }
+
+  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  const storedFile = String(intent.storedFile || "").trim();
+  const safeName = safeBasename(String(intent.fileName || storedFile || "file"));
+  const contentType = String(intent.mime || "").trim() || contentTypeForName(safeName);
+  if (storedObjectKey && objectStorage.isEnabled()) {
+    await objectStorage.putBuffer(storedObjectKey, stripped.buffer, contentType);
+  } else if (storedFile) {
+    const filePath = path.join(FILES_DIR, storedFile);
+    fs.writeFileSync(filePath, stripped.buffer);
+  } else {
+    return { sanitized: false, bytes: Math.max(0, Number(stripped.buffer.length || 0)) };
+  }
+
+  const intentId = String(intent.id || "").trim();
+  if (intentId) {
+    clearArchiveIndexCacheForIntent(intentId);
+    clearArchiveIndexBuildJobsForIntent(intentId);
+    removePreviewCacheForIntent(intentId);
+  }
+  return {
+    sanitized: true,
+    bytes: Math.max(0, Number(stripped.buffer.length || 0))
+  };
 }
 
 async function buildIntentFolderDownloadBuffer(intent = null) {
@@ -3189,6 +3285,12 @@ const server = http.createServer(async (req, res) => {
           res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
           res.end(JSON.stringify({ ok: false, message: "Uploaded file size does not match intent" }));
           return;
+        }
+        const sanitizedPayload = await maybeSanitizeIntentStoredFolderBundle(intent, {
+          sizeHint: actualBytes
+        }).catch(() => null);
+        if (sanitizedPayload && Number.isFinite(Number(sanitizedPayload.bytes)) && Number(sanitizedPayload.bytes) >= 0) {
+          actualBytes = Number(sanitizedPayload.bytes);
         }
 
         finalizeObjectUploadIntent(intent, actualBytes, expectedBytes || actualBytes);
@@ -5418,9 +5520,17 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
       }
     }
 
+    let finalizedStoredBytes = Math.max(0, Number(t.bytesExpected || 0));
+    const sanitizedPayload = await maybeSanitizeIntentStoredFolderBundle(intent, {
+      sizeHint: finalizedStoredBytes
+    }).catch(() => null);
+    if (sanitizedPayload && Number.isFinite(Number(sanitizedPayload.bytes)) && Number(sanitizedPayload.bytes) >= 0) {
+      finalizedStoredBytes = Number(sanitizedPayload.bytes);
+    }
+
     intent.stored = true;
-    intent.storedBytes = t.bytesExpected;
-    intent.plainStoredBytes = uploadBytesToPlainBytes(intent, t.bytesExpected);
+    intent.storedBytes = finalizedStoredBytes;
+    intent.plainStoredBytes = uploadBytesToPlainBytes(intent, finalizedStoredBytes);
     intent.status = "stored";
     intent.transferState = "delivered";
     intent.uploadedAt = Date.now();
@@ -5449,14 +5559,14 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
 
     if (intent.groupId) {
       finalizeGroupRecipientCopies(intent, {
-        storedBytes: Number(intent.storedBytes || t.bytesExpected || 0),
+        storedBytes: Number(intent.storedBytes || finalizedStoredBytes || 0),
         totalBytes: Number(t.bytesExpected || resolveUploadExpectedBytes(intent) || 0),
         uploadedAt: intent.uploadedAt
       });
     }
 
     emitTransferState(intent, "delivered", {
-      sentBytes: Number(intent.storedBytes || t.bytesExpected || 0),
+      sentBytes: Number(intent.storedBytes || finalizedStoredBytes || 0),
       totalBytes: Number(t.bytesExpected || resolveUploadExpectedBytes(intent) || 0),
       plainSentBytes: Number(intent.plainStoredBytes || intent.fileSize || 0),
       plainTotalBytes: Number(intent.fileSize || 0)
