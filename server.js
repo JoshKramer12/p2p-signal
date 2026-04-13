@@ -1637,6 +1637,17 @@ function cleanupPreviewCache() {
   } catch {}
 }
 
+function stripAutoDuplicateFolderSuffix(rawName = "folder") {
+  const safeName = safeBasename(String(rawName || "folder"));
+  const withoutExt = safeName.toLowerCase().endsWith(".folder")
+    ? safeName.slice(0, -(".folder".length))
+    : safeName;
+  const match = /^(.*?)(?:\s*\((\d+)\)|-(\d+))$/.exec(withoutExt);
+  if (!match) return safeBasename(withoutExt || "folder") || "folder";
+  const prefix = safeBasename(String(match[1] || "").trim() || "folder");
+  return prefix || "folder";
+}
+
 function buildDownloadPresentation(fileName = "file", mime = "") {
   const safeName = safeBasename(String(fileName || "file"));
   const rawMime = String(mime || "").trim();
@@ -1649,9 +1660,8 @@ function buildDownloadPresentation(fileName = "file", mime = "") {
       isFolderBundle: false
     };
   }
-  const exportName = safeName.toLowerCase().endsWith(".folder")
-    ? `${safeName.slice(0, -(".folder".length))}.zip`
-    : `${safeName}.zip`;
+  const exportBase = stripAutoDuplicateFolderSuffix(safeName);
+  const exportName = `${exportBase}.zip`;
   return {
     fileName: safeBasename(exportName),
     mime: "application/zip",
@@ -1687,11 +1697,7 @@ async function maybeRedirectObjectStorageAttachment(req, res, objectKey = "", fi
 }
 
 function folderExportRootName(fileName = "folder") {
-  const rawName = safeBasename(String(fileName || "folder"));
-  const withoutExt = rawName.toLowerCase().endsWith(".folder")
-    ? rawName.slice(0, -(".folder".length))
-    : rawName;
-  return safeBasename(withoutExt || "folder") || "folder";
+  return stripAutoDuplicateFolderSuffix(fileName);
 }
 
 function remapFolderBundleEntryPath(fullPath = "", desiredRoot = "folder") {
