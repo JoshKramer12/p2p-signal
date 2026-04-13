@@ -1645,8 +1645,6 @@ async function maybeRedirectObjectStorageAttachment(req, res, objectKey = "", fi
   if (String(req?.headers?.range || "").trim()) return false;
   if (!/[?&]direct=1(?:&|$)/.test(String(req?.url || ""))) return false;
   const presentation = buildDownloadPresentation(fileName, mime);
-  // Folder bundles must go through the server export path so internal metadata files are never exposed.
-  if (presentation.isFolderBundle) return false;
   const exportName = presentation.fileName;
   const contentDisposition = `attachment; filename="${exportName}"; filename*=UTF-8''${encodeURIComponent(exportName)}`;
   let signedUrl = "";
