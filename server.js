@@ -23,16 +23,18 @@ const MIN_INTENT_TTL_MS = Math.max(60 * 1000, Number(process.env.MIN_INTENT_TTL_
 const TRANSFER_IDLE_TIMEOUT_MS = Number(process.env.TRANSFER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
 const TRANSFER_SWEEP_INTERVAL_MS = Number(process.env.TRANSFER_SWEEP_INTERVAL_MS || 15 * 1000);
 const USER_STORAGE_QUOTA_BYTES = Number(process.env.USER_STORAGE_QUOTA_BYTES || 5 * 1024 * 1024 * 1024);
+const ARCHIVE_PREVIEW_MAX_DEFAULT_BYTES = 512 * 1024 * 1024;
 const ARCHIVE_PREVIEW_MAX_BYTES = Math.max(
-  Number(process.env.ARCHIVE_PREVIEW_MAX_BYTES || 0) || 0,
-  10 * 1024 * 1024 * 1024
+  0,
+  Number(process.env.ARCHIVE_PREVIEW_MAX_BYTES || ARCHIVE_PREVIEW_MAX_DEFAULT_BYTES)
 );
 const PREVIEW_CACHE_TTL_MS = Number(process.env.PREVIEW_CACHE_TTL_MS || 6 * 60 * 60 * 1000);
 const ARCHIVE_INDEX_CACHE_TTL_MS = Number(process.env.ARCHIVE_INDEX_CACHE_TTL_MS || 15 * 60 * 1000);
 const FOLDER_BUNDLE_MANIFEST = "__merm_bundle_meta__.json";
+const ARCHIVE_PREVIEW_WARMUP_MAX_DEFAULT_BYTES = 256 * 1024 * 1024;
 const ARCHIVE_PREVIEW_WARMUP_MAX_BYTES = Math.max(
   0,
-  Number(process.env.ARCHIVE_PREVIEW_WARMUP_MAX_BYTES || 3 * 1024 * 1024 * 1024)
+  Number(process.env.ARCHIVE_PREVIEW_WARMUP_MAX_BYTES || ARCHIVE_PREVIEW_WARMUP_MAX_DEFAULT_BYTES)
 );
 const ARCHIVE_PREVIEW_WARMUP_MAX_ENTRIES = Math.max(
   0,
@@ -40,7 +42,26 @@ const ARCHIVE_PREVIEW_WARMUP_MAX_ENTRIES = Math.max(
 );
 const ARCHIVE_PREVIEW_WARMUP_ENTRY_MAX_BYTES = Math.max(
   512 * 1024,
-  Number(process.env.ARCHIVE_PREVIEW_WARMUP_ENTRY_MAX_BYTES || 40 * 1024 * 1024)
+  Number(process.env.ARCHIVE_PREVIEW_WARMUP_ENTRY_MAX_BYTES || 16 * 1024 * 1024)
+);
+const FOLDER_BUNDLE_SANITIZE_MAX_BYTES = Math.max(
+  8 * 1024 * 1024,
+  Number(process.env.FOLDER_BUNDLE_SANITIZE_MAX_BYTES || 256 * 1024 * 1024)
+);
+const WS_DOWNLOAD_CHUNK_BYTES = Math.max(
+  64 * 1024,
+  Number(process.env.WS_DOWNLOAD_CHUNK_BYTES || 512 * 1024)
+);
+const WS_DOWNLOAD_HIGH_WATER_BYTES = Math.max(
+  1 * 1024 * 1024,
+  Number(process.env.WS_DOWNLOAD_HIGH_WATER_BYTES || 8 * 1024 * 1024)
+);
+const WS_DOWNLOAD_RESUME_BYTES = Math.max(
+  256 * 1024,
+  Math.min(
+    WS_DOWNLOAD_HIGH_WATER_BYTES,
+    Number(process.env.WS_DOWNLOAD_RESUME_BYTES || Math.floor(WS_DOWNLOAD_HIGH_WATER_BYTES / 2))
+  )
 );
 const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 64 * 1024 * 1024);
 const INLINE_TINY_INTENT_MAX_BYTES = Math.max(
@@ -1992,20 +2013,72 @@ async function loadIntentStoredFileBuffer(intent = null) {
   }
 }
 
-async function stripFolderBundleManifestBuffer(rawBuffer = null) {
+async function resolveIntentStoredAssetBytes(intent = null, fallbackBytes = 0) {
+  if (!intent || typeof intent !== "object") return Math.max(0, Number(fallbackBytes || 0));
+  let size = Math.max(
+    0,
+    Number(
+      fallbackBytes
+      || intent.storedBytes
+      || intent.uploadBytesExpected
+      || intent.fileSize
+      || 0
+    )
+  );
+  if (size > 0) return size;
+
+  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  if (storedObjectKey && objectStorage.isEnabled()) {
+    try {
+      const head = await objectStorage.headObject(storedObjectKey);
+      const headSize = Math.max(0, Number(head?.size || 0));
+      if (headSize > 0) return headSize;
+    } catch {}
+  }
+
+  const storedFile = String(intent.storedFile || "").trim();
+  if (storedFile) {
+    try {
+      const stat = fs.statSync(path.join(FILES_DIR, storedFile));
+      const localSize = Math.max(0, Number(stat?.size || 0));
+      if (localSize > 0) return localSize;
+    } catch {}
+  }
+
+  return 0;
+}
+
+async function stripFolderBundleManifestBuffer(rawBuffer = null, options = {}) {
   const source = Buffer.isBuffer(rawBuffer) ? rawBuffer : Buffer.from(rawBuffer || []);
   if (!source.length) {
     return {
       buffer: source,
       changed: false,
-      removedCount: 0
+      removedCount: 0,
+      remappedCount: 0
     };
   }
+  const desiredRootRaw = safeBasename(String(options?.desiredRoot || "").trim());
+  const desiredRoot = desiredRootRaw || "";
   const sourceZip = await JSZip.loadAsync(source);
   const exportZip = new JSZip();
   let removedCount = 0;
+  let remappedCount = 0;
   const entries = Object.values(sourceZip?.files || {})
     .sort((left, right) => String(left?.name || "").localeCompare(String(right?.name || "")));
+  const bundledFileEntries = [];
+  entries.forEach((entry) => {
+    const fullPath = normalizeZipPath(entry?.name || "");
+    if (!fullPath || entry?.dir) return;
+    if (isFolderBundleManifestPath(fullPath)) return;
+    bundledFileEntries.push(fullPath);
+  });
+  const topRoots = new Set(
+    bundledFileEntries
+      .map((fullPath) => String(fullPath || "").split("/").filter(Boolean)[0] || "")
+      .filter(Boolean)
+  );
+  const shouldRemapRoot = Boolean(desiredRoot && topRoots.size === 1 && !topRoots.has(desiredRoot));
   for (const entry of entries) {
     const fullPath = normalizeZipPath(entry?.name || "");
     if (!fullPath || entry?.dir) continue;
@@ -2013,14 +2086,19 @@ async function stripFolderBundleManifestBuffer(rawBuffer = null) {
       removedCount += 1;
       continue;
     }
+    const exportPath = shouldRemapRoot
+      ? (remapFolderBundleEntryPath(fullPath, desiredRoot) || fullPath)
+      : fullPath;
+    if (exportPath !== fullPath) remappedCount += 1;
     const payload = await entry.async("nodebuffer");
-    exportZip.file(fullPath, payload, { compression: "STORE" });
+    exportZip.file(exportPath, payload, { compression: "STORE" });
   }
-  if (!removedCount) {
+  if (!removedCount && !remappedCount) {
     return {
       buffer: source,
       changed: false,
-      removedCount: 0
+      removedCount: 0,
+      remappedCount: 0
     };
   }
   const rebuilt = await exportZip.generateAsync({
@@ -2031,7 +2109,8 @@ async function stripFolderBundleManifestBuffer(rawBuffer = null) {
   return {
     buffer: rebuilt,
     changed: true,
-    removedCount
+    removedCount,
+    remappedCount
   };
 }
 
@@ -2044,14 +2123,36 @@ async function maybeSanitizeIntentStoredFolderBundle(intent = null, options = {}
     return { sanitized: false, bytes: fallbackBytes };
   }
 
-  const raw = await loadIntentStoredFileBuffer(intent).catch(() => null);
-  if (!Buffer.isBuffer(raw) || !raw.length) {
-    return { sanitized: false, bytes: fallbackBytes };
+  const intentId = String(intent.id || "").trim();
+  const estimatedBytes = await resolveIntentStoredAssetBytes(intent, fallbackBytes).catch(() => fallbackBytes);
+  if (estimatedBytes > FOLDER_BUNDLE_SANITIZE_MAX_BYTES) {
+    uploadDiagLog("folder-sanitize-skipped-size", {
+      intentId,
+      bytes: estimatedBytes,
+      limitBytes: FOLDER_BUNDLE_SANITIZE_MAX_BYTES
+    });
+    return { sanitized: false, bytes: estimatedBytes };
   }
 
-  const stripped = await stripFolderBundleManifestBuffer(raw).catch(() => null);
+  const raw = await loadIntentStoredFileBuffer(intent).catch(() => null);
+  if (!Buffer.isBuffer(raw) || !raw.length) {
+    return { sanitized: false, bytes: estimatedBytes || fallbackBytes };
+  }
+
+  const rawBytes = Math.max(0, Number(raw.length || 0));
+  if (rawBytes > FOLDER_BUNDLE_SANITIZE_MAX_BYTES) {
+    uploadDiagLog("folder-sanitize-skipped-raw-size", {
+      intentId,
+      bytes: rawBytes,
+      limitBytes: FOLDER_BUNDLE_SANITIZE_MAX_BYTES
+    });
+    return { sanitized: false, bytes: Math.max(estimatedBytes, rawBytes) };
+  }
+
+  const desiredRoot = folderExportRootName(String(intent?.fileName || "folder"));
+  const stripped = await stripFolderBundleManifestBuffer(raw, { desiredRoot }).catch(() => null);
   if (!stripped || !Buffer.isBuffer(stripped.buffer)) {
-    return { sanitized: false, bytes: Math.max(fallbackBytes, Number(raw.length || 0)) };
+    return { sanitized: false, bytes: Math.max(estimatedBytes, rawBytes) };
   }
   if (!stripped.changed) {
     return { sanitized: false, bytes: Math.max(0, Number(stripped.buffer.length || 0)) };
@@ -2070,7 +2171,6 @@ async function maybeSanitizeIntentStoredFolderBundle(intent = null, options = {}
     return { sanitized: false, bytes: Math.max(0, Number(stripped.buffer.length || 0)) };
   }
 
-  const intentId = String(intent.id || "").trim();
   if (intentId) {
     clearArchiveIndexCacheForIntent(intentId);
     clearArchiveIndexBuildJobsForIntent(intentId);
@@ -5458,6 +5558,24 @@ function resumeWsInbound(ws) {
   }
 }
 
+async function waitForWsBufferedAmountBelow(ws, targetBytes = 0, options = {}) {
+  const target = Math.max(0, Number(targetBytes || 0));
+  const pollMs = Math.max(10, Number(options?.pollMs || 25));
+  const timeoutMs = Math.max(500, Number(options?.timeoutMs || 45 * 1000));
+  const startedAt = Date.now();
+  while (ws && ws.readyState === WebSocket.OPEN) {
+    const buffered = Math.max(0, Number(ws.bufferedAmount || 0));
+    if (buffered <= target) return true;
+    if (Date.now() - startedAt > timeoutMs) {
+      const err = new Error("WebSocket send backpressure timeout");
+      err.code = "WS_BACKPRESSURE_TIMEOUT";
+      throw err;
+    }
+    await waitMs(pollMs);
+  }
+  throw new Error("WebSocket closed");
+}
+
 function notifyUploadFailed(intent, intentId, message) {
   const payload = { type: "upload_failed", intentId, message, deliveryHeld: isIntentDeliveryHeld(intent) };
   if (intent?.from) sendToUser(intent.from, payload);
@@ -7648,6 +7766,9 @@ if (data.type === "login") {
 if (data.type === "download_ws_request") {
   const intentId = String(data.intentId || "");
   if (!intentId) return send(ws, { type: "error", message: "Missing intentId" });
+  if (ws._downloadWsActive) {
+    return send(ws, { type: "error", message: "Another download is already active", intentId });
+  }
 
   const intentFile = path.join(INTENTS_DIR, `${intentId}.json`);
   if (!fs.existsSync(intentFile)) {
@@ -7676,32 +7797,49 @@ if (data.type === "download_ws_request") {
     : (() => {
         const filePath = path.join(FILES_DIR, String(intent.storedFile || "").trim());
         return fs.existsSync(filePath)
-          ? fs.createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024 })
+          ? fs.createReadStream(filePath, { highWaterMark: WS_DOWNLOAD_CHUNK_BYTES })
           : null;
       })();
   if (!rs) {
     return send(ws, { type: "error", message: "Stored file missing", intentId });
   }
 
-  rs.on("data", (chunk) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(chunk, { binary: true });
+  ws._downloadWsActive = true;
+  const onSocketClose = () => {
+    try { if (typeof rs.destroy === "function") rs.destroy(); } catch {}
+  };
+  ws.once("close", onSocketClose);
+  try {
+    for await (const rawChunk of rs) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) break;
+      const chunk = Buffer.isBuffer(rawChunk) ? rawChunk : Buffer.from(rawChunk || "");
+      if (!chunk.length) continue;
+      await new Promise((resolve, reject) => {
+        ws.send(chunk, { binary: true }, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      });
+      if (Number(ws.bufferedAmount || 0) >= WS_DOWNLOAD_HIGH_WATER_BYTES) {
+        await waitForWsBufferedAmountBelow(ws, WS_DOWNLOAD_RESUME_BYTES, {
+          timeoutMs: 45 * 1000,
+          pollMs: 20
+        });
+      }
     }
-  });
-
-  rs.on("end", () => {
     if (ws.readyState === WebSocket.OPEN) {
       send(ws, { type: "download_ws_end", intentId });
     }
-  });
-
-  rs.on("error", (err) => {
+  } catch (err) {
     console.log("❌ download_ws stream error:", err);
     if (ws.readyState === WebSocket.OPEN) {
       send(ws, { type: "error", message: "Download failed" });
     }
-  });
-
+  } finally {
+    ws._downloadWsActive = false;
+    ws.removeListener("close", onSocketClose);
+    try { if (typeof rs.destroy === "function") rs.destroy(); } catch {}
+  }
   return;
 }
 
