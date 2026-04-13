@@ -847,6 +847,15 @@ function normalizeZipPath(value = "") {
   return String(value || "").replace(/\\/g, "/").replace(/^\/+/, "");
 }
 
+function isFolderBundleManifestPath(pathLike = "") {
+  const normalized = normalizeZipPath(pathLike);
+  if (!normalized) return false;
+  if (normalized === FOLDER_BUNDLE_MANIFEST) return true;
+  const parts = normalized.split("/").filter(Boolean);
+  const leaf = parts.length ? parts[parts.length - 1] : "";
+  return leaf === FOLDER_BUNDLE_MANIFEST;
+}
+
 function buildIntentStoredSizeHint(intent = null) {
   return Math.max(
     0,
@@ -1420,7 +1429,7 @@ async function buildArchiveIndexEntries(zipSource = null) {
         zipFile.readEntry();
         return;
       }
-      if (rawName === FOLDER_BUNDLE_MANIFEST) {
+      if (isFolderBundleManifestPath(rawName)) {
         zipFile.readEntry();
         return;
       }
@@ -1992,7 +2001,7 @@ async function buildIntentFolderDownloadBuffer(intent = null) {
   for (const entry of entries) {
     const fullPath = String(entry?.name || "").replace(/^\/+/, "");
     if (!fullPath || entry?.dir) continue;
-    if (fullPath === FOLDER_BUNDLE_MANIFEST) continue;
+    if (isFolderBundleManifestPath(fullPath)) continue;
     const payload = await entry.async("nodebuffer");
     const exportPath = remapFolderBundleEntryPath(fullPath, desiredRoot);
     if (!exportPath) continue;
@@ -2016,7 +2025,8 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
   if (
     dispositionType === "attachment" &&
     storedObjectKey &&
-    !Boolean(intent?.passwordProtected || isIntentPasswordProtected(intent))
+    !Boolean(intent?.passwordProtected || isIntentPasswordProtected(intent)) &&
+    !presentation.isFolderBundle
   ) {
     const redirected = await maybeRedirectObjectStorageAttachment(req, res, storedObjectKey, safeName, rawMime);
     if (redirected) return;
@@ -2047,7 +2057,7 @@ function extractZipEntryToPath(zipSource, entryPath, outputPath) {
     err.status = 404;
     return Promise.reject(err);
   }
-  if (normalizedEntry === FOLDER_BUNDLE_MANIFEST) {
+  if (isFolderBundleManifestPath(normalizedEntry)) {
     const err = new Error("Entry not found");
     err.status = 404;
     return Promise.reject(err);
@@ -3639,7 +3649,7 @@ const server = http.createServer(async (req, res) => {
         res.end("Missing intentId, token or entry path");
         return;
       }
-      if (entryPath === FOLDER_BUNDLE_MANIFEST) {
+      if (isFolderBundleManifestPath(entryPath)) {
         res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });
         res.end("Entry not found");
         return;
