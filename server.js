@@ -2030,13 +2030,6 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
     const redirected = await maybeRedirectObjectStorageAttachment(req, res, storedObjectKey, safeName, rawMime);
     if (redirected) return;
   }
-  if (dispositionType !== "inline" && presentation.isFolderBundle) {
-    const exportBuffer = await buildIntentFolderDownloadBuffer(intent).catch(() => null);
-    if (exportBuffer) {
-      serveBufferDownload(req, res, exportBuffer, safeName, rawMime, dispositionType);
-      return;
-    }
-  }
   if (storedObjectKey && objectStorage.isEnabled()) {
     await serveFileFromObjectStorage(req, res, storedObjectKey, safeName, dispositionType, {
       size: buildIntentStoredSizeHint(intent),
