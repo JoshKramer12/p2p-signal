@@ -1641,8 +1641,8 @@ function buildDownloadPresentation(fileName = "file", mime = "") {
 async function maybeRedirectObjectStorageAttachment(req, res, objectKey = "", fileName = "file", mime = "") {
   const key = String(objectKey || "").trim();
   if (!key || !objectStorage.isEnabled()) return false;
-  if (String(req?.method || "GET").trim().toUpperCase() !== "GET") return false;
-  if (String(req?.headers?.range || "").trim()) return false;
+  const method = String(req?.method || "GET").trim().toUpperCase();
+  if (method !== "GET" && method !== "HEAD") return false;
   if (!/[?&]direct=1(?:&|$)/.test(String(req?.url || ""))) return false;
   const presentation = buildDownloadPresentation(fileName, mime);
   const exportName = presentation.fileName;
@@ -1657,7 +1657,7 @@ async function maybeRedirectObjectStorageAttachment(req, res, objectKey = "", fi
     signedUrl = "";
   }
   if (!signedUrl) return false;
-  res.writeHead(302, {
+  res.writeHead(307, {
     location: signedUrl,
     "cache-control": "no-store"
   });
