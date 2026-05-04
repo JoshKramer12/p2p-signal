@@ -6239,6 +6239,7 @@ function removeUserFromGroups(username = "") {
 }
 
 function ensureUserShape(u) {
+  if (!u || typeof u !== "object" || Array.isArray(u)) return null;
   if (!u.friends) u.friends = [];
   if (!Array.isArray(u.friends)) u.friends = [];
   if (!u.incomingRequests) u.incomingRequests = [];
