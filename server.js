@@ -5333,6 +5333,25 @@ function send(ws, obj) {
   }
 }
 
+function closeUnauthenticatedSocket(ws, reason = "Authentication required") {
+  if (!ws || ws.readyState !== WebSocket.OPEN || ws._authCloseScheduled) return;
+  ws._authCloseScheduled = true;
+  setTimeout(() => {
+    try {
+      if (ws.readyState === WebSocket.OPEN) ws.close(4001, reason);
+    } catch {}
+  }, 25);
+}
+
+function redactMessageForLog(data = null) {
+  if (!data || typeof data !== "object") return data;
+  const out = { ...data };
+  ["password", "sessionToken", "token", "downloadToken"].forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(out, key)) out[key] = "[redacted]";
+  });
+  return out;
+}
+
 function resolveIntentEncryptionMeta(intent) {
   const enc = intent?.encryption;
   if (!enc || typeof enc !== "object") return null;
@@ -7480,7 +7499,7 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
     try {
       data = JSON.parse(msg.toString());
       if (!["ping", "inbox_request", "friends_list", "friend_requests", "guest_transfer_requests", "groups_list", "typing", "chat_state_request", "chat_state_update", "quick_chats_request", "quick_chats_update", "file_holder_request", "file_holder_update"].includes(String(data?.type || ""))) {
-        console.log("📩 Message received:", data);
+        console.log("📩 Message received:", redactMessageForLog(data));
       }
     } catch {
       return; // Ignore malformed JSON
@@ -7490,8 +7509,13 @@ console.log("🌍 Client public endpoint:", ws.publicIp, ws.publicPort);
     const publicTypes = ["auth_signup", "auth_login", "auth_resume", "ping"];
 
     if (!ws.username && !publicTypes.includes(data.type)) {
+      ws.unauthorizedMessageCount = Number(ws.unauthorizedMessageCount || 0) + 1;
       console.log("🛑 Blocked unauthorized message:", data.type);
-      return send(ws, { type: "error", message: "Not logged in" });
+      send(ws, { type: "error", message: "Not logged in" });
+      if (ws.unauthorizedMessageCount >= 3) {
+        closeUnauthenticatedSocket(ws, "Authentication required");
+      }
+      return;
     }
 
 
@@ -7655,7 +7679,9 @@ if (data.type === "auth_resume") {
 
   const user = ensureUserShape(loadUser(username));
   if (!user || !user.sessionTokens?.includes(token)) {
-    return send(ws, { type: "error", message: "Session expired" });
+    send(ws, { type: "error", message: "Session expired" });
+    closeUnauthenticatedSocket(ws, "Session expired");
+    return;
   }
   touchUserSessionToken(user, token);
 
