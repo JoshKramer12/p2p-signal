@@ -493,6 +493,7 @@ if (savedSession) {
   }
 
   function setFriendsList(list) {
+    const previousSelected = selectedFriend();
     const prev = new Set(friends);
     friends = Array.isArray(list) ? list : [];
 
@@ -504,13 +505,19 @@ if (savedSession) {
     const newlyAdded = friends.filter(f => f && f !== me && !prev.has(f));
     newlyAdded.forEach(name => bumpActivity(name));
 
-    renderFriends();
+    const nextSelected = renderFriends(previousSelected);
+    if (nextSelected !== previousSelected) {
+      highlightActiveFriend(nextSelected || "");
+    } else {
+      applyActiveContact();
+    }
     renderFriendsTab();
     renderFriendSearch();
   }
 
-  function renderFriends() {
-    if (!friendSelectEl) return;
+  function renderFriends(preferredSelection = "") {
+    if (!friendSelectEl) return "";
+    const currentSelection = String(preferredSelection || friendSelectEl.value || "").trim();
     friendSelectEl.innerHTML = "";
 
     const me = currentUsername();
@@ -524,8 +531,9 @@ if (savedSession) {
     }
 
     if (!others.length) {
+      if (me) friendSelectEl.value = me;
       renderFriendSidebar(me ? [me] : []);
-      return;
+      return me || "";
     }
 
     const sorted = [...others].sort((a, b) => {
@@ -541,7 +549,17 @@ if (savedSession) {
       friendSelectEl.appendChild(opt);
     }
 
+    const availableValues = new Set(Array.from(friendSelectEl.options).map((opt) => String(opt.value || "").trim()));
+    const fallback = sorted[0] || me || "";
+    const nextSelection = (currentSelection && availableValues.has(currentSelection))
+      ? currentSelection
+      : fallback;
+    if (nextSelection) {
+      friendSelectEl.value = nextSelection;
+    }
+
     renderFriendSidebar(me ? [me, ...sorted] : sorted);
+    return nextSelection || "";
   }
 
   function applyActiveContact() {
@@ -1732,7 +1750,16 @@ div.querySelector(".msgMoreBtn")?.addEventListener("click", () => {
   let ACCOUNT_USERNAME = "";
   let IS_AUTHED = false;
 
-  const ACCOUNT_SIGNALING_SERVER = "wss://p2p-signal.fly.dev";
+  function getRuntimeSignalWsUrl() {
+    try {
+      const runtimeWs = String(window.__MERM_RUNTIME_CONFIG__?.signalWsUrl || "").trim();
+      if (runtimeWs) return runtimeWs;
+      if (window.__MERM_RUNTIME_CONFIG__?.staging) return "wss://p2p-signal-staging.fly.dev";
+    } catch {}
+    return "wss://p2p-signal.fly.dev";
+  }
+
+  const ACCOUNT_SIGNALING_SERVER = getRuntimeSignalWsUrl();
 
 
 const RTC_CONFIG = {

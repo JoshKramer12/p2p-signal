@@ -10,6 +10,81 @@ const JSZip = require("jszip");
 const yauzl = require("yauzl");
 
 const PORT = process.env.PORT || 8080;
+const MERM_DEPLOY_ENV = String(process.env.MERM_DEPLOY_ENV || "").trim().toLowerCase();
+const IS_STAGING_DEPLOY = MERM_DEPLOY_ENV === "staging";
+
+function envAny(names = [], fallback = "") {
+  for (const name of names) {
+    const value = String(process.env[name] || "").trim();
+    if (value) return value;
+  }
+  return String(fallback || "").trim();
+}
+
+function assertSafeStagingConfig() {
+  if (!IS_STAGING_DEPLOY) return;
+  const required = [
+    ["MERM_SIGNAL_WS_URL"],
+    ["MERM_SIGNAL_HTTP_BASE_URL"],
+    ["GUEST_APP_BASE_URL"],
+    ["GUEST_BRIDGE_SECRET"],
+    ["STORAGE_DIR"],
+    ["INTENT_UNLOCK_SECRET"],
+    ["OBJECT_STORAGE_BUCKET", "BUCKET_NAME"],
+    ["OBJECT_STORAGE_REGION", "AWS_REGION"],
+    ["OBJECT_STORAGE_ENDPOINT", "AWS_ENDPOINT_URL_S3"],
+    ["OBJECT_STORAGE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"],
+    ["OBJECT_STORAGE_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"],
+    ["OBJECT_STORAGE_PREFIX"],
+    ["OBJECT_STORAGE_INTENT_PREFIX"],
+    ["OBJECT_STORAGE_FILE_HOLDER_PREFIX"]
+  ];
+  const missing = required
+    .filter((names) => !envAny(names))
+    .map((names) => names.join(" or "));
+  if (missing.length) {
+    throw new Error(`Refusing to boot staging without required env: ${missing.join(", ")}`);
+  }
+
+  const stagingValues = [
+    envAny(["MERM_SIGNAL_WS_URL"]),
+    envAny(["MERM_SIGNAL_HTTP_BASE_URL"]),
+    envAny(["GUEST_APP_BASE_URL"]),
+    envAny(["STORAGE_DIR"]),
+    envAny(["OBJECT_STORAGE_BUCKET", "BUCKET_NAME"]),
+    envAny(["OBJECT_STORAGE_PREFIX"]),
+    envAny(["OBJECT_STORAGE_INTENT_PREFIX"]),
+    envAny(["OBJECT_STORAGE_FILE_HOLDER_PREFIX"])
+  ].map((value) => String(value || "").toLowerCase());
+
+  const unsafe = stagingValues.some((value) => (
+    value.includes("merm.fly.dev") ||
+    value.includes("p2p-signal.fly.dev") ||
+    value === "merm-storage" ||
+    value === "merm"
+  ));
+  const allStaging = stagingValues.every((value) => value.includes("staging"));
+  if (unsafe || !allStaging) {
+    throw new Error("Refusing to boot staging with production-looking URL, storage dir, bucket, or prefix.");
+  }
+}
+
+function setMermEnvironmentHeaders(res) {
+  if (!IS_STAGING_DEPLOY) return;
+  res.setHeader("X-Merm-Environment", "staging");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
+}
+
+function runtimeConfigPayload() {
+  return {
+    deployEnv: MERM_DEPLOY_ENV || (IS_STAGING_DEPLOY ? "staging" : "production"),
+    staging: IS_STAGING_DEPLOY,
+    signalWsUrl: envAny(["MERM_SIGNAL_WS_URL"], IS_STAGING_DEPLOY ? "" : "wss://p2p-signal.fly.dev"),
+    signalHttpBaseUrl: envAny(["MERM_SIGNAL_HTTP_BASE_URL"], IS_STAGING_DEPLOY ? "" : "https://p2p-signal.fly.dev")
+  };
+}
+
+assertSafeStagingConfig();
 
 const RETENTION_DAYS = Math.max(0, Number(process.env.RETENTION_DAYS || 0));
 const RETENTION_MS = RETENTION_DAYS > 0 ? (RETENTION_DAYS * 24 * 60 * 60 * 1000) : 0;
@@ -649,6 +724,7 @@ function unregisterOnlineSocket(username = "", ws = null) {
 }
 
 function setCors(res) {
+  setMermEnvironmentHeaders(res);
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password,X-Merm-Unlock,X-Merm-Session,X-Merm-Username,X-Merm-File-Name,X-Merm-File-Mime");
@@ -2372,6 +2448,7 @@ async function ensureZipEntryExtracted(intentId, zipSource, entryPath, safeName)
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
+    setMermEnvironmentHeaders(res);
 
     if (req.method === "OPTIONS") {
       setCors(res);
@@ -2383,6 +2460,17 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/" || url.pathname === "/health") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("ok");
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/runtime-config.js") {
+      res.writeHead(200, {
+        "content-type": "application/javascript; charset=utf-8",
+        "cache-control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        "pragma": "no-cache",
+        "expires": "0"
+      });
+      res.end(`window.__MERM_RUNTIME_CONFIG__ = Object.freeze(${JSON.stringify(runtimeConfigPayload())});\n`);
       return;
     }
 
