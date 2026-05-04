@@ -18,6 +18,14 @@ function trimEnv(name = "", fallback = "") {
   return String(process.env[name] || fallback || "").trim();
 }
 
+function trimEnvAny(names = [], fallback = "") {
+  for (const name of names) {
+    const value = trimEnv(name);
+    if (value) return value;
+  }
+  return String(fallback || "").trim();
+}
+
 function envFlag(name = "", fallback = false) {
   const raw = String(process.env[name] || "").trim().toLowerCase();
   if (!raw) return Boolean(fallback);
@@ -42,11 +50,11 @@ function sanitizeKeySegment(value = "") {
 let cachedClient = null;
 
 const config = {
-  bucket: trimEnv("OBJECT_STORAGE_BUCKET"),
-  region: trimEnv("OBJECT_STORAGE_REGION", "auto"),
-  endpoint: trimEnv("OBJECT_STORAGE_ENDPOINT"),
-  accessKeyId: trimEnv("OBJECT_STORAGE_ACCESS_KEY_ID"),
-  secretAccessKey: trimEnv("OBJECT_STORAGE_SECRET_ACCESS_KEY"),
+  bucket: trimEnvAny(["OBJECT_STORAGE_BUCKET", "BUCKET_NAME"]),
+  region: trimEnvAny(["OBJECT_STORAGE_REGION", "AWS_REGION"], "auto"),
+  endpoint: trimEnvAny(["OBJECT_STORAGE_ENDPOINT", "AWS_ENDPOINT_URL_S3"]),
+  accessKeyId: trimEnvAny(["OBJECT_STORAGE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"]),
+  secretAccessKey: trimEnvAny(["OBJECT_STORAGE_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"]),
   forcePathStyle: envFlag("OBJECT_STORAGE_FORCE_PATH_STYLE", false),
   uploadUrlTtlSec: Math.max(60, Number(process.env.OBJECT_STORAGE_UPLOAD_URL_TTL_SEC || 15 * 60)),
   downloadUrlTtlSec: Math.max(60, Number(process.env.OBJECT_STORAGE_DOWNLOAD_URL_TTL_SEC || 15 * 60)),

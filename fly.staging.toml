@@ -1,0 +1,28 @@
+# Staging-only Fly config for p2p-signal.
+# Do not use this file for production deploys.
+
+app = "p2p-signal-staging"
+primary_region = "ewr"
+
+[build]
+
+[env]
+  MERM_DEPLOY_ENV = "staging"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  memory = "1gb"
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024
+
+[mounts]
+  source = "data_staging"
+  destination = "/data"
