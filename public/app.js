@@ -1754,9 +1754,8 @@ div.querySelector(".msgMoreBtn")?.addEventListener("click", () => {
     try {
       const runtimeWs = String(window.__MERM_RUNTIME_CONFIG__?.signalWsUrl || "").trim();
       if (runtimeWs) return runtimeWs;
-      if (window.__MERM_RUNTIME_CONFIG__?.staging) return "wss://p2p-signal-staging.fly.dev";
     } catch {}
-    return "wss://p2p-signal.fly.dev";
+    return "";
   }
 
   const ACCOUNT_SIGNALING_SERVER = getRuntimeSignalWsUrl();
@@ -2057,6 +2056,11 @@ async function startRtcReceiver(intentId, from, offer) {
 
   function connectAccountSocket() {
     if (accountWs && (accountWs.readyState === WebSocket.OPEN || accountWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    if (!ACCOUNT_SIGNALING_SERVER) {
+      log("Signal server is not configured");
+      setAuthState("Server config unavailable.");
       return;
     }
     accountWs = new WebSocket(ACCOUNT_SIGNALING_SERVER);
