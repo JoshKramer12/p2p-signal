@@ -4,6 +4,10 @@
   "main": "server.js",
   "scripts": {
     "deploy:staging": "fly deploy -c fly.staging.toml -a p2p-signal-staging",
+    "promotion:check": "bash scripts/promotion-check.sh",
+    "promotion:prepare": "bash scripts/prepare-production-promotion.sh",
+    "verify:staging": "bash scripts/verify-runtime-config.sh staging",
+    "verify:production": "bash scripts/verify-runtime-config.sh production",
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.js"
   },
