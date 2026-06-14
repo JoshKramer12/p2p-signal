@@ -5607,6 +5607,45 @@ function queueInlineStoredIntentOffload(intentId = "", payloadBuffer = null, opt
   });
 }
 
+function queueStoredFileIntentOffload(intentId = "", localFilePath = "", options = {}) {
+  if (!objectStorage.isEnabled()) return;
+  const id = String(intentId || "").trim();
+  const filePath = String(localFilePath || "").trim();
+  if (!id || !filePath) return;
+  const safeName = safeBasename(String(options.safeName || "file"));
+
+  setImmediate(async () => {
+    try {
+      if (!fs.existsSync(filePath)) return;
+      const latest = loadIntent(id);
+      if (!latest || !latest.stored) return;
+      const objectKey = String(latest.storedObjectKey || "").trim()
+        || objectStorage.buildIntentObjectKey(id, String(latest.storedFile || safeName || "file"));
+      await objectStorage.putFile(objectKey, filePath, contentTypeForName(safeName));
+      const refreshed = loadIntent(id) || latest;
+      refreshed.storedObjectKey = objectKey;
+      refreshed.updatedAt = Date.now();
+      saveIntent(refreshed);
+
+      if (refreshed.groupId) {
+        const mirrorIds = Array.isArray(refreshed.groupMirrorIntentIds) ? refreshed.groupMirrorIntentIds : [];
+        mirrorIds.forEach((mirrorId) => {
+          const mirror = loadIntent(String(mirrorId || "").trim());
+          if (!mirror) return;
+          mirror.storedObjectKey = objectKey;
+          mirror.updatedAt = Date.now();
+          saveIntent(mirror);
+        });
+      }
+
+      try { fs.unlinkSync(filePath); } catch {}
+      uploadDiagLog("file-offload-complete", { intentId: id, objectKey });
+    } catch (err) {
+      console.error("❌ Failed to offload uploaded file to object storage:", err);
+    }
+  });
+}
+
 function maybeSendUploadProgress(t) {
   if (!t || !t.intent || !t.intent.to) return;
   const now = Date.now();
@@ -5735,17 +5774,7 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
 
     const storedFileName = String(intent.storedFile || "").trim();
     const localFilePath = String(t.filePath || (storedFileName ? path.join(FILES_DIR, storedFileName) : "")).trim();
-    if (objectStorage.isEnabled() && localFilePath && fs.existsSync(localFilePath)) {
-      const safeName = safeBasename(String(intent.fileName || storedFileName || "file"));
-      const objectKey = String(intent.storedObjectKey || "").trim() || objectStorage.buildIntentObjectKey(intentId, storedFileName || safeName);
-      try {
-        await objectStorage.putFile(objectKey, localFilePath, contentTypeForName(safeName));
-        intent.storedObjectKey = objectKey;
-        try { fs.unlinkSync(localFilePath); } catch {}
-      } catch (err) {
-        console.error("❌ Failed to offload uploaded file to object storage:", err);
-      }
-    }
+    const safeName = safeBasename(String(intent.fileName || storedFileName || "file"));
 
     let finalizedStoredBytes = Math.max(0, Number(t.bytesExpected || 0));
     const sanitizedPayload = await maybeSanitizeIntentStoredFolderBundle(intent, {
@@ -5807,6 +5836,11 @@ function finalizeOfflineTransfer(intentId, t, senderWs, options = {}) {
         deliveryHeld: isIntentDeliveryHeld(intent)
       });
     }
+
+    queueStoredFileIntentOffload(intentId, localFilePath, {
+      safeName,
+      storedFileName
+    });
   };
 
   try {

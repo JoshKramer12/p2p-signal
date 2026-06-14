@@ -1772,6 +1772,24 @@ const rtcPeers = new Map(); // intentId -> { pc, dc, role, to, from }
 const rtcAnswerResolvers = new Map(); // intentId -> resolve(answer)
 const rtcOpenResolvers = new Map(); // intentId -> resolve()
 const rtcReceiveState = new Map(); // intentId -> { name,size,received,chunks,writer,writeChain }
+const RTC_RECEIVE_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024;
+
+function safeRtcTempName(name = "file") {
+  return String(name || "file")
+    .replace(/[\\/:*?"<>|]+/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160) || "file";
+}
+
+async function openRtcReceiveWriter(intentId = "", name = "file") {
+  if (!navigator.storage || typeof navigator.storage.getDirectory !== "function") return null;
+  const root = await navigator.storage.getDirectory();
+  const dir = await root.getDirectoryHandle("rtc-receive", { create: true });
+  const fileHandle = await dir.getFileHandle(`${String(intentId || "transfer")}-${safeRtcTempName(name)}`, { create: true });
+  const writer = await fileHandle.createWritable({ keepExistingData: false });
+  return { dir, fileHandle, writer };
+}
 
 function rtcCleanup(intentId) {
   const state = rtcPeers.get(intentId);
@@ -1871,13 +1889,29 @@ async function sendFileViaWebRTC(file, intentId, to, onProgress) {
 
   const chunkSize = 256 * 1024;
   const bufferLimit = 8 * 1024 * 1024;
+  const bufferStallTimeoutMs = 60 * 1000;
   let offset = 0;
+  let lastBufferedAmount = -1;
+  let stalledSince = 0;
 
   while (offset < file.size) {
     const slice = file.slice(offset, offset + chunkSize);
     const buf = await slice.arrayBuffer();
 
     while (dc.bufferedAmount > bufferLimit) {
+      if (dc.readyState !== "open") {
+        throw new Error("WebRTC data channel closed during upload");
+      }
+      const buffered = Number(dc.bufferedAmount || 0);
+      if (buffered === lastBufferedAmount) {
+        if (!stalledSince) stalledSince = Date.now();
+        if (Date.now() - stalledSince > bufferStallTimeoutMs) {
+          throw new Error("WebRTC upload stalled");
+        }
+      } else {
+        stalledSince = 0;
+        lastBufferedAmount = buffered;
+      }
       await new Promise(r => setTimeout(r, 10));
     }
 
@@ -1916,8 +1950,20 @@ async function startRtcReceiver(intentId, from, offer) {
             received: 0,
             chunks: [],
             writer: null,
+            fileHandle: null,
+            tempDir: null,
+            memoryBytes: 0,
             writeChain: Promise.resolve()
           };
+          state.writerReady = openRtcReceiveWriter(intentId, name)
+            .then(async (result) => {
+              if (!result?.fileHandle) return false;
+              state.fileHandle = result.fileHandle;
+              state.tempDir = result.dir || null;
+              state.writer = result.writer || null;
+              return true;
+            })
+            .catch(() => false);
 
           // create pending bubble
           ensurePendingBubble({
@@ -1936,9 +1982,22 @@ async function startRtcReceiver(intentId, from, offer) {
           const state = rtcReceiveState.get(intentId);
           if (!state) return;
 
+          try { await state.writerReady; } catch {}
           if (state.writer) {
             await state.writeChain;
             await state.writer.close();
+            const file = await state.fileHandle.getFile();
+            const url = URL.createObjectURL(file);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = state.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 60_000);
+            try {
+              await state.tempDir?.removeEntry?.(`${String(intentId || "transfer")}-${safeRtcTempName(state.name)}`);
+            } catch {}
           } else {
             const blob = new Blob(state.chunks, { type: guessMime(state.name) });
             const url = URL.createObjectURL(blob);
@@ -1979,9 +2038,18 @@ async function startRtcReceiver(intentId, from, offer) {
       if (!state) return;
 
       const chunk = msg.data instanceof ArrayBuffer ? new Uint8Array(msg.data) : msg.data;
+      try { await state.writerReady; } catch {}
       if (state.writer) {
         state.writeChain = state.writeChain.then(() => state.writer.write(chunk));
       } else {
+        const chunkBytes = chunk.byteLength || chunk.size || 0;
+        if (state.memoryBytes + chunkBytes > RTC_RECEIVE_MEMORY_LIMIT_BYTES) {
+          markPendingFailed(intentId, "File too large for in-memory P2P receive");
+          rtcReceiveState.delete(intentId);
+          rtcCleanup(intentId);
+          return;
+        }
+        state.memoryBytes += chunkBytes;
         state.chunks.push(chunk);
       }
       state.received += chunk.byteLength || chunk.size || 0;
@@ -2708,9 +2776,11 @@ function abortSendFlow(reason) {
   async function uploadFilesViaServer(intentId, files, onProgress) {
     if (!accountWs || accountWs.readyState !== WebSocket.OPEN) {
       log("❌ Not connected");
-      return;
+      throw new Error("Server not connected");
     }
-    if (isUploading) return;
+    if (isUploading) {
+      throw new Error("Another upload is already active");
+    }
 
     isUploading = true;
 
@@ -2729,26 +2799,41 @@ function abortSendFlow(reason) {
         const uploadOk = await uploadOkPromise;
         if (uploadOk === false) throw new Error("Upload canceled");
 
-        const chunkSize = 8 * 1024 * 1024; // 8 MB chunks for better throughput
-        const bufferLimit = 128 * 1024 * 1024;
+        const chunkSize = file.size > 256 * 1024 * 1024 ? 1024 * 1024 : 512 * 1024;
+        const bufferLimit = 16 * 1024 * 1024;
         let offset = 0;
+        let lastBufferedAmount = -1;
+        let stalledSince = 0;
 
         while (offset < file.size) {
-  const slice = file.slice(offset, offset + chunkSize);
-  const buf = await slice.arrayBuffer();
+          if (!accountWs || accountWs.readyState !== WebSocket.OPEN) {
+            throw new Error("Connection lost during upload");
+          }
 
-  // If ws buffer is huge, yield until it drains a bit (prevents freezing)
-  while (accountWs.bufferedAmount > bufferLimit) {
-    await new Promise(r => setTimeout(r, 15));
-  }
+          while (accountWs.bufferedAmount > bufferLimit) {
+            const buffered = Number(accountWs.bufferedAmount || 0);
+            if (buffered === lastBufferedAmount) {
+              if (!stalledSince) stalledSince = Date.now();
+              if (Date.now() - stalledSince > 45_000) {
+                throw new Error("Upload stalled (socket buffer not draining)");
+              }
+            } else {
+              stalledSince = 0;
+              lastBufferedAmount = buffered;
+            }
+            await new Promise(r => setTimeout(r, 25));
+          }
 
-  accountWs.send(buf); // keep as ArrayBuffer (binary)
-  offset += chunkSize;
+          const slice = file.slice(offset, offset + chunkSize);
+          accountWs.send(slice);
+          offset += slice.size;
 
-  if (typeof onProgress === "function") {
-    onProgress(Math.min(offset, file.size), file.size);
-  }
-}
+          if (typeof onProgress === "function") {
+            onProgress(Math.min(offset, file.size), file.size);
+          }
+
+          await new Promise(r => setTimeout(r, 0));
+        }
 
 
 
@@ -3054,6 +3139,7 @@ if (filesDeleteSelected) {
       let currentIntentId = null;
       let success = false;
       const targetFriend = file._sendTarget || selectedFriend();
+      const fileSendStartedAt = performance.now();
 
       sendUi.currentIndex += 1;
       updateSendProgress(file.name, 0, file.size || 0);
@@ -3116,7 +3202,8 @@ if (filesDeleteSelected) {
         });
 
         success = true;
-        log(`✅ Send success: ${file.name}`);
+        const elapsedSeconds = Math.max(0, (performance.now() - fileSendStartedAt) / 1000).toFixed(2);
+        log(`✅ Sent ${file.name} in ${elapsedSeconds}s`);
 
       } catch (err) {
         log("❌ Send failed: " + (err?.message || err));
