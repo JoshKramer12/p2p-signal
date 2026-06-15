@@ -8,8 +8,8 @@ import WebSocket from "ws";
 
 function parseArgs(argv = []) {
   const out = {
-    wsUrl: "wss://p2p-signal-staging.fly.dev",
-    httpBaseUrl: "https://p2p-signal-staging.fly.dev",
+    wsUrl: process.env.ACCOUNT_UPLOAD_BENCH_WS_URL || process.env.MERM_SIGNAL_WS_URL || "ws://127.0.0.1:3000",
+    httpBaseUrl: process.env.ACCOUNT_UPLOAD_BENCH_HTTP_BASE_URL || process.env.MERM_SIGNAL_HTTP_BASE_URL || "http://127.0.0.1:3000",
     file: "/Users/josh/Desktop/1000.dat",
     concurrency: 0,
     runs: 1,
