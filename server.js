@@ -176,6 +176,29 @@ function objectMultipartThresholdForMime(mime = "") {
   }
   return OBJECT_MULTIPART_THRESHOLD_BYTES;
 }
+
+function chooseObjectMultipartPartSize(expectedBytes = 0, mime = "") {
+  const bytes = Math.max(0, Number(expectedBytes || 0));
+  const normalizedMime = String(mime || "").trim().toLowerCase();
+  const maxPartSizeByCount = Math.max(
+    5 * 1024 * 1024,
+    Math.ceil(bytes / OBJECT_MULTIPART_MAX_PARTS)
+  );
+  let tunedPartSize = OBJECT_MULTIPART_PART_SIZE_BYTES;
+  if (normalizedMime.startsWith("video/") && bytes > 0 && bytes <= 128 * 1024 * 1024) {
+    tunedPartSize = 5 * 1024 * 1024;
+  }
+  if (bytes >= 2 * 1024 * 1024 * 1024) {
+    tunedPartSize = Math.max(tunedPartSize, 24 * 1024 * 1024);
+  } else if (bytes >= 1024 * 1024 * 1024) {
+    tunedPartSize = Math.max(tunedPartSize, 20 * 1024 * 1024);
+  } else if (bytes >= 512 * 1024 * 1024) {
+    tunedPartSize = Math.max(tunedPartSize, 16 * 1024 * 1024);
+  } else if (bytes >= 32 * 1024 * 1024) {
+    tunedPartSize = Math.max(tunedPartSize, 6 * 1024 * 1024);
+  }
+  return Math.max(tunedPartSize, maxPartSizeByCount);
+}
 const OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS = Math.max(
   1000,
   Number(process.env.OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS || 30 * 1000)
@@ -3454,21 +3477,7 @@ const server = http.createServer(async (req, res) => {
       let uploadPlan = null;
       let objectUploadSession = null;
       if (useMultipart) {
-        const maxPartSizeByCount = Math.max(
-          5 * 1024 * 1024,
-          Math.ceil(expectedBytes / OBJECT_MULTIPART_MAX_PARTS)
-        );
-        let tunedPartSize = OBJECT_MULTIPART_PART_SIZE_BYTES;
-        if (expectedBytes >= 2 * 1024 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 24 * 1024 * 1024);
-        } else if (expectedBytes >= 1024 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 20 * 1024 * 1024);
-        } else if (expectedBytes >= 512 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 16 * 1024 * 1024);
-        } else if (expectedBytes >= 32 * 1024 * 1024) {
-          tunedPartSize = Math.max(tunedPartSize, 6 * 1024 * 1024);
-        }
-        const partSize = Math.max(tunedPartSize, maxPartSizeByCount);
+        const partSize = chooseObjectMultipartPartSize(expectedBytes, mime);
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
         const recommendedConcurrency = expectedBytes >= 1024 * 1024 * 1024
           ? 12
