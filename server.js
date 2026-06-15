@@ -180,12 +180,13 @@ function objectMultipartThresholdForMime(mime = "") {
 function chooseObjectMultipartPartSize(expectedBytes = 0, mime = "") {
   const bytes = Math.max(0, Number(expectedBytes || 0));
   const normalizedMime = String(mime || "").trim().toLowerCase();
+  const keepSmallVideoParts = normalizedMime.startsWith("video/") && bytes > 0 && bytes <= 384 * 1024 * 1024;
   const maxPartSizeByCount = Math.max(
     5 * 1024 * 1024,
     Math.ceil(bytes / OBJECT_MULTIPART_MAX_PARTS)
   );
   let tunedPartSize = OBJECT_MULTIPART_PART_SIZE_BYTES;
-  if (normalizedMime.startsWith("video/") && bytes > 0 && bytes <= 128 * 1024 * 1024) {
+  if (keepSmallVideoParts) {
     tunedPartSize = 5 * 1024 * 1024;
   }
   if (bytes >= 2 * 1024 * 1024 * 1024) {
@@ -194,7 +195,7 @@ function chooseObjectMultipartPartSize(expectedBytes = 0, mime = "") {
     tunedPartSize = Math.max(tunedPartSize, 20 * 1024 * 1024);
   } else if (bytes >= 512 * 1024 * 1024) {
     tunedPartSize = Math.max(tunedPartSize, 16 * 1024 * 1024);
-  } else if (bytes >= 32 * 1024 * 1024) {
+  } else if (bytes >= 32 * 1024 * 1024 && !keepSmallVideoParts) {
     tunedPartSize = Math.max(tunedPartSize, 6 * 1024 * 1024);
   }
   return Math.max(tunedPartSize, maxPartSizeByCount);
