@@ -8,6 +8,8 @@ primary_region = "ewr"
 
 [env]
   MERM_DEPLOY_ENV = "staging"
+  ACCOUNT_RELAY_MULTIPART_PART_SIZE_BYTES = "8388608"
+  GUEST_RELAY_MULTIPART_PART_SIZE_BYTES = "8388608"
 
 [http_service]
   internal_port = 8080
