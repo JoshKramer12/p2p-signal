@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
+    "bench:account-upload": "node tools/account_upload_bench.mjs",
     "deploy:staging": "fly deploy -c fly.staging.toml -a p2p-signal-staging",
     "promotion:check": "bash scripts/promotion-check.sh",
     "promotion:prepare": "bash scripts/prepare-production-promotion.sh",

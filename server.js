@@ -153,7 +153,7 @@ const OFFLINE_UPLOAD_STREAM_HWM_BYTES = Math.max(
 );
 const OBJECT_MULTIPART_THRESHOLD_BYTES = Math.max(
   5 * 1024 * 1024,
-  Number(process.env.OBJECT_MULTIPART_THRESHOLD_BYTES || 24 * 1024 * 1024)
+  Number(process.env.OBJECT_MULTIPART_THRESHOLD_BYTES || (64 * 1024 * 1024))
 );
 const OBJECT_MULTIPART_PART_SIZE_BYTES = Math.max(
   5 * 1024 * 1024,
@@ -167,6 +167,41 @@ const OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX = Math.max(
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
   1,
   Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX, Number(process.env.OBJECT_MULTIPART_CLIENT_CONCURRENCY || 12))
+);
+
+function objectMultipartThresholdForMime(mime = "") {
+  const normalizedMime = String(mime || "").trim().toLowerCase();
+  if (normalizedMime.startsWith("video/")) {
+    return Math.min(OBJECT_MULTIPART_THRESHOLD_BYTES, 8 * 1024 * 1024);
+  }
+  return OBJECT_MULTIPART_THRESHOLD_BYTES;
+}
+const OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS = Math.max(
+  1000,
+  Number(process.env.OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS || 30 * 1000)
+);
+const OBJECT_MULTIPART_COMPLETE_SETTLE_POLL_MS = Math.max(
+  100,
+  Number(process.env.OBJECT_MULTIPART_COMPLETE_SETTLE_POLL_MS || 450)
+);
+const ACCOUNT_RELAY_UPLOAD_SESSION_TTL_MS = Math.max(
+  2 * 60 * 1000,
+  Number(process.env.ACCOUNT_RELAY_UPLOAD_SESSION_TTL_MS || 45 * 60 * 1000)
+);
+const ACCOUNT_RELAY_MULTIPART_PART_SIZE_BYTES = Math.max(
+  1024 * 1024,
+  Number(process.env.ACCOUNT_RELAY_MULTIPART_PART_SIZE_BYTES || 4 * 1024 * 1024)
+);
+const ACCOUNT_RELAY_MULTIPART_CLIENT_CONCURRENCY_MAX = Math.max(
+  1,
+  Number(process.env.ACCOUNT_RELAY_MULTIPART_CLIENT_CONCURRENCY_MAX || 16)
+);
+const ACCOUNT_RELAY_MULTIPART_CLIENT_CONCURRENCY = Math.max(
+  1,
+  Math.min(
+    ACCOUNT_RELAY_MULTIPART_CLIENT_CONCURRENCY_MAX,
+    Number(process.env.ACCOUNT_RELAY_MULTIPART_CLIENT_CONCURRENCY || 12)
+  )
 );
 const INBOX_REQUEST_MIN_INTERVAL_MS = Math.max(0, Number(process.env.INBOX_REQUEST_MIN_INTERVAL_MS || 500));
 const UPLOAD_CHECKPOINT_EVERY_BYTES = Math.max(
@@ -270,6 +305,7 @@ const inboxes = new Map();
 
 // intentId -> { tcp: net.Socket, bytesExpected, bytesSent, senderWs, receiverWs }
 const activeTransfers = new Map();
+const accountRelayUploadSessions = new Map(); // relayUploadId -> pending account HTTP relay upload session
 const archiveIndexCache = new Map(); // intentId -> { entries, archiveSize, archiveMtimeMs, cachedAt }
 const archiveIndexBuildJobs = new Map(); // `${intentId}:${archiveSize}:${archiveMtimeMs}` -> Promise<entries[]>
 const archivePreviewWarmupJobs = new Map(); // intentId -> Promise<void>
@@ -727,7 +763,7 @@ function setCors(res) {
   setMermEnvironmentHeaders(res);
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password,X-Merm-Unlock,X-Merm-Session,X-Merm-Username,X-Merm-File-Name,X-Merm-File-Mime");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Range,X-Merm-Password,X-Merm-Unlock,X-Merm-Session,X-Merm-Username,X-Merm-File-Name,X-Merm-File-Mime,X-Relay-Upload-Id,X-Relay-Part-Number");
   res.setHeader("Access-Control-Expose-Headers", "Content-Length,Content-Disposition,Content-Range,Accept-Ranges,X-Merm-Unlock,X-Merm-Unlock-Exp");
 }
 
@@ -1385,6 +1421,262 @@ function streamRequestBodyToFile(req, outputPath, maxBytes = FILE_HOLDER_MAX_FIL
     ws.on("finish", onFinish);
     req.pipe(ws);
   });
+}
+
+function removeRelayUploadPath(targetPath = "") {
+  const fullPath = String(targetPath || "").trim();
+  if (!fullPath) return;
+  try {
+    fs.rmSync(fullPath, { recursive: true, force: true });
+  } catch {}
+}
+
+function accountRelayUploadSessionDir(relayUploadId = "") {
+  return path.join(RELAY_UPLOADS_DIR, `account-${safeBasename(String(relayUploadId || "upload"))}`);
+}
+
+function normalizeAccountRelayUploadParts(parts = null) {
+  if (!parts || typeof parts !== "object") return [];
+  return Object.entries(parts)
+    .map(([partNumber, part]) => ({
+      partNumber: Math.max(1, Number(partNumber || part?.partNumber || 0)),
+      size: Math.max(0, Number(part?.size || 0)),
+      path: String(part?.path || "").trim()
+    }))
+    .filter((part) => Number.isFinite(part.partNumber) && part.partNumber > 0 && part.path)
+    .sort((a, b) => a.partNumber - b.partNumber);
+}
+
+function accountRelayUploadConfirmedBytes(session = null) {
+  return normalizeAccountRelayUploadParts(session?.parts)
+    .reduce((sum, part) => sum + Math.max(0, Number(part?.size || 0)), 0);
+}
+
+function buildAccountRelayUploadStatusPayload(intent = null, session = null) {
+  if (!intent || !session) return null;
+  return {
+    ok: true,
+    intentId: String(intent.id || "").trim(),
+    relayUploadId: String(session.id || "").trim(),
+    mode: "relay-multipart",
+    partSize: Math.max(1, Number(session.partSize || ACCOUNT_RELAY_MULTIPART_PART_SIZE_BYTES)),
+    totalParts: Math.max(1, Number(session.totalParts || 1)),
+    maxConcurrency: Math.max(1, Number(session.maxConcurrency || ACCOUNT_RELAY_MULTIPART_CLIENT_CONCURRENCY)),
+    bytesExpected: Math.max(0, Number(session.size || resolveUploadExpectedBytes(intent) || intent.fileSize || 0)),
+    bytesUploadedConfirmed: accountRelayUploadConfirmedBytes(session),
+    finalizing: Boolean(session.finalizing),
+    finalized: Boolean(session.finalized)
+  };
+}
+
+function findAccountRelayUploadSessionByClientUploadId(intentId = "", username = "", clientUploadId = "") {
+  const targetIntentId = String(intentId || "").trim();
+  const targetUsername = String(username || "").trim();
+  const targetClientUploadId = String(clientUploadId || "").trim();
+  if (!targetIntentId || !targetUsername || !targetClientUploadId) return null;
+  for (const session of accountRelayUploadSessions.values()) {
+    if (!session) continue;
+    if (String(session.intentId || "").trim() !== targetIntentId) continue;
+    if (String(session.username || "").trim() !== targetUsername) continue;
+    if (String(session.clientUploadId || "").trim() !== targetClientUploadId) continue;
+    return session;
+  }
+  return null;
+}
+
+function findLatestAccountRelayUploadSessionForIntent(intentId = "", username = "") {
+  const targetIntentId = String(intentId || "").trim();
+  const targetUsername = String(username || "").trim();
+  if (!targetIntentId || !targetUsername) return null;
+  let latest = null;
+  for (const session of accountRelayUploadSessions.values()) {
+    if (!session) continue;
+    if (String(session.intentId || "").trim() !== targetIntentId) continue;
+    if (String(session.username || "").trim() !== targetUsername) continue;
+    if (!latest || Number(session.updatedAt || 0) > Number(latest.updatedAt || 0)) {
+      latest = session;
+    }
+  }
+  return latest;
+}
+
+function removeAccountRelayUploadSession(relayUploadId = "", options = {}) {
+  const id = String(relayUploadId || "").trim();
+  if (!id) return;
+  const session = accountRelayUploadSessions.get(id) || null;
+  if (session?.dir && !options?.keepFiles) {
+    removeRelayUploadPath(session.dir);
+  }
+  accountRelayUploadSessions.delete(id);
+}
+
+function pruneAccountRelayUploadSessions() {
+  const now = Date.now();
+  for (const [relayUploadId, session] of accountRelayUploadSessions.entries()) {
+    if (Number(session?.expiresAt || 0) > now) continue;
+    removeAccountRelayUploadSession(relayUploadId);
+  }
+}
+
+function abortAccountRelayUploadSessionsForIntent(intentId = "", options = {}) {
+  const targetIntentId = String(intentId || "").trim();
+  const targetUsername = String(options?.username || "").trim();
+  if (!targetIntentId) return 0;
+  let removed = 0;
+  for (const [relayUploadId, session] of accountRelayUploadSessions.entries()) {
+    if (!session) continue;
+    if (String(session.intentId || "").trim() !== targetIntentId) continue;
+    if (targetUsername && String(session.username || "").trim() !== targetUsername) continue;
+    if (options?.preserveFinalized && session.finalized) continue;
+    removeAccountRelayUploadSession(relayUploadId);
+    removed += 1;
+  }
+  return removed;
+}
+
+async function concatenateAccountRelayUploadParts(parts = [], targetPath = "") {
+  const target = String(targetPath || "").trim();
+  if (!target) throw new Error("Missing relay upload target.");
+  const writer = fs.createWriteStream(target);
+  try {
+    for (const part of parts) {
+      await new Promise((resolve, reject) => {
+        const reader = fs.createReadStream(part.path);
+        const cleanup = () => {
+          reader.off("error", onError);
+          writer.off("error", onError);
+          reader.off("end", onEnd);
+        };
+        const onError = (err) => {
+          cleanup();
+          reject(err);
+        };
+        const onEnd = () => {
+          cleanup();
+          resolve();
+        };
+        reader.once("error", onError);
+        writer.once("error", onError);
+        reader.once("end", onEnd);
+        reader.pipe(writer, { end: false });
+      });
+    }
+    await new Promise((resolve, reject) => {
+      writer.once("error", reject);
+      writer.end(resolve);
+    });
+  } catch (err) {
+    try { writer.destroy(); } catch {}
+    throw err;
+  }
+}
+
+function buildAccountRelayCompletePayload(intent = null) {
+  if (!intent) return { ok: false };
+  return {
+    ok: true,
+    intentId: intent.id,
+    storedFile: intent.storedFile || null,
+    bytesStored: Number(intent.storedBytes || 0),
+    deliveryHeld: isIntentDeliveryHeld(intent)
+  };
+}
+
+async function finalizeAccountRelayUploadedIntent(intentId = "", session = null, senderWs = null) {
+  const id = String(intentId || "").trim();
+  if (!id) throw new Error("Missing intent ID.");
+  const activeSession = session || accountRelayUploadSessions.get(String(session?.id || "").trim()) || null;
+  let intent = loadIntent(id);
+  if (!intent) throw new Error("Intent not found.");
+  if (intent.stored && hasStoredAsset(intent) && String(intent.transferState || "").toLowerCase() !== "uploading") {
+    return buildAccountRelayCompletePayload(intent);
+  }
+
+  const storedFileName = String(activeSession?.storedFileName || intent.storedFile || "").trim();
+  const localFilePath = String(activeSession?.targetPath || "").trim();
+  const safeName = safeBasename(String(intent.fileName || storedFileName || "file"));
+  intent.storedFile = storedFileName;
+  intent.storedObjectKey = null;
+  intent.objectUploadSession = null;
+  let finalizedStoredBytes = Math.max(
+    0,
+    Number(activeSession?.size || resolveUploadExpectedBytes(intent) || intent.fileSize || 0)
+  );
+  const sanitizedPayload = await maybeSanitizeIntentStoredFolderBundle(intent, {
+    sizeHint: finalizedStoredBytes
+  }).catch(() => null);
+  if (sanitizedPayload && Number.isFinite(Number(sanitizedPayload.bytes)) && Number(sanitizedPayload.bytes) >= 0) {
+    finalizedStoredBytes = Number(sanitizedPayload.bytes);
+  }
+
+  intent.stored = true;
+  intent.storedBytes = finalizedStoredBytes;
+  intent.plainStoredBytes = uploadBytesToPlainBytes(intent, finalizedStoredBytes);
+  intent.status = "stored";
+  intent.transferState = "delivered";
+  intent.uploadedAt = Date.now();
+  intent.completedAt = intent.uploadedAt;
+  intent.updatedAt = intent.uploadedAt;
+  saveIntent(intent);
+  queueIntentArchivePreviewWarmup(intent);
+
+  const receiverSockets = getOnlineSocketsForUser(intent.to);
+  if (!intent.groupId && receiverSockets.length && !isIntentDeliveryHeld(intent)) {
+    const safeIntent = intentForClient(intent);
+    sendToUser(intent.to, {
+      type: "incoming_file",
+      intent: safeIntent
+    });
+    try {
+      sendToUser(intent.to, { type: "inbox", items: loadIntentsForUser(intent.to) });
+    } catch {}
+
+    const iosSocket = receiverSockets.find((sock) => String(sock?.client || "").toLowerCase() === "ios");
+    if (iosSocket) {
+      send(iosSocket, {
+        type: "prepare_transfer",
+        intentId: id
+      });
+    }
+  }
+
+  if (intent.groupId) {
+    finalizeGroupRecipientCopies(intent, {
+      storedBytes: Number(intent.storedBytes || finalizedStoredBytes || 0),
+      totalBytes: Number(resolveUploadExpectedBytes(intent) || finalizedStoredBytes || 0),
+      uploadedAt: intent.uploadedAt
+    });
+  }
+
+  emitTransferState(intent, "delivered", {
+    sentBytes: Number(intent.storedBytes || finalizedStoredBytes || 0),
+    totalBytes: Number(resolveUploadExpectedBytes(intent) || finalizedStoredBytes || 0),
+    plainSentBytes: Number(intent.plainStoredBytes || intent.fileSize || 0),
+    plainTotalBytes: Number(intent.fileSize || 0)
+  });
+
+  if (senderWs) {
+    send(senderWs, {
+      type: "upload_done",
+      intentId: id,
+      deliveryHeld: isIntentDeliveryHeld(intent)
+    });
+  } else {
+    sendToUser(intent.from, {
+      type: "upload_done",
+      intentId: id,
+      deliveryHeld: isIntentDeliveryHeld(intent)
+    });
+  }
+
+  if (localFilePath) {
+    queueStoredFileIntentOffload(id, localFilePath, {
+      safeName,
+      storedFileName
+    });
+  }
+
+  return buildAccountRelayCompletePayload(intent);
 }
 
 function isGuestBridgeAuthorized(req) {
@@ -2581,6 +2873,377 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    const accountIntentRelayUploadInitMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/relay-upload\/init$/i)
+      : null;
+    if (accountIntentRelayUploadInitMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const intentId = String(accountIntentRelayUploadInitMatch[1] || "").trim();
+      const intent = loadIntent(intentId);
+      if (!intent) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Intent not found" }));
+        return;
+      }
+      if (intent.from !== username) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
+        return;
+      }
+      if (intent.isTextOnly || String(intent.messageType || "").toLowerCase() === "text") {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Text intents do not need file upload" }));
+        return;
+      }
+      if (intent.stored && hasStoredAsset(intent) && String(intent.transferState || "").toLowerCase() !== "uploading") {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          enabled: true,
+          intentId,
+          alreadyStored: true,
+          bytesExpected: Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0),
+          plainBytesExpected: Number(intent.fileSize || 0)
+        }));
+        return;
+      }
+
+      let body = {};
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch (err) {
+        const status = Number(err?.status || 400);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Invalid request body") }));
+        return;
+      }
+
+      const expectedBytes = Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0);
+      if (!Number.isFinite(expectedBytes) || expectedBytes <= 0) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Intent has invalid upload size" }));
+        return;
+      }
+      const requestBytes = Math.max(0, Number(body?.size || 0));
+      if (requestBytes > 0 && requestBytes !== expectedBytes) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload size does not match intent" }));
+        return;
+      }
+
+      const clientUploadId = String(body?.clientUploadId || "").trim().slice(0, 160);
+      let uploadSession = findAccountRelayUploadSessionByClientUploadId(intentId, username, clientUploadId);
+      if (!uploadSession) {
+        uploadSession = findLatestAccountRelayUploadSessionForIntent(intentId, username);
+      }
+      if (uploadSession && uploadSession.finalized && uploadSession.finalizeResult) {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({
+          ok: true,
+          enabled: true,
+          intentId,
+          alreadyStored: true,
+          relayUploadId: uploadSession.id,
+          finalizeResult: uploadSession.finalizeResult,
+          upload: {
+            mode: "relay-multipart",
+            partSize: uploadSession.partSize,
+            totalParts: uploadSession.totalParts,
+            maxConcurrency: uploadSession.maxConcurrency
+          },
+          status: buildAccountRelayUploadStatusPayload(intent, uploadSession),
+          bytesExpected: expectedBytes,
+          plainBytesExpected: Number(intent.fileSize || 0)
+        }));
+        return;
+      }
+
+      if (!uploadSession || uploadSession.finalizing) {
+        abortAccountRelayUploadSessionsForIntent(intentId, { username });
+        const originalName = safeBasename(String(body?.name || intent.fileName || "file"));
+        const uploadMime = normalizeFileHolderMime(String(body?.mime || "").trim(), originalName);
+        const relayUploadId = randomUUID();
+        const partSize = Math.max(1024 * 1024, ACCOUNT_RELAY_MULTIPART_PART_SIZE_BYTES);
+        const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
+        const dir = accountRelayUploadSessionDir(relayUploadId);
+        const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${originalName}`;
+        fs.mkdirSync(dir, { recursive: true });
+        uploadSession = {
+          id: relayUploadId,
+          intentId,
+          username,
+          originalName,
+          mime: uploadMime,
+          size: expectedBytes,
+          partSize,
+          totalParts,
+          maxConcurrency: Math.max(1, Math.min(ACCOUNT_RELAY_MULTIPART_CLIENT_CONCURRENCY, totalParts)),
+          dir,
+          parts: {},
+          clientUploadId,
+          storedFileName,
+          targetPath: path.join(FILES_DIR, storedFileName),
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          expiresAt: Date.now() + ACCOUNT_RELAY_UPLOAD_SESSION_TTL_MS,
+          finalizing: false,
+          finalized: false,
+          finalizeResult: null
+        };
+        accountRelayUploadSessions.set(relayUploadId, uploadSession);
+      } else {
+        uploadSession.updatedAt = Date.now();
+        uploadSession.expiresAt = Date.now() + ACCOUNT_RELAY_UPLOAD_SESSION_TTL_MS;
+        accountRelayUploadSessions.set(uploadSession.id, uploadSession);
+      }
+
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        enabled: true,
+        intentId,
+        relayUploadId: uploadSession.id,
+        upload: {
+          mode: "relay-multipart",
+          partSize: uploadSession.partSize,
+          totalParts: uploadSession.totalParts,
+          maxConcurrency: uploadSession.maxConcurrency
+        },
+        status: buildAccountRelayUploadStatusPayload(intent, uploadSession),
+        bytesExpected: expectedBytes,
+        plainBytesExpected: Number(intent.fileSize || 0)
+      }));
+      return;
+    }
+
+    const accountIntentRelayUploadPartMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/relay-upload\/part$/i)
+      : null;
+    if (accountIntentRelayUploadPartMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const intentId = String(accountIntentRelayUploadPartMatch[1] || "").trim();
+      const relayUploadId = String(req.headers["x-relay-upload-id"] || "").trim();
+      const partNumber = Math.max(1, Number(req.headers["x-relay-part-number"] || 0));
+      if (!relayUploadId || !Number.isFinite(partNumber)) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Missing relay upload metadata" }));
+        return;
+      }
+
+      const uploadSession = accountRelayUploadSessions.get(relayUploadId) || null;
+      if (!uploadSession || uploadSession.intentId !== intentId || uploadSession.username !== username) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload session expired. Retry send." }));
+        return;
+      }
+      if (uploadSession.finalized || uploadSession.finalizing) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload is already finalizing." }));
+        return;
+      }
+      if (partNumber < 1 || partNumber > uploadSession.totalParts) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Invalid upload part." }));
+        return;
+      }
+
+      const expectedStart = (partNumber - 1) * uploadSession.partSize;
+      const expectedEnd = Math.min(uploadSession.size, expectedStart + uploadSession.partSize);
+      const expectedBytes = Math.max(0, expectedEnd - expectedStart);
+      fs.mkdirSync(uploadSession.dir, { recursive: true });
+      const targetPath = path.join(uploadSession.dir, `part-${String(partNumber).padStart(6, "0")}`);
+      let streamed = null;
+      try {
+        streamed = await streamRequestBodyToFile(req, targetPath, Math.max(expectedBytes, expectedBytes + 1024));
+      } catch (err) {
+        const status = Number(err?.status || 500);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Could not save upload part.") }));
+        return;
+      }
+      if (Number(streamed?.bytes || 0) !== expectedBytes) {
+        removeRelayUploadPath(targetPath);
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload part size did not match." }));
+        return;
+      }
+
+      uploadSession.parts = uploadSession.parts && typeof uploadSession.parts === "object" ? uploadSession.parts : {};
+      uploadSession.parts[partNumber] = {
+        partNumber,
+        size: expectedBytes,
+        path: targetPath,
+        receivedAt: Date.now()
+      };
+      uploadSession.updatedAt = Date.now();
+      uploadSession.expiresAt = Date.now() + ACCOUNT_RELAY_UPLOAD_SESSION_TTL_MS;
+      accountRelayUploadSessions.set(uploadSession.id, uploadSession);
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        intentId,
+        relayUploadId: uploadSession.id,
+        partNumber,
+        size: expectedBytes,
+        uploadedBytesConfirmed: accountRelayUploadConfirmedBytes(uploadSession)
+      }));
+      return;
+    }
+
+    const accountIntentRelayUploadCompleteMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/relay-upload\/complete$/i)
+      : null;
+    if (accountIntentRelayUploadCompleteMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const intentId = String(accountIntentRelayUploadCompleteMatch[1] || "").trim();
+      let body = {};
+      try {
+        body = await readJsonBody(req, 64 * 1024);
+      } catch (err) {
+        const status = Number(err?.status || 400);
+        res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Invalid request body") }));
+        return;
+      }
+
+      const relayUploadId = String(body?.relayUploadId || "").trim();
+      const uploadSession = accountRelayUploadSessions.get(relayUploadId) || null;
+      if (!uploadSession || uploadSession.intentId !== intentId || uploadSession.username !== username) {
+        res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload session expired. Retry send." }));
+        return;
+      }
+      if (uploadSession.finalized && uploadSession.finalizeResult) {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify(uploadSession.finalizeResult));
+        return;
+      }
+      if (uploadSession.finalizing) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload is already finalizing." }));
+        return;
+      }
+
+      const parts = normalizeAccountRelayUploadParts(uploadSession.parts);
+      if (parts.length !== uploadSession.totalParts) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Some upload parts are still missing." }));
+        return;
+      }
+      const confirmedBytes = parts.reduce((sum, part) => sum + Math.max(0, Number(part.size || 0)), 0);
+      if (confirmedBytes !== uploadSession.size) {
+        res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Uploaded size does not match file size." }));
+        return;
+      }
+      for (let i = 0; i < parts.length; i += 1) {
+        const part = parts[i];
+        const expectedPartNumber = i + 1;
+        const expectedStart = i * uploadSession.partSize;
+        const expectedEnd = Math.min(uploadSession.size, expectedStart + uploadSession.partSize);
+        const expectedBytes = Math.max(0, expectedEnd - expectedStart);
+        if (part.partNumber !== expectedPartNumber || part.size !== expectedBytes || !fs.existsSync(part.path)) {
+          res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          res.end(JSON.stringify({ ok: false, message: "Upload parts are incomplete." }));
+          return;
+        }
+      }
+
+      uploadSession.finalizing = true;
+      uploadSession.updatedAt = Date.now();
+      accountRelayUploadSessions.set(uploadSession.id, uploadSession);
+      try {
+        removeRelayUploadPath(uploadSession.targetPath);
+        await concatenateAccountRelayUploadParts(parts, uploadSession.targetPath);
+        const result = await finalizeAccountRelayUploadedIntent(intentId, uploadSession, online.get(username) || null);
+        uploadSession.finalized = true;
+        uploadSession.finalizing = false;
+        uploadSession.finalizeResult = result;
+        uploadSession.expiresAt = Date.now() + 15 * 60 * 1000;
+        removeRelayUploadPath(uploadSession.dir);
+        accountRelayUploadSessions.set(uploadSession.id, uploadSession);
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify(result));
+        return;
+      } catch (err) {
+        uploadSession.finalizing = false;
+        uploadSession.updatedAt = Date.now();
+        accountRelayUploadSessions.set(uploadSession.id, uploadSession);
+        removeRelayUploadPath(uploadSession.targetPath);
+        res.writeHead(500, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: String(err?.message || "Could not finish upload.") }));
+        return;
+      }
+    }
+
+    const accountIntentRelayUploadAbortMatch = req.method === "POST"
+      ? url.pathname.match(/^\/api\/intents\/([^/]+)\/relay-upload\/abort$/i)
+      : null;
+    if (accountIntentRelayUploadAbortMatch) {
+      setCors(res);
+      const username = extractUsernameFromRequest(req, url);
+      const sessionToken = extractSessionTokenFromRequest(req, url);
+      const user = verifyAccountSession(username, sessionToken);
+      if (!user) {
+        res.writeHead(401, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Unauthorized" }));
+        return;
+      }
+
+      const intentId = String(accountIntentRelayUploadAbortMatch[1] || "").trim();
+      let body = {};
+      try {
+        body = await readJsonBody(req, 32 * 1024);
+      } catch {}
+      const relayUploadId = String(body?.relayUploadId || "").trim();
+      const uploadSession = accountRelayUploadSessions.get(relayUploadId) || null;
+      if (!uploadSession) {
+        res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: true, aborted: false, relayUploadId }));
+        return;
+      }
+      if (uploadSession.intentId !== intentId || uploadSession.username !== username) {
+        res.writeHead(403, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Upload session is not valid for this account." }));
+        return;
+      }
+      if (!uploadSession.finalized) {
+        removeAccountRelayUploadSession(relayUploadId);
+      } else {
+        accountRelayUploadSessions.delete(relayUploadId);
+      }
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({ ok: true, aborted: !uploadSession.finalized, relayUploadId }));
+      return;
+    }
+
     const accountIntentUploadInitMatch = req.method === "POST"
       ? url.pathname.match(/^\/api\/intents\/([^/]+)\/object-upload\/init$/i)
       : null;
@@ -2668,12 +3331,17 @@ const server = http.createServer(async (req, res) => {
       const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${safeName}`;
       const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName);
       const hintedUploadId = String(body?.uploadId || "").trim();
+      const shouldUseMultipart = expectedBytes >= objectMultipartThresholdForMime(mime);
       let existingSession = normalizeObjectUploadSession(intent.objectUploadSession);
       let canReuseExisting = Boolean(
         existingSession &&
         String(intent.storedObjectKey || "").trim() &&
         existingSession.objectKey === String(intent.storedObjectKey || "").trim()
       );
+
+      if (canReuseExisting && existingSession?.mode === "multipart" && !shouldUseMultipart) {
+        canReuseExisting = false;
+      }
 
       if (canReuseExisting && existingSession?.mode === "multipart" && hintedUploadId) {
         if (hintedUploadId !== String(existingSession.uploadId || "").trim()) {
@@ -2782,7 +3450,7 @@ const server = http.createServer(async (req, res) => {
       }
       removeIntentCachedObjectFile(intent.id);
 
-      const useMultipart = expectedBytes >= OBJECT_MULTIPART_THRESHOLD_BYTES;
+      const useMultipart = shouldUseMultipart;
       let uploadPlan = null;
       let objectUploadSession = null;
       if (useMultipart) {
@@ -3373,68 +4041,46 @@ const server = http.createServer(async (req, res) => {
             res.end(JSON.stringify({ ok: false, message: "Upload session changed" }));
             return;
           }
-          const requestedParts = Array.isArray(body?.parts)
-            ? body.parts
-              .map((part) => ({
-                partNumber: Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.partNumber || part?.PartNumber || 0))),
-                etag: String(part?.etag || part?.ETag || "").trim().replace(/"/g, ""),
-                size: Math.max(0, Number(part?.size || part?.Size || 0))
-              }))
-              .filter((part) => Number.isFinite(part.partNumber))
-              .sort((a, b) => a.partNumber - b.partNumber)
-            : [];
-
-          let listedParts = [];
-          const needsLookup = !requestedParts.length || requestedParts.some((part) => !part.etag);
-          if (needsLookup) {
-            listedParts = await objectStorage.listMultipartUploadParts(session.objectKey, session.uploadId).catch(() => []);
-          }
-
-          const listedByPartNumber = new Map();
-          listedParts.forEach((part) => {
-            const number = Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.PartNumber || part?.partNumber || 0)));
-            const etag = String(part?.ETag || part?.etag || "").trim().replace(/"/g, "");
-            if (!Number.isFinite(number) || !etag) return;
-            listedByPartNumber.set(number, {
-              etag,
-              size: Math.max(0, Number(part?.Size || part?.size || 0))
+          try {
+            const resolvedParts = await resolveObjectMultipartCompletionParts(session, body?.parts || [], {
+              expectedBytes
             });
-          });
-
-          completionParts = requestedParts.length
-            ? requestedParts
-              .map((part) => {
-                const listed = listedByPartNumber.get(part.partNumber) || null;
-                return {
-                  partNumber: part.partNumber,
-                  etag: String(part.etag || listed?.etag || "").trim(),
-                  size: Math.max(0, Number(part.size || listed?.size || 0))
-                };
-              })
-              .filter((part) => Number.isFinite(part.partNumber) && part.etag)
-              .sort((a, b) => a.partNumber - b.partNumber)
-            : Array.from(listedByPartNumber.entries())
-              .map(([partNumber, part]) => ({
-                partNumber,
-                etag: String(part?.etag || "").trim(),
-                size: Math.max(0, Number(part?.size || 0))
-              }))
-              .filter((part) => Number.isFinite(part.partNumber) && part.etag)
-              .sort((a, b) => a.partNumber - b.partNumber);
-
-          if (!completionParts.length) {
+            completionParts = resolvedParts.parts;
+            if (resolvedParts.attempts > 1) {
+              uploadDiagLog("complete-parts-settled", {
+                intentId,
+                attempts: resolvedParts.attempts,
+                knownPartBytes: resolvedParts.knownPartBytes,
+                expectedBytes,
+                partCount: completionParts.length
+              });
+            }
+          } catch (settleErr) {
             clearFinalizing();
-            res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-            res.end(JSON.stringify({ ok: false, message: "No uploaded multipart parts were found" }));
-            return;
-          }
-
-          const knownPartBytes = completionParts.reduce((sum, part) => sum + Math.max(0, Number(part.size || 0)), 0);
-          if (expectedBytes > 0 && knownPartBytes > 0 && knownPartBytes !== expectedBytes) {
-            clearFinalizing();
-            res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-            res.end(JSON.stringify({ ok: false, message: "Uploaded multipart size does not match intent" }));
-            return;
+            const code = String(settleErr?.code || "");
+            if (code === "MULTIPART_UPLOAD_MISSING") {
+              res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+              res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
+              return;
+            }
+            if (code === "MULTIPART_PARTS_NOT_SETTLED") {
+              uploadDiagLog("complete-parts-not-settled", {
+                intentId,
+                attempts: Number(settleErr?.attempts || 0),
+                knownPartBytes: Number(settleErr?.knownPartBytes || 0),
+                expectedBytes
+              });
+              res.writeHead(503, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "retry-after": "2" });
+              res.end(JSON.stringify({
+                ok: false,
+                retryable: true,
+                message: "Uploaded multipart parts are still settling. Try finalizing again.",
+                bytesExpected: expectedBytes,
+                bytesUploadedConfirmed: Number(settleErr?.knownPartBytes || 0)
+              }));
+              return;
+            }
+            throw settleErr;
           }
 
           try {
@@ -3445,10 +4091,20 @@ const server = http.createServer(async (req, res) => {
             );
           } catch (err) {
             const msg = String(err?.message || "").toLowerCase();
-            if (msg.includes("invalidpart") || msg.includes("invalid part") || msg.includes("no such upload")) {
+            if (msg.includes("invalidpart") || msg.includes("invalid part")) {
+              clearFinalizing();
+              res.writeHead(503, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "retry-after": "2" });
+              res.end(JSON.stringify({
+                ok: false,
+                retryable: true,
+                message: "Uploaded multipart parts are still settling. Try finalizing again."
+              }));
+              return;
+            }
+            if (msg.includes("no such upload")) {
               clearFinalizing();
               res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-              res.end(JSON.stringify({ ok: false, message: "Multipart upload could not be completed. Retry send." }));
+              res.end(JSON.stringify({ ok: false, message: "Upload session expired, retry send" }));
               return;
             }
             throw err;
@@ -4054,7 +4710,8 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(404, { "content-type": "text/plain" });
     res.end("Not found");
-  } catch {
+  } catch (err) {
+    console.error("💥 HTTP handler crash:", err);
     res.writeHead(500, { "content-type": "text/plain" });
     res.end("Server error");
   }
@@ -4087,6 +4744,7 @@ const STORAGE_DIR = process.env.STORAGE_DIR || DEFAULT_STORAGE_DIR;
 
 const INTENTS_DIR = path.join(STORAGE_DIR, "intents");
 const FILES_DIR = path.join(STORAGE_DIR, "files");
+const RELAY_UPLOADS_DIR = path.join(STORAGE_DIR, "relay-uploads");
 const FILE_HOLDER_DIR = path.join(STORAGE_DIR, "file-holder");
 const USERS_DIR = path.join(STORAGE_DIR, "users");
 const GROUPS_DIR = path.join(STORAGE_DIR, "groups");
@@ -4220,6 +4878,142 @@ function objectUploadedBytesFromPartRows(rows = []) {
   return normalizeObjectMultipartPartRows(rows).reduce((sum, part) => sum + Math.max(0, Number(part?.size || 0)), 0);
 }
 
+function normalizeObjectMultipartCompletionRequest(raw = null) {
+  const rows = [];
+  (Array.isArray(raw) ? raw : []).forEach((part) => {
+    const partNumber = Math.max(1, Math.min(OBJECT_MULTIPART_MAX_PARTS, Number(part?.partNumber || part?.PartNumber || 0)));
+    if (!Number.isFinite(partNumber)) return;
+    rows.push({
+      partNumber,
+      etag: String(part?.etag || part?.ETag || "").trim().replace(/"/g, ""),
+      size: Math.max(0, Number(part?.size || part?.Size || 0))
+    });
+  });
+  rows.sort((a, b) => a.partNumber - b.partNumber);
+  const deduped = [];
+  const seen = new Set();
+  rows.forEach((part) => {
+    if (seen.has(part.partNumber)) return;
+    seen.add(part.partNumber);
+    deduped.push(part);
+  });
+  return deduped;
+}
+
+function expectedObjectMultipartPartSize(session = null, expectedBytes = 0, partNumber = 1) {
+  const partSize = Math.max(5 * 1024 * 1024, Number(session?.partSize || OBJECT_MULTIPART_PART_SIZE_BYTES));
+  const totalBytes = Math.max(0, Number(expectedBytes || 0));
+  const number = Math.max(1, Number(partNumber || 1));
+  if (!totalBytes || !partSize) return 0;
+  const start = (number - 1) * partSize;
+  if (start >= totalBytes) return 0;
+  return Math.max(0, Math.min(partSize, totalBytes - start));
+}
+
+async function resolveObjectMultipartCompletionParts(session = null, requestedPartsRaw = [], options = {}) {
+  const uploadSession = normalizeObjectUploadSession(session);
+  if (!uploadSession || uploadSession.mode !== "multipart") {
+    return { parts: [], attempts: 0, knownPartBytes: 0 };
+  }
+
+  const requestedParts = normalizeObjectMultipartCompletionRequest(requestedPartsRaw);
+  const expectedBytes = Math.max(0, Number(options?.expectedBytes || 0));
+  const expectedPartCount = Math.max(1, Number(uploadSession.totalParts || 1));
+  const deadline = Date.now() + Math.max(1000, Number(options?.timeoutMs || OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS));
+  const pollMs = Math.max(100, Number(options?.pollMs || OBJECT_MULTIPART_COMPLETE_SETTLE_POLL_MS));
+  let attempts = 0;
+  let lastParts = [];
+  let lastKnownPartBytes = 0;
+
+  while (true) {
+    attempts += 1;
+    const knownByPartNumber = new Map();
+    objectMultipartPartRowsFromMap(uploadSession.completedPartsByNumber || {}).forEach((part) => {
+      knownByPartNumber.set(part.partNumber, {
+        etag: String(part?.etag || "").trim(),
+        size: Math.max(0, Number(part?.size || 0))
+      });
+    });
+
+    const needsLookup = (
+      attempts > 1 ||
+      !requestedParts.length ||
+      requestedParts.some((part) => !part.etag) ||
+      knownByPartNumber.size < Math.min(expectedPartCount, requestedParts.length || expectedPartCount)
+    );
+
+    if (needsLookup) {
+      const listedParts = await objectStorage.listMultipartUploadParts(
+        uploadSession.objectKey,
+        uploadSession.uploadId
+      ).catch((err) => {
+        const msg = String(err?.message || "").toLowerCase();
+        if (msg.includes("no such upload") || msg.includes("uploadid")) {
+          const missing = new Error("Upload session expired, retry send");
+          missing.code = "MULTIPART_UPLOAD_MISSING";
+          throw missing;
+        }
+        return [];
+      });
+      normalizeObjectMultipartPartRows(listedParts).forEach((part) => {
+        knownByPartNumber.set(part.partNumber, {
+          etag: String(part?.etag || "").trim(),
+          size: Math.max(0, Number(part?.size || 0))
+        });
+      });
+    }
+
+    const completionParts = requestedParts.length
+      ? requestedParts
+        .map((part) => {
+          const known = knownByPartNumber.get(part.partNumber) || null;
+          return {
+            partNumber: part.partNumber,
+            etag: String(part.etag || known?.etag || "").trim(),
+            size: Math.max(
+              0,
+              Number(part.size || known?.size || expectedObjectMultipartPartSize(uploadSession, expectedBytes, part.partNumber))
+            )
+          };
+        })
+        .filter((part) => Number.isFinite(part.partNumber) && part.etag)
+        .sort((a, b) => a.partNumber - b.partNumber)
+      : Array.from(knownByPartNumber.entries())
+        .map(([partNumber, part]) => ({
+          partNumber,
+          etag: String(part?.etag || "").trim(),
+          size: Math.max(
+            0,
+            Number(part?.size || expectedObjectMultipartPartSize(uploadSession, expectedBytes, partNumber))
+          )
+        }))
+        .filter((part) => Number.isFinite(part.partNumber) && part.etag)
+        .sort((a, b) => a.partNumber - b.partNumber);
+
+    const knownPartBytes = completionParts.reduce((sum, part) => sum + Math.max(0, Number(part.size || 0)), 0);
+    const allRequestedPartsResolved = requestedParts.length > 0 && completionParts.length === requestedParts.length;
+    const allExpectedPartsResolved = expectedPartCount > 0 && completionParts.length >= expectedPartCount;
+    const byteCountMatches = expectedBytes <= 0 || knownPartBytes === expectedBytes;
+    lastParts = completionParts;
+    lastKnownPartBytes = knownPartBytes;
+
+    if (completionParts.length && byteCountMatches && (allExpectedPartsResolved || allRequestedPartsResolved)) {
+      return { parts: completionParts, attempts, knownPartBytes };
+    }
+
+    if (Date.now() >= deadline) break;
+    await waitMs(Math.min(2500, pollMs + (attempts - 1) * 250));
+  }
+
+  const err = new Error("Uploaded multipart parts are still settling. Try finalizing again.");
+  err.code = "MULTIPART_PARTS_NOT_SETTLED";
+  err.parts = lastParts;
+  err.knownPartBytes = lastKnownPartBytes;
+  err.expectedBytes = expectedBytes;
+  err.attempts = attempts;
+  throw err;
+}
+
 function normalizeObjectUploadSession(raw = null) {
   if (!raw || typeof raw !== "object") return null;
   const mode = String(raw.mode || "").trim().toLowerCase();
@@ -4336,6 +5130,7 @@ async function clearIntentObjectUploadSession(intent = null, options = {}) {
 
 function deleteStoredAssetForIntent(intent = null) {
   if (!intent || typeof intent !== "object") return;
+  abortAccountRelayUploadSessionsForIntent(intent.id);
   clearIntentObjectUploadSession(intent, { abortRemote: true }).catch(() => {});
   const objectKey = String(intent.storedObjectKey || "").trim();
   if (objectKey && objectStorage.isEnabled()) {
@@ -5125,6 +5920,7 @@ function enforceIntentPasswordGate(req, res, url, intent) {
 
 fs.mkdirSync(INTENTS_DIR, { recursive: true });
 fs.mkdirSync(FILES_DIR, { recursive: true });
+fs.mkdirSync(RELAY_UPLOADS_DIR, { recursive: true });
 fs.mkdirSync(FILE_HOLDER_DIR, { recursive: true });
 fs.mkdirSync(USERS_DIR, { recursive: true });
 fs.mkdirSync(GROUPS_DIR, { recursive: true });
@@ -5992,6 +6788,7 @@ function finalizeGroupRecipientCopies(primaryIntent, options = {}) {
 
 function cleanupStalledTransfers() {
   const now = Date.now();
+  pruneAccountRelayUploadSessions();
   for (const [intentId, t] of activeTransfers.entries()) {
     if (!intentId || !t) continue;
     const baseTimeout = Number.isFinite(TRANSFER_IDLE_TIMEOUT_MS) ? TRANSFER_IDLE_TIMEOUT_MS : 180000;
