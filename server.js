@@ -191,6 +191,24 @@ function chooseObjectMultipartPartSize(expectedBytes = 0, mime = "") {
   }
   return Math.max(tunedPartSize, maxPartSizeByCount);
 }
+
+function normalizeDiagnosticUploadPlan(raw = null) {
+  if (!IS_STAGING_DEPLOY || !raw || typeof raw !== "object") return null;
+  const mode = String(raw.mode || "").trim().toLowerCase();
+  if (mode !== "single" && mode !== "multipart") return null;
+  const normalized = { mode };
+  if (mode === "multipart") {
+    const partSize = Number(raw.partSize || 0);
+    if (Number.isFinite(partSize) && partSize >= 5 * 1024 * 1024 && partSize <= 64 * 1024 * 1024) {
+      normalized.partSize = Math.floor(partSize);
+    }
+    const maxConcurrency = Number(raw.maxConcurrency || 0);
+    if (Number.isFinite(maxConcurrency) && maxConcurrency >= 1) {
+      normalized.maxConcurrency = Math.max(1, Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX, Math.floor(maxConcurrency)));
+    }
+  }
+  return normalized;
+}
 const OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS = Math.max(
   1000,
   Number(process.env.OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS || 30 * 1000)
@@ -2781,6 +2799,26 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (IS_STAGING_DEPLOY && req.method === "GET" && url.pathname === "/upload-bench.html") {
+      const benchPath = path.join(__dirname, "public", "upload-bench.html");
+      let payload = "";
+      try {
+        payload = fs.readFileSync(benchPath, "utf8");
+      } catch {
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" });
+        res.end("Not found");
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        "pragma": "no-cache",
+        "expires": "0"
+      });
+      res.end(payload);
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/api/account/badge") {
       setCors(res);
       const username = extractUsernameFromRequest(req, url);
@@ -3346,7 +3384,10 @@ const server = http.createServer(async (req, res) => {
       const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${safeName}`;
       const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName);
       const hintedUploadId = String(body?.uploadId || "").trim();
-      const shouldUseMultipart = expectedBytes >= objectMultipartThresholdForMime(mime);
+      const diagnosticUploadPlan = normalizeDiagnosticUploadPlan(body?.diagnosticUploadPlan);
+      const shouldUseMultipart = diagnosticUploadPlan?.mode
+        ? diagnosticUploadPlan.mode === "multipart"
+        : expectedBytes >= objectMultipartThresholdForMime(mime);
       let existingSession = normalizeObjectUploadSession(intent.objectUploadSession);
       let canReuseExisting = Boolean(
         existingSession &&
@@ -3469,7 +3510,10 @@ const server = http.createServer(async (req, res) => {
       let uploadPlan = null;
       let objectUploadSession = null;
       if (useMultipart) {
-        const partSize = chooseObjectMultipartPartSize(expectedBytes, mime);
+        const partSize = Math.max(
+          5 * 1024 * 1024,
+          Number(diagnosticUploadPlan?.partSize || chooseObjectMultipartPartSize(expectedBytes, mime))
+        );
         const totalParts = Math.max(1, Math.ceil(expectedBytes / partSize));
         const recommendedConcurrency = expectedBytes >= 1024 * 1024 * 1024
           ? 12
@@ -3480,7 +3524,11 @@ const server = http.createServer(async (req, res) => {
               : (expectedBytes >= 32 * 1024 * 1024 ? 8 : 4)));
         const maxConcurrency = Math.max(
           1,
-          Math.min(OBJECT_MULTIPART_CLIENT_CONCURRENCY, recommendedConcurrency, totalParts)
+          Math.min(
+            OBJECT_MULTIPART_CLIENT_CONCURRENCY,
+            Number(diagnosticUploadPlan?.maxConcurrency || recommendedConcurrency),
+            totalParts
+          )
         );
         const multipart = await objectStorage.createMultipartUpload(objectKey, mime);
         if (!multipart?.uploadId) {
@@ -3559,7 +3607,8 @@ const server = http.createServer(async (req, res) => {
         multipartThresholdBytes: objectMultipartThresholdForMime(mime),
         partSize: Number(objectUploadSession?.partSize || 0),
         totalParts: Number(objectUploadSession?.totalParts || 1),
-        maxConcurrency: Number(objectUploadSession?.maxConcurrency || 1)
+        maxConcurrency: Number(objectUploadSession?.maxConcurrency || 1),
+        diagnosticUploadPlan: diagnosticUploadPlan || null
       });
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       res.end(JSON.stringify({

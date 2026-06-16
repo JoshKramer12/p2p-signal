@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Merm STAGING Upload Bench</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #10203a;
+      --muted: #607089;
+      --accent: #0d9488;
+      --border: #d8e1ee;
+    }
+    body {
+      margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      background: linear-gradient(180deg, #eef4ff 0%, var(--bg) 100%);
+      color: var(--text);
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 12px 30px rgba(16, 32, 58, 0.08);
+      margin-bottom: 18px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    button {
+      margin-top: 16px;
+      border: 0;
+      border-radius: 999px;
+      background: var(--accent);
+      color: #fff;
+      font: inherit;
+      padding: 12px 18px;
+      cursor: pointer;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.45;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel">
+      <h1>Merm STAGING Upload Bench</h1>
+      <p id="status">Preparing browser-side upload benchmark…</p>
+      <button id="runBtn" type="button">Run Again</button>
+    </section>
+    <section class="panel">
+      <pre id="output">Waiting…</pre>
+    </section>
+  </main>
+  <script>
+    const FILE_SIZE_BYTES = 23 * 1024 * 1024;
+    const FILE_NAME = "bench-23mb.mp4";
+    const HTTP_BASE_URL = window.location.origin;
+    const WS_URL = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`;
+    const RUNS = [
+      { label: "single-xhr", diagnosticUploadPlan: { mode: "single" }, transport: "xhr", concurrency: 1 },
+      { label: "single-fetch", diagnosticUploadPlan: { mode: "single" }, transport: "fetch", concurrency: 1 },
+      { label: "multipart-8mb-xhr-3", diagnosticUploadPlan: { mode: "multipart", partSize: 8 * 1024 * 1024, maxConcurrency: 3 }, transport: "xhr", concurrency: 3 }
+    ];
+
+    const statusEl = document.getElementById("status");
+    const outputEl = document.getElementById("output");
+    const runBtn = document.getElementById("runBtn");
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function appendLine(text = "") {
+      outputEl.textContent += `${text}\n`;
+    }
+
+    function resetOutput() {
+      outputEl.textContent = "";
+    }
+
+    function fmtSeconds(ms = 0) {
+      return (Math.max(0, Number(ms || 0)) / 1000).toFixed(2);
+    }
+
+    function fmtMbps(bytes = 0, ms = 1) {
+      const bps = Math.max(0, Number(bytes || 0)) / Math.max(0.001, Number(ms || 0) / 1000);
+      return (bps * 8 / 1000000).toFixed(1);
+    }
+
+    function wait(ms = 0) {
+      return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms || 0))));
+    }
+
+    function parseRetryAfterMs(value = "") {
+      const seconds = Number(String(value || "").trim());
+      if (Number.isFinite(seconds) && seconds > 0) return Math.min(10000, Math.round(seconds * 1000));
+      return 2000;
+    }
+
+    function makeBenchFile() {
+      const bytes = new Uint8Array(FILE_SIZE_BYTES);
+      const blob = new Blob([bytes], { type: "video/mp4" });
+      return new File([blob], FILE_NAME, { type: "video/mp4", lastModified: Date.now() });
+    }
+
+    async function jsonReq(pathname, {
+      method = "GET",
+      headers = {},
+      body = null,
+      timeoutMs = 0
+    } = {}) {
+      const controller = timeoutMs > 0 ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+      try {
+        const res = await fetch(`${HTTP_BASE_URL}${pathname}`, {
+          method,
+          headers: {
+            "content-type": "application/json",
+            ...headers
+          },
+          body: body != null ? JSON.stringify(body) : undefined,
+          signal: controller?.signal,
+          cache: "no-store"
+        });
+        const text = await res.text();
+        let payload = null;
+        try { payload = text ? JSON.parse(text) : null; } catch {}
+        if (!res.ok) {
+          const err = new Error(String(payload?.message || `HTTP ${res.status}`));
+          err.status = res.status;
+          err.payload = payload;
+          err.headers = Object.fromEntries(res.headers.entries());
+          throw err;
+        }
+        return payload || {};
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    function connectWs() {
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(WS_URL);
+        const timer = setTimeout(() => reject(new Error("WebSocket connect timed out")), 15000);
+        ws.addEventListener("open", () => {
+          clearTimeout(timer);
+          resolve(ws);
+        }, { once: true });
+        ws.addEventListener("error", (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }, { once: true });
+      });
+    }
+
+    function waitForMessage(ws, predicate, timeoutMs, label) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+        const onMessage = (event) => {
+          let payload = null;
+          try { payload = JSON.parse(String(event.data || "")); } catch { return; }
+          if (!predicate(payload)) return;
+          cleanup();
+          resolve(payload);
+        };
+        const onClose = () => {
+          cleanup();
+          reject(new Error("WebSocket closed"));
+        };
+        const cleanup = () => {
+          clearTimeout(timer);
+          ws.removeEventListener("message", onMessage);
+          ws.removeEventListener("close", onClose);
+        };
+        ws.addEventListener("message", onMessage);
+        ws.addEventListener("close", onClose, { once: true });
+      });
+    }
+
+    async function signupAndLogin(ws) {
+      const suffix = `${Date.now()}${Math.floor(Math.random() * 100000)}`;
+      const username = `browser_bench_${suffix}`.slice(0, 32);
+      const password = `bench-${suffix}-pw`;
+      ws.send(JSON.stringify({
+        type: "auth_signup",
+        username,
+        password,
+        name: "Browser Bench"
+      }));
+      const signup = await waitForMessage(ws, (msg) => msg.type === "signup_ok" || msg.type === "error", 15000, "signup");
+      if (signup.type === "error") throw new Error(String(signup.message || "signup failed"));
+      ws.send(JSON.stringify({
+        type: "auth_login",
+        username,
+        password,
+        client: "web"
+      }));
+      const login = await waitForMessage(ws, (msg) => msg.type === "login_ok" || msg.type === "error", 15000, "login");
+      if (login.type === "error") throw new Error(String(login.message || "login failed"));
+      return {
+        username,
+        sessionToken: String(login.sessionToken || "").trim()
+      };
+    }
+
+    async function createSelfIntent(ws, username, fileSize) {
+      const clientIntentId = `browser-bench-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const waitAck = waitForMessage(
+        ws,
+        (msg) => (msg.type === "intent_ok" && msg.clientIntentId === clientIntentId) || msg.type === "error",
+        15000,
+        "intent_ok"
+      );
+      ws.send(JSON.stringify({
+        type: "send_intent",
+        clientIntentId,
+        to: username,
+        fileName: FILE_NAME,
+        fileSize,
+        uploadBytesExpected: fileSize,
+        note: "browser upload benchmark"
+      }));
+      const ack = await waitAck;
+      if (ack.type === "error") throw new Error(String(ack.message || "intent failed"));
+      return String(ack.intentId || "").trim();
+    }
+
+    function xhrPut(url, blob, headers = {}, onProgress = null, timeoutMs = 0) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", url, true);
+        if (timeoutMs > 0) xhr.timeout = timeoutMs;
+        Object.entries(headers || {}).forEach(([key, value]) => {
+          if (!key || value == null || value === "") return;
+          try { xhr.setRequestHeader(key, String(value)); } catch {}
+        });
+        xhr.upload.onprogress = (evt) => {
+          if (typeof onProgress === "function") {
+            try { onProgress(Math.max(0, Number(evt.loaded || 0)), Math.max(0, Number(evt.total || blob.size || 0))); } catch {}
+          }
+        };
+        xhr.onerror = () => reject(new Error(`XHR upload failed readyState=${xhr.readyState} status=${xhr.status || 0}`));
+        xhr.ontimeout = () => reject(new Error("XHR upload timed out"));
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve({
+              etag: String(xhr.getResponseHeader("ETag") || "").replace(/"/g, "")
+            });
+            return;
+          }
+          reject(new Error(`XHR upload failed (${xhr.status || 0})`));
+        };
+        xhr.send(blob);
+      });
+    }
+
+    async function fetchPut(url, blob, headers = {}, timeoutMs = 0) {
+      const controller = timeoutMs > 0 ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+      try {
+        const res = await fetch(url, {
+          method: "PUT",
+          headers: headers || {},
+          body: blob,
+          signal: controller?.signal,
+          cache: "no-store"
+        });
+        if (!res.ok) {
+          throw new Error(`fetch upload failed (${res.status || 0})`);
+        }
+        return {
+          etag: String(res.headers.get("etag") || "").replace(/"/g, "")
+        };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    async function runSingleUpload(file, authHeaders, intentId, runConfig) {
+      const initStart = performance.now();
+      const initPayload = await jsonReq(`/api/intents/${encodeURIComponent(intentId)}/object-upload/init`, {
+        method: "POST",
+        headers: authHeaders,
+        body: {
+          name: FILE_NAME,
+          size: file.size,
+          diagnosticUploadPlan: runConfig.diagnosticUploadPlan
+        },
+        timeoutMs: 20000
+      });
+      const initMs = performance.now() - initStart;
+      const uploadUrl = String(initPayload?.upload?.url || "").trim();
+      const uploadHost = uploadUrl ? new URL(uploadUrl).hostname : "";
+      let firstProgressMs = 0;
+      const uploadStart = performance.now();
+      if (runConfig.transport === "fetch") {
+        await fetchPut(uploadUrl, file, initPayload?.upload?.headers || {}, 180000);
+      } else {
+        await xhrPut(uploadUrl, file, initPayload?.upload?.headers || {}, (loaded) => {
+          if (!firstProgressMs && loaded > 0) {
+            firstProgressMs = Math.max(0, performance.now() - uploadStart);
+          }
+        }, 180000);
+      }
+      const uploadMs = performance.now() - uploadStart;
+      return {
+        initPayload,
+        initMs,
+        uploadHost,
+        firstProgressMs,
+        uploadMs
+      };
+    }
+
+    async function runMultipartUpload(file, authHeaders, intentId, runConfig) {
+      const initStart = performance.now();
+      const initPayload = await jsonReq(`/api/intents/${encodeURIComponent(intentId)}/object-upload/init`, {
+        method: "POST",
+        headers: authHeaders,
+        body: {
+          name: FILE_NAME,
+          size: file.size,
+          diagnosticUploadPlan: runConfig.diagnosticUploadPlan
+        },
+        timeoutMs: 20000
+      });
+      const initMs = performance.now() - initStart;
+      const uploadId = String(initPayload?.upload?.uploadId || "").trim();
+      const partSize = Math.max(5 * 1024 * 1024, Number(initPayload?.upload?.partSize || 0));
+      const totalParts = Math.max(1, Number(initPayload?.upload?.totalParts || Math.ceil(file.size / partSize)));
+      const requestedPartNumbers = Array.from({ length: totalParts }, (_, idx) => idx + 1);
+      const planStart = performance.now();
+      const partsPayload = await jsonReq(`/api/intents/${encodeURIComponent(intentId)}/object-upload/parts`, {
+        method: "POST",
+        headers: authHeaders,
+        body: {
+          uploadId,
+          partNumbers: requestedPartNumbers
+        },
+        timeoutMs: 20000
+      });
+      const planMs = performance.now() - planStart;
+      const planCache = new Map();
+      for (const row of Array.isArray(partsPayload?.parts) ? partsPayload.parts : []) {
+        const partNumber = Math.max(1, Number(row?.partNumber || 0));
+        if (!Number.isFinite(partNumber) || !row?.upload?.url) continue;
+        planCache.set(partNumber, row.upload);
+      }
+      const firstUpload = planCache.get(1) || null;
+      const uploadHost = firstUpload?.url ? new URL(firstUpload.url).hostname : "";
+      let firstProgressMs = 0;
+      const completedParts = [];
+      let nextIndex = 0;
+      const uploadStart = performance.now();
+      const worker = async () => {
+        while (true) {
+          const idx = nextIndex;
+          nextIndex += 1;
+          if (idx >= totalParts) return;
+          const partNumber = idx + 1;
+          const start = (partNumber - 1) * partSize;
+          const end = Math.min(file.size, start + partSize);
+          const partBlob = file.slice(start, end, file.type || "application/octet-stream");
+          const partResult = await xhrPut(planCache.get(partNumber).url, partBlob, planCache.get(partNumber).headers || {}, (loaded) => {
+            if (!firstProgressMs && loaded > 0) {
+              firstProgressMs = Math.max(0, performance.now() - uploadStart);
+            }
+          }, 180000);
+          completedParts.push({
+            partNumber,
+            etag: String(partResult?.etag || "").trim(),
+            size: partBlob.size
+          });
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(runConfig.concurrency || 3, totalParts) }, () => worker()));
+      const uploadMs = performance.now() - uploadStart;
+      completedParts.sort((a, b) => a.partNumber - b.partNumber);
+      return {
+        initPayload,
+        initMs,
+        uploadHost,
+        firstProgressMs,
+        planMs,
+        uploadMs,
+        completedParts,
+        uploadId,
+        totalParts,
+        partSize
+      };
+    }
+
+    async function finalizeUpload(authHeaders, intentId, body, ws) {
+      const completeStart = performance.now();
+      let syncMs = 0;
+      const waitUploadDone = waitForMessage(
+        ws,
+        (msg) => (msg.type === "upload_done" && String(msg.intentId || "").trim() === intentId) || msg.type === "error",
+        15000,
+        "upload_done"
+      ).then((msg) => {
+        syncMs = Math.max(0, performance.now() - completeStart);
+        return msg;
+      }).catch(() => null);
+      let attempts = 0;
+      while (true) {
+        attempts += 1;
+        try {
+          await jsonReq(`/api/intents/${encodeURIComponent(intentId)}/object-upload/complete`, {
+            method: "POST",
+            headers: authHeaders,
+            body,
+            timeoutMs: 45000
+          });
+          break;
+        } catch (err) {
+          const retryable = Boolean(err?.payload?.retryable) || Number(err?.status || 0) === 503;
+          if (!retryable || attempts >= 4) throw err;
+          await wait(parseRetryAfterMs(err?.headers?.["retry-after"]));
+        }
+      }
+      const completeMs = performance.now() - completeStart;
+      await waitUploadDone;
+      return { completeMs, syncMs };
+    }
+
+    async function runScenario(runConfig) {
+      const file = makeBenchFile();
+      const ws = await connectWs();
+      const authStart = performance.now();
+      const auth = await signupAndLogin(ws);
+      const authMs = performance.now() - authStart;
+      const authHeaders = {
+        "x-merm-username": auth.username,
+        "x-merm-session": auth.sessionToken
+      };
+      try {
+        const intentStart = performance.now();
+        const intentId = await createSelfIntent(ws, auth.username, file.size);
+        const intentMs = performance.now() - intentStart;
+        let result = {
+          label: runConfig.label,
+          requestedMode: String(runConfig?.diagnosticUploadPlan?.mode || ""),
+          transport: runConfig.transport,
+          authMs,
+          intentMs,
+          planMs: 0,
+          firstProgressMs: 0
+        };
+        let finalizeBody = { size: file.size };
+        if (runConfig.diagnosticUploadPlan.mode === "multipart") {
+          const multipart = await runMultipartUpload(file, authHeaders, intentId, runConfig);
+          result = {
+            ...result,
+            resolvedMode: String(multipart?.initPayload?.upload?.mode || ""),
+            uploadHost: multipart.uploadHost,
+            partSize: multipart.partSize,
+            totalParts: multipart.totalParts,
+            serverConcurrency: Number(multipart?.initPayload?.upload?.maxConcurrency || 0),
+            initMs: multipart.initMs,
+            planMs: multipart.planMs,
+            firstProgressMs: multipart.firstProgressMs,
+            uploadMs: multipart.uploadMs
+          };
+          finalizeBody = {
+            uploadId: multipart.uploadId,
+            size: file.size,
+            parts: multipart.completedParts
+          };
+        } else {
+          const single = await runSingleUpload(file, authHeaders, intentId, runConfig);
+          result = {
+            ...result,
+            resolvedMode: String(single?.initPayload?.upload?.mode || ""),
+            uploadHost: single.uploadHost,
+            partSize: file.size,
+            totalParts: 1,
+            serverConcurrency: Number(single?.initPayload?.upload?.maxConcurrency || 1),
+            initMs: single.initMs,
+            firstProgressMs: single.firstProgressMs,
+            uploadMs: single.uploadMs
+          };
+        }
+        const finalized = await finalizeUpload(authHeaders, intentId, finalizeBody, ws);
+        result.completeMs = finalized.completeMs;
+        result.syncMs = finalized.syncMs;
+        result.totalMs = result.authMs + result.intentMs + result.initMs + result.planMs + result.uploadMs + result.completeMs;
+        result.throughputMbps = fmtMbps(file.size, result.uploadMs);
+        result.endToEndMbps = fmtMbps(file.size, result.totalMs);
+        return result;
+      } finally {
+        try { ws.close(); } catch {}
+      }
+    }
+
+    function renderResult(run) {
+      appendLine(`[${run.label}] requested=${run.requestedMode} resolved=${run.resolvedMode} transport=${run.transport}`);
+      appendLine(`[${run.label}] upload_host=${run.uploadHost || "unknown"} parts=${run.totalParts} partSize=${run.partSize} serverHint=${run.serverConcurrency}`);
+      appendLine(`[${run.label}] timings_s auth=${fmtSeconds(run.authMs)} intent=${fmtSeconds(run.intentMs)} init=${fmtSeconds(run.initMs)} first_progress=${fmtSeconds(run.firstProgressMs)} plan=${fmtSeconds(run.planMs)} upload=${fmtSeconds(run.uploadMs)} complete=${fmtSeconds(run.completeMs)} sync=${fmtSeconds(run.syncMs)} total=${fmtSeconds(run.totalMs)}`);
+      appendLine(`[${run.label}] throughput_mbps upload=${run.throughputMbps} end_to_end=${run.endToEndMbps}`);
+      appendLine("");
+    }
+
+    async function main() {
+      runBtn.disabled = true;
+      resetOutput();
+      appendLine(`Browser: ${navigator.userAgent}`);
+      appendLine(`Origin: ${window.location.origin}`);
+      appendLine(`File size bytes: ${FILE_SIZE_BYTES}`);
+      appendLine("");
+      const startedAt = performance.now();
+      for (const runConfig of RUNS) {
+        try {
+          setStatus(`Running ${runConfig.label}…`);
+          const run = await runScenario(runConfig);
+          renderResult(run);
+        } catch (err) {
+          appendLine(`[${runConfig.label}] ERROR: ${String(err?.stack || err?.message || err)}`);
+          appendLine("");
+        }
+      }
+      setStatus(`Finished in ${fmtSeconds(performance.now() - startedAt)}s`);
+      runBtn.disabled = false;
+    }
+
+    runBtn.addEventListener("click", () => {
+      main().catch((err) => {
+        appendLine(`FATAL: ${String(err?.stack || err?.message || err)}`);
+        runBtn.disabled = false;
+      });
+    });
+
+    main().catch((err) => {
+      appendLine(`FATAL: ${String(err?.stack || err?.message || err)}`);
+      runBtn.disabled = false;
+    });
+  </script>
+</body>
+</html>

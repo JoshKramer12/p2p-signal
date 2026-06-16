@@ -16,6 +16,9 @@ function parseArgs(argv = []) {
     label: "",
     timeoutMs: 180000,
     retries: 3,
+    forceMode: "",
+    partSize: 0,
+    maxConcurrency: 0,
     hostOverrides: {}
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -29,6 +32,9 @@ function parseArgs(argv = []) {
     if (arg === "--label" && next) { out.label = String(next); i += 1; continue; }
     if (arg === "--timeout-ms" && next) { out.timeoutMs = Math.max(0, Number(next) || 0); i += 1; continue; }
     if (arg === "--retries" && next) { out.retries = Math.max(1, Number(next) || 1); i += 1; continue; }
+    if (arg === "--force-mode" && next) { out.forceMode = String(next).trim().toLowerCase(); i += 1; continue; }
+    if (arg === "--part-size" && next) { out.partSize = Math.max(0, Number(next) || 0); i += 1; continue; }
+    if (arg === "--max-concurrency" && next) { out.maxConcurrency = Math.max(0, Number(next) || 0); i += 1; continue; }
     if (arg === "--resolve-host" && next) {
       const [host, ip] = String(next).split("=");
       if (host && ip) out.hostOverrides[String(host).trim().toLowerCase()] = String(ip).trim();
@@ -243,6 +249,17 @@ function parseRetryAfterMs(value = "") {
   return 2000;
 }
 
+function buildDiagnosticUploadPlan(opts = {}) {
+  const mode = String(opts.forceMode || "").trim().toLowerCase();
+  if (mode !== "single" && mode !== "multipart") return undefined;
+  const plan = { mode };
+  if (mode === "multipart") {
+    if (Number(opts.partSize || 0) > 0) plan.partSize = Math.floor(Number(opts.partSize || 0));
+    if (Number(opts.maxConcurrency || 0) > 0) plan.maxConcurrency = Math.floor(Number(opts.maxConcurrency || 0));
+  }
+  return plan;
+}
+
 async function runOnce(opts) {
   const stat = await fs.stat(opts.file);
   const fileSize = Number(stat.size || 0);
@@ -269,12 +286,20 @@ async function runOnce(opts) {
       headers: authHeaders,
       body: {
         name: fileName,
-        size: fileSize
+        size: fileSize,
+        diagnosticUploadPlan: buildDiagnosticUploadPlan(opts)
       },
       timeoutMs: opts.timeoutMs
     });
     const initMs = performance.now() - initStart;
     const mode = String(initPayload?.upload?.mode || "").trim().toLowerCase();
+    const uploadHost = (() => {
+      const directUrl = String(initPayload?.upload?.url || "").trim();
+      if (directUrl) {
+        try { return new URL(directUrl).hostname || ""; } catch {}
+      }
+      return "";
+    })();
     if (mode === "single") {
       const upload = initPayload?.upload || {};
       if (!upload?.url) throw new Error("Missing single upload URL");
@@ -285,6 +310,16 @@ async function runOnce(opts) {
       const uploadMs = performance.now() - uploadStart;
 
       const completeStart = performance.now();
+      let uploadDoneReceivedMs = 0;
+      const waitUploadDone = waitForMessage(
+        ws,
+        (msg) => (msg.type === "upload_done" && String(msg.intentId || "").trim() === intentId) || msg.type === "error",
+        Math.min(15000, opts.timeoutMs),
+        "upload_done"
+      ).then((msg) => {
+        uploadDoneReceivedMs = Math.max(0, performance.now() - completeStart);
+        return msg;
+      }).catch(() => null);
       await jsonReq(opts.httpBaseUrl, `/api/intents/${encodeURIComponent(intentId)}/object-upload/complete`, {
         method: "POST",
         headers: authHeaders,
@@ -294,6 +329,8 @@ async function runOnce(opts) {
         timeoutMs: opts.timeoutMs
       });
       const completeMs = performance.now() - completeStart;
+      const uploadDoneMsg = await waitUploadDone;
+      const syncMs = uploadDoneMsg ? uploadDoneReceivedMs : 0;
 
       return {
         mode,
@@ -302,12 +339,14 @@ async function runOnce(opts) {
         partSize: fileSize,
         serverMaxConcurrency: 1,
         usedConcurrency: 1,
+        uploadHost,
         authMs,
         intentMs,
         initMs,
         planMs: 0,
         uploadMs,
         completeMs,
+        syncMs,
         totalMs: authMs + intentMs + initMs + uploadMs + completeMs,
         uploadedBytes: fileSize,
         p50PartMs: uploadMs,
@@ -343,6 +382,14 @@ async function runOnce(opts) {
       if (!Number.isFinite(partNumber) || !row?.upload?.url) continue;
       planCache.set(partNumber, row.upload);
     }
+    const multipartUploadHost = (() => {
+      const firstUpload = planCache.get(1) || null;
+      const directUrl = String(firstUpload?.url || "").trim();
+      if (directUrl) {
+        try { return new URL(directUrl).hostname || ""; } catch {}
+      }
+      return uploadHost;
+    })();
 
     const fh = await fs.open(opts.file, "r");
     const completedParts = [];
@@ -414,6 +461,16 @@ async function runOnce(opts) {
     const completeStart = performance.now();
     const etagCount = completedParts.filter((part) => String(part?.etag || "").trim()).length;
     console.log(`[bench_debug] multipart uploadedParts=${completedParts.length} etagCount=${etagCount} uploadedBytes=${uploadedBytes}`);
+    let uploadDoneReceivedMs = 0;
+    const waitUploadDone = waitForMessage(
+      ws,
+      (msg) => (msg.type === "upload_done" && String(msg.intentId || "").trim() === intentId) || msg.type === "error",
+      Math.min(15000, opts.timeoutMs),
+      "upload_done"
+    ).then((msg) => {
+      uploadDoneReceivedMs = Math.max(0, performance.now() - completeStart);
+      return msg;
+    }).catch(() => null);
     let completeAttempt = 0;
     while (true) {
       completeAttempt += 1;
@@ -438,6 +495,8 @@ async function runOnce(opts) {
       }
     }
     const completeMs = performance.now() - completeStart;
+    const uploadDoneMsg = await waitUploadDone;
+    const syncMs = uploadDoneMsg ? uploadDoneReceivedMs : 0;
 
     partDurationsMs.sort((a, b) => a - b);
     const p50 = partDurationsMs.length ? partDurationsMs[Math.floor(partDurationsMs.length * 0.5)] : 0;
@@ -452,12 +511,14 @@ async function runOnce(opts) {
       partSize,
       serverMaxConcurrency,
       usedConcurrency: concurrency,
+      uploadHost: multipartUploadHost,
       authMs,
       intentMs,
       initMs,
       planMs,
       uploadMs,
       completeMs,
+      syncMs,
       totalMs: authMs + intentMs + initMs + planMs + uploadMs + completeMs,
       uploadedBytes,
       p50PartMs: p50,
@@ -475,7 +536,8 @@ function printResult(index, run, label = "") {
   const prefix = label ? `[${label}] ` : "";
   console.log(`${prefix}run=${index + 1}`);
   console.log(`${prefix}mode=${run.mode} size=${run.fileSize} parts=${run.totalParts} partSize=${run.partSize} serverHint=${run.serverMaxConcurrency} usedConcurrency=${run.usedConcurrency}`);
-  console.log(`${prefix}timings_s auth=${fmtSeconds(run.authMs)} intent=${fmtSeconds(run.intentMs)} init=${fmtSeconds(run.initMs)} plan=${fmtSeconds(run.planMs)} upload=${fmtSeconds(run.uploadMs)} complete=${fmtSeconds(run.completeMs)} total=${fmtSeconds(run.totalMs)}`);
+  console.log(`${prefix}upload_host=${run.uploadHost || "unknown"}`);
+  console.log(`${prefix}timings_s auth=${fmtSeconds(run.authMs)} intent=${fmtSeconds(run.intentMs)} init=${fmtSeconds(run.initMs)} plan=${fmtSeconds(run.planMs)} upload=${fmtSeconds(run.uploadMs)} complete=${fmtSeconds(run.completeMs)} sync=${fmtSeconds(run.syncMs)} total=${fmtSeconds(run.totalMs)}`);
   console.log(`${prefix}throughput_mbps upload=${fmtMbps(run.uploadedBytes, run.uploadMs)} end_to_end=${fmtMbps(run.uploadedBytes, run.totalMs)}`);
   console.log(`${prefix}part_latency_s p50=${fmtSeconds(run.p50PartMs)} p95=${fmtSeconds(run.p95PartMs)} max=${fmtSeconds(run.maxPartMs)} retries=${run.retryCount}`);
   console.log(`${prefix}intentId=${run.intentId}`);
