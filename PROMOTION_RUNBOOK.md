@@ -23,6 +23,22 @@ Production:
 - Runtime URL: `https://p2p-signal.fly.dev/runtime-config.js`
 - Branch: `main`
 
+## Fly Storage Safety Warning
+
+Do not run `fly storage create` for benchmark buckets from this staging repo unless you first verify the Fly app target and understand the secret side effects.
+
+Why:
+
+- This staging working copy still contains a local `fly.toml` with `app = 'p2p-signal'`.
+- `fly storage create` can use the current app context and automatically set `AWS_*` / `BUCKET_NAME` secrets on that app.
+- That means a bucket experiment can unexpectedly touch production secrets if the app target is not pinned correctly.
+
+Required rule:
+
+- Treat `fly storage create` as production-risky from staging repos.
+- Do not use it for benchmark buckets unless you explicitly verify `-a <expected-app>` and `-c <expected-config>` and confirm which app will receive secret updates.
+- Prefer creating benchmark buckets from an isolated shell or Tigris Dashboard instead of from a staging repo directory.
+
 ## Normal Bugfix Flow
 
 1. Make the fix in `/Users/josh/Desktop/p2p-signal-staging`.
