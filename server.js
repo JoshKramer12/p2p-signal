@@ -12,6 +12,7 @@ const yauzl = require("yauzl");
 const PORT = process.env.PORT || 8080;
 const MERM_DEPLOY_ENV = String(process.env.MERM_DEPLOY_ENV || "").trim().toLowerCase();
 const IS_STAGING_DEPLOY = MERM_DEPLOY_ENV === "staging";
+const STORAGE_DEFAULT_TARGET_ID = "default";
 
 function envAny(names = [], fallback = "") {
   for (const name of names) {
@@ -147,7 +148,7 @@ function normalizeStorageTargetId(raw = "") {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
-  return normalized || objectStorage.DEFAULT_PROFILE_ID;
+  return normalized || STORAGE_DEFAULT_TARGET_ID;
 }
 
 function enabledStorageTargets() {
