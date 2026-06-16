@@ -295,13 +295,16 @@ function embedProfileIdInObjectKey(objectKey = "", profileId = DEFAULT_PROFILE_I
 
 function resolveProfileIdFromStorageMetadata(source = null) {
   const input = source && typeof source === "object" ? source : {};
-  const explicitId = normalizeProfileId(
+  const explicitRaw = String(
     input.storageTargetId ||
     input.targetId ||
     input.profileId ||
     ""
-  );
-  if (explicitId && getProfile(explicitId)) return explicitId;
+  ).trim();
+  if (explicitRaw) {
+    const explicitId = normalizeProfileId(explicitRaw);
+    if (getProfile(explicitId)) return explicitId;
+  }
   return resolveProfileIdFromObjectKey(input.objectKey || input.storedObjectKey || "");
 }
 
