@@ -14,6 +14,9 @@ const {
 } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
+const DEFAULT_PROFILE_ID = "default";
+const STORAGE_TARGET_KEY_PREFIX = "__storage-target";
+
 function trimEnv(name = "", fallback = "") {
   return String(process.env[name] || fallback || "").trim();
 }
@@ -47,44 +50,213 @@ function sanitizeKeySegment(value = "") {
     .replace(/^-+|-+$/g, "") || "item";
 }
 
-let cachedClient = null;
+function normalizeProfileId(value = "") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized || DEFAULT_PROFILE_ID;
+}
 
-const config = {
-  bucket: trimEnvAny(["OBJECT_STORAGE_BUCKET", "BUCKET_NAME"]),
-  region: trimEnvAny(["OBJECT_STORAGE_REGION", "AWS_REGION"], "auto"),
-  endpoint: trimEnvAny(["OBJECT_STORAGE_ENDPOINT", "AWS_ENDPOINT_URL_S3"]),
-  accessKeyId: trimEnvAny(["OBJECT_STORAGE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"]),
-  secretAccessKey: trimEnvAny(["OBJECT_STORAGE_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"]),
-  forcePathStyle: envFlag("OBJECT_STORAGE_FORCE_PATH_STYLE", false),
-  uploadUrlTtlSec: Math.max(60, Number(process.env.OBJECT_STORAGE_UPLOAD_URL_TTL_SEC || 15 * 60)),
-  downloadUrlTtlSec: Math.max(60, Number(process.env.OBJECT_STORAGE_DOWNLOAD_URL_TTL_SEC || 15 * 60)),
-  prefix: normalizePrefix(trimEnv("OBJECT_STORAGE_PREFIX")),
-  intentPrefix: normalizePrefix(trimEnv("OBJECT_STORAGE_INTENT_PREFIX", "intents")),
-  fileHolderPrefix: normalizePrefix(trimEnv("OBJECT_STORAGE_FILE_HOLDER_PREFIX", "file-holder"))
-};
+function parseEndpointHost(value = "") {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    return String(new URL(raw).host || "").trim().toLowerCase();
+  } catch {
+    return raw
+      .replace(/^https?:\/\//i, "")
+      .replace(/\/.*$/, "")
+      .trim()
+      .toLowerCase();
+  }
+}
 
-function isEnabled() {
+function providerNameFromHost(host = "") {
+  const normalizedHost = String(host || "").trim().toLowerCase();
+  if (!normalizedHost) return "S3-compatible";
+  if (normalizedHost.includes("tigris")) return "Fly Tigris";
+  if (normalizedHost.includes("r2.cloudflarestorage.com")) return "Cloudflare R2";
+  if (normalizedHost.includes("amazonaws.com")) return "AWS S3";
+  return "S3-compatible";
+}
+
+function buildProfileLabel(providerName = "", region = "", profileId = DEFAULT_PROFILE_ID, isDefault = false) {
+  const base = String(providerName || "S3-compatible").trim();
+  const regionName = String(region || "").trim();
+  if (regionName && regionName.toLowerCase() !== "auto") {
+    return `${base} ${regionName}${isDefault ? " (control)" : ""}`;
+  }
+  return `${base}${isDefault ? " (control)" : ""}`;
+}
+
+function buildProfile(profileId = DEFAULT_PROFILE_ID, source = {}) {
+  const id = normalizeProfileId(profileId);
+  const endpointHost = parseEndpointHost(source.endpoint);
+  const providerName = String(source.providerName || "").trim() || providerNameFromHost(endpointHost);
+  const region = String(source.region || "auto").trim() || "auto";
+  const isDefault = id === DEFAULT_PROFILE_ID;
+  return {
+    id,
+    label: String(source.label || "").trim() || buildProfileLabel(providerName, region, id, isDefault),
+    providerName,
+    region,
+    bucket: String(source.bucket || "").trim(),
+    endpoint: String(source.endpoint || "").trim(),
+    endpointHost,
+    accessKeyId: String(source.accessKeyId || "").trim(),
+    secretAccessKey: String(source.secretAccessKey || "").trim(),
+    forcePathStyle: Boolean(source.forcePathStyle),
+    uploadUrlTtlSec: Math.max(60, Number(source.uploadUrlTtlSec || 15 * 60)),
+    downloadUrlTtlSec: Math.max(60, Number(source.downloadUrlTtlSec || 15 * 60)),
+    prefix: normalizePrefix(source.prefix),
+    intentPrefix: normalizePrefix(source.intentPrefix || "intents"),
+    fileHolderPrefix: normalizePrefix(source.fileHolderPrefix || "file-holder")
+  };
+}
+
+function loadDefaultProfile() {
+  return buildProfile(DEFAULT_PROFILE_ID, {
+    label: trimEnv("OBJECT_STORAGE_LABEL"),
+    providerName: trimEnv("OBJECT_STORAGE_PROVIDER_NAME"),
+    bucket: trimEnvAny(["OBJECT_STORAGE_BUCKET", "BUCKET_NAME"]),
+    region: trimEnvAny(["OBJECT_STORAGE_REGION", "AWS_REGION"], "auto"),
+    endpoint: trimEnvAny(["OBJECT_STORAGE_ENDPOINT", "AWS_ENDPOINT_URL_S3"]),
+    accessKeyId: trimEnvAny(["OBJECT_STORAGE_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"]),
+    secretAccessKey: trimEnvAny(["OBJECT_STORAGE_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"]),
+    forcePathStyle: envFlag("OBJECT_STORAGE_FORCE_PATH_STYLE", false),
+    uploadUrlTtlSec: Number(process.env.OBJECT_STORAGE_UPLOAD_URL_TTL_SEC || 15 * 60),
+    downloadUrlTtlSec: Number(process.env.OBJECT_STORAGE_DOWNLOAD_URL_TTL_SEC || 15 * 60),
+    prefix: trimEnv("OBJECT_STORAGE_PREFIX"),
+    intentPrefix: trimEnv("OBJECT_STORAGE_INTENT_PREFIX", "intents"),
+    fileHolderPrefix: trimEnv("OBJECT_STORAGE_FILE_HOLDER_PREFIX", "file-holder")
+  });
+}
+
+function parseBenchmarkTargetIds() {
+  return Array.from(new Set(
+    String(process.env.OBJECT_STORAGE_BENCH_TARGETS || "")
+      .split(",")
+      .map((value) => normalizeProfileId(value))
+      .filter((value) => value && value !== DEFAULT_PROFILE_ID)
+  ));
+}
+
+function benchmarkEnvPrefix(profileId = "") {
+  return `OBJECT_STORAGE_BENCH_${String(profileId || "").trim().toUpperCase()}_`;
+}
+
+function loadBenchmarkProfiles(defaultProfile) {
+  return parseBenchmarkTargetIds().map((profileId) => {
+    const prefix = benchmarkEnvPrefix(profileId);
+    return buildProfile(profileId, {
+      label: trimEnv(`${prefix}LABEL`),
+      providerName: trimEnv(`${prefix}PROVIDER_NAME`),
+      bucket: trimEnv(`${prefix}BUCKET`),
+      region: trimEnv(`${prefix}REGION`, defaultProfile.region || "auto"),
+      endpoint: trimEnv(`${prefix}ENDPOINT`),
+      accessKeyId: trimEnv(`${prefix}ACCESS_KEY_ID`),
+      secretAccessKey: trimEnv(`${prefix}SECRET_ACCESS_KEY`),
+      forcePathStyle: envFlag(`${prefix}FORCE_PATH_STYLE`, defaultProfile.forcePathStyle),
+      uploadUrlTtlSec: Number(process.env[`${prefix}UPLOAD_URL_TTL_SEC`] || defaultProfile.uploadUrlTtlSec),
+      downloadUrlTtlSec: Number(process.env[`${prefix}DOWNLOAD_URL_TTL_SEC`] || defaultProfile.downloadUrlTtlSec),
+      prefix: trimEnv(`${prefix}PREFIX`, defaultProfile.prefix),
+      intentPrefix: trimEnv(`${prefix}INTENT_PREFIX`, defaultProfile.intentPrefix),
+      fileHolderPrefix: trimEnv(`${prefix}FILE_HOLDER_PREFIX`, defaultProfile.fileHolderPrefix)
+    });
+  });
+}
+
+const defaultProfile = loadDefaultProfile();
+const benchmarkProfiles = loadBenchmarkProfiles(defaultProfile);
+const profilesById = new Map([
+  [defaultProfile.id, defaultProfile],
+  ...benchmarkProfiles.map((profile) => [profile.id, profile])
+]);
+const cachedClients = new Map();
+
+function getProfile(profileId = DEFAULT_PROFILE_ID) {
+  const id = normalizeProfileId(profileId);
+  return profilesById.get(id) || null;
+}
+
+function isEnabled(profileId = DEFAULT_PROFILE_ID) {
+  const profile = getProfile(profileId);
   return Boolean(
-    config.bucket &&
-    config.endpoint &&
-    config.accessKeyId &&
-    config.secretAccessKey
+    profile &&
+    profile.bucket &&
+    profile.endpoint &&
+    profile.accessKeyId &&
+    profile.secretAccessKey
   );
 }
 
-function client() {
-  if (!isEnabled()) return null;
-  if (cachedClient) return cachedClient;
-  cachedClient = new S3Client({
-    region: config.region || "auto",
-    endpoint: config.endpoint,
-    forcePathStyle: config.forcePathStyle,
+function describeProfile(profileId = DEFAULT_PROFILE_ID) {
+  const profile = getProfile(profileId);
+  if (!profile) return null;
+  return {
+    id: profile.id,
+    label: profile.label,
+    providerName: profile.providerName,
+    region: profile.region,
+    endpointHost: profile.endpointHost,
+    forcePathStyle: Boolean(profile.forcePathStyle),
+    enabled: isEnabled(profile.id),
+    isDefault: profile.id === DEFAULT_PROFILE_ID
+  };
+}
+
+function listUploadBenchmarkTargets() {
+  return [defaultProfile, ...benchmarkProfiles].map((profile) => describeProfile(profile.id));
+}
+
+function resolveProfileIdFromObjectKey(objectKey = "") {
+  const key = String(objectKey || "").trim().replace(/^\/+/, "");
+  if (!key) return DEFAULT_PROFILE_ID;
+  const marker = `${STORAGE_TARGET_KEY_PREFIX}/`;
+  if (!key.startsWith(marker)) return DEFAULT_PROFILE_ID;
+  const remainder = key.slice(marker.length);
+  const slashIndex = remainder.indexOf("/");
+  if (slashIndex <= 0) return DEFAULT_PROFILE_ID;
+  const profileId = normalizeProfileId(remainder.slice(0, slashIndex));
+  return getProfile(profileId) ? profileId : DEFAULT_PROFILE_ID;
+}
+
+function describeObjectKeyTarget(objectKey = "") {
+  return describeProfile(resolveProfileIdFromObjectKey(objectKey));
+}
+
+function embedProfileIdInObjectKey(objectKey = "", profileId = DEFAULT_PROFILE_ID) {
+  const key = String(objectKey || "").trim().replace(/^\/+/, "");
+  const id = normalizeProfileId(profileId);
+  if (!key || id === DEFAULT_PROFILE_ID) return key;
+  return `${STORAGE_TARGET_KEY_PREFIX}/${id}/${key}`;
+}
+
+function client(profileId = DEFAULT_PROFILE_ID) {
+  const profile = getProfile(profileId);
+  if (!profile || !isEnabled(profile.id)) return null;
+  if (cachedClients.has(profile.id)) return cachedClients.get(profile.id);
+  const nextClient = new S3Client({
+    region: profile.region || "auto",
+    endpoint: profile.endpoint,
+    forcePathStyle: profile.forcePathStyle,
     credentials: {
-      accessKeyId: config.accessKeyId,
-      secretAccessKey: config.secretAccessKey
+      accessKeyId: profile.accessKeyId,
+      secretAccessKey: profile.secretAccessKey
     }
   });
-  return cachedClient;
+  cachedClients.set(profile.id, nextClient);
+  return nextClient;
+}
+
+function clientForObjectKey(objectKey = "") {
+  return client(resolveProfileIdFromObjectKey(objectKey));
+}
+
+function profileForObjectKey(objectKey = "") {
+  return getProfile(resolveProfileIdFromObjectKey(objectKey));
 }
 
 function joinKey(...parts) {
@@ -95,37 +267,44 @@ function joinKey(...parts) {
     .replace(/\/{2,}/g, "/");
 }
 
-function buildIntentObjectKey(intentId = "", fileName = "") {
-  return joinKey(
-    config.prefix,
-    config.intentPrefix,
+function buildIntentObjectKey(intentId = "", fileName = "", options = {}) {
+  const profileId = normalizeProfileId(options?.profileId || DEFAULT_PROFILE_ID);
+  const profile = getProfile(profileId) || defaultProfile;
+  const baseKey = joinKey(
+    profile.prefix,
+    profile.intentPrefix,
     sanitizeKeySegment(intentId),
     sanitizeKeySegment(fileName || "file")
   );
+  return embedProfileIdInObjectKey(baseKey, profile.id);
 }
 
-function buildFileHolderObjectKey(owner = "", itemId = "", fileName = "") {
-  return joinKey(
-    config.prefix,
-    config.fileHolderPrefix,
+function buildFileHolderObjectKey(owner = "", itemId = "", fileName = "", options = {}) {
+  const profileId = normalizeProfileId(options?.profileId || DEFAULT_PROFILE_ID);
+  const profile = getProfile(profileId) || defaultProfile;
+  const baseKey = joinKey(
+    profile.prefix,
+    profile.fileHolderPrefix,
     sanitizeKeySegment(owner || "user"),
     sanitizeKeySegment(itemId),
     sanitizeKeySegment(fileName || "file")
   );
+  return embedProfileIdInObjectKey(baseKey, profile.id);
 }
 
-async function createUploadUrl(objectKey = "", contentType = "application/octet-stream", expiresInSec = config.uploadUrlTtlSec) {
-  if (!isEnabled()) return null;
+async function createUploadUrl(objectKey = "", contentType = "application/octet-stream", expiresInSec = 0) {
   const key = String(objectKey || "").trim();
   if (!key) return null;
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
   const url = await getSignedUrl(
-    client(),
+    clientForObjectKey(key),
     new PutObjectCommand({
-      Bucket: config.bucket,
+      Bucket: profile.bucket,
       Key: key,
       ContentType: String(contentType || "application/octet-stream").trim() || "application/octet-stream"
     }),
-    { expiresIn: Math.max(60, Number(expiresInSec || config.uploadUrlTtlSec)) }
+    { expiresIn: Math.max(60, Number(expiresInSec || profile.uploadUrlTtlSec)) }
   );
   return {
     url,
@@ -137,11 +316,12 @@ async function createUploadUrl(objectKey = "", contentType = "application/octet-
 }
 
 async function createMultipartUpload(objectKey = "", contentType = "application/octet-stream") {
-  if (!isEnabled()) return null;
   const key = String(objectKey || "").trim();
   if (!key) return null;
-  const response = await client().send(new CreateMultipartUploadCommand({
-    Bucket: config.bucket,
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
+  const response = await clientForObjectKey(key).send(new CreateMultipartUploadCommand({
+    Bucket: profile.bucket,
     Key: key,
     ContentType: String(contentType || "application/octet-stream").trim() || "application/octet-stream"
   }));
@@ -153,21 +333,22 @@ async function createMultipartUpload(objectKey = "", contentType = "application/
   };
 }
 
-async function createMultipartUploadPartUrl(objectKey = "", uploadId = "", partNumber = 1, expiresInSec = config.uploadUrlTtlSec) {
-  if (!isEnabled()) return null;
+async function createMultipartUploadPartUrl(objectKey = "", uploadId = "", partNumber = 1, expiresInSec = 0) {
   const key = String(objectKey || "").trim();
   const upload = String(uploadId || "").trim();
   const part = Math.max(1, Math.min(10000, Number(partNumber || 0)));
   if (!key || !upload || !Number.isFinite(part)) return null;
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
   const url = await getSignedUrl(
-    client(),
+    clientForObjectKey(key),
     new UploadPartCommand({
-      Bucket: config.bucket,
+      Bucket: profile.bucket,
       Key: key,
       UploadId: upload,
       PartNumber: part
     }),
-    { expiresIn: Math.max(60, Number(expiresInSec || config.uploadUrlTtlSec)) }
+    { expiresIn: Math.max(60, Number(expiresInSec || profile.uploadUrlTtlSec)) }
   );
   return {
     url,
@@ -177,7 +358,6 @@ async function createMultipartUploadPartUrl(objectKey = "", uploadId = "", partN
 }
 
 async function completeMultipartUpload(objectKey = "", uploadId = "", parts = []) {
-  if (!isEnabled()) return null;
   const key = String(objectKey || "").trim();
   const upload = String(uploadId || "").trim();
   const normalizedParts = Array.isArray(parts)
@@ -190,8 +370,10 @@ async function completeMultipartUpload(objectKey = "", uploadId = "", parts = []
       .sort((a, b) => a.PartNumber - b.PartNumber)
     : [];
   if (!key || !upload || !normalizedParts.length) return null;
-  await client().send(new CompleteMultipartUploadCommand({
-    Bucket: config.bucket,
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
+  await clientForObjectKey(key).send(new CompleteMultipartUploadCommand({
+    Bucket: profile.bucket,
     Key: key,
     UploadId: upload,
     MultipartUpload: {
@@ -206,13 +388,14 @@ async function completeMultipartUpload(objectKey = "", uploadId = "", parts = []
 }
 
 async function abortMultipartUpload(objectKey = "", uploadId = "") {
-  if (!isEnabled()) return false;
   const key = String(objectKey || "").trim();
   const upload = String(uploadId || "").trim();
   if (!key || !upload) return false;
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return false;
   try {
-    await client().send(new AbortMultipartUploadCommand({
-      Bucket: config.bucket,
+    await clientForObjectKey(key).send(new AbortMultipartUploadCommand({
+      Bucket: profile.bucket,
       Key: key,
       UploadId: upload
     }));
@@ -224,16 +407,17 @@ async function abortMultipartUpload(objectKey = "", uploadId = "") {
 }
 
 async function listMultipartUploadParts(objectKey = "", uploadId = "") {
-  if (!isEnabled()) return [];
   const key = String(objectKey || "").trim();
   const upload = String(uploadId || "").trim();
   if (!key || !upload) return [];
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return [];
 
   const parts = [];
   let marker = 0;
   while (true) {
-    const response = await client().send(new ListPartsCommand({
-      Bucket: config.bucket,
+    const response = await clientForObjectKey(key).send(new ListPartsCommand({
+      Bucket: profile.bucket,
       Key: key,
       UploadId: upload,
       PartNumberMarker: marker > 0 ? marker : undefined
@@ -261,18 +445,19 @@ async function listMultipartUploadParts(objectKey = "", uploadId = "") {
 }
 
 async function createDownloadUrl(objectKey = "", options = {}) {
-  if (!isEnabled()) return null;
   const key = String(objectKey || "").trim();
   if (!key) return null;
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
   const url = await getSignedUrl(
-    client(),
+    clientForObjectKey(key),
     new GetObjectCommand({
-      Bucket: config.bucket,
+      Bucket: profile.bucket,
       Key: key,
       ResponseContentDisposition: options?.contentDisposition,
       ResponseContentType: options?.contentType
     }),
-    { expiresIn: Math.max(60, Number(options?.expiresInSec || config.downloadUrlTtlSec)) }
+    { expiresIn: Math.max(60, Number(options?.expiresInSec || profile.downloadUrlTtlSec)) }
   );
   return url;
 }
@@ -288,12 +473,13 @@ function isMissingObjectError(err) {
 }
 
 async function headObject(objectKey = "") {
-  if (!isEnabled()) return null;
   const key = String(objectKey || "").trim();
   if (!key) return null;
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
   try {
-    const response = await client().send(new HeadObjectCommand({
-      Bucket: config.bucket,
+    const response = await clientForObjectKey(key).send(new HeadObjectCommand({
+      Bucket: profile.bucket,
       Key: key
     }));
     return {
@@ -310,12 +496,13 @@ async function headObject(objectKey = "") {
 }
 
 async function deleteObject(objectKey = "") {
-  if (!isEnabled()) return false;
   const key = String(objectKey || "").trim();
   if (!key) return false;
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return false;
   try {
-    await client().send(new DeleteObjectCommand({
-      Bucket: config.bucket,
+    await clientForObjectKey(key).send(new DeleteObjectCommand({
+      Bucket: profile.bucket,
       Key: key
     }));
     return true;
@@ -326,14 +513,15 @@ async function deleteObject(objectKey = "") {
 }
 
 async function putFile(objectKey = "", localPath = "", contentType = "application/octet-stream") {
-  if (!isEnabled()) return null;
   const key = String(objectKey || "").trim();
   const filePath = String(localPath || "").trim();
   if (!key || !filePath) return null;
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
   const stat = fs.statSync(filePath);
   const body = fs.createReadStream(filePath);
-  await client().send(new PutObjectCommand({
-    Bucket: config.bucket,
+  await clientForObjectKey(key).send(new PutObjectCommand({
+    Bucket: profile.bucket,
     Key: key,
     Body: body,
     ContentType: String(contentType || "application/octet-stream").trim() || "application/octet-stream",
@@ -346,12 +534,13 @@ async function putFile(objectKey = "", localPath = "", contentType = "applicatio
 }
 
 async function putBuffer(objectKey = "", buffer = Buffer.alloc(0), contentType = "application/octet-stream") {
-  if (!isEnabled()) return null;
   const key = String(objectKey || "").trim();
   const body = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || "");
   if (!key) return null;
-  await client().send(new PutObjectCommand({
-    Bucket: config.bucket,
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
+  await clientForObjectKey(key).send(new PutObjectCommand({
+    Bucket: profile.bucket,
     Key: key,
     Body: body,
     ContentType: String(contentType || "application/octet-stream").trim() || "application/octet-stream",
@@ -364,14 +553,15 @@ async function putBuffer(objectKey = "", buffer = Buffer.alloc(0), contentType =
 }
 
 async function getObjectStream(objectKey = "", options = {}) {
-  if (!isEnabled()) return null;
   const key = String(objectKey || "").trim();
   if (!key) return null;
+  const profile = profileForObjectKey(key);
+  if (!profile || !isEnabled(profile.id)) return null;
   const range = options?.range && typeof options.range === "object"
     ? `bytes=${Math.max(0, Number(options.range.start || 0))}-${Math.max(0, Number(options.range.end || 0))}`
     : undefined;
-  const response = await client().send(new GetObjectCommand({
-    Bucket: config.bucket,
+  const response = await clientForObjectKey(key).send(new GetObjectCommand({
+    Bucket: profile.bucket,
     Key: key,
     Range: range
   }));
@@ -386,7 +576,6 @@ async function getObjectStream(objectKey = "", options = {}) {
 }
 
 async function downloadObjectToFile(objectKey = "", outputPath = "") {
-  if (!isEnabled()) return null;
   const targetPath = String(outputPath || "").trim();
   if (!targetPath) return null;
   const response = await getObjectStream(objectKey);
@@ -405,15 +594,20 @@ async function streamToBuffer(readable = null) {
 }
 
 async function readObjectBuffer(objectKey = "") {
-  if (!isEnabled()) return null;
   const response = await getObjectStream(objectKey);
   if (!response?.body) return null;
   return streamToBuffer(response.body);
 }
 
 module.exports = {
-  config,
+  DEFAULT_PROFILE_ID,
+  STORAGE_TARGET_KEY_PREFIX,
+  config: defaultProfile,
   isEnabled,
+  describeProfile,
+  listUploadBenchmarkTargets,
+  resolveProfileIdFromObjectKey,
+  describeObjectKeyTarget,
   buildIntentObjectKey,
   buildFileHolderObjectKey,
   createUploadUrl,

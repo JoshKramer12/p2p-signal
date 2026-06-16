@@ -78,9 +78,8 @@
     const FILE_NAME = "bench-23mb.mp4";
     const HTTP_BASE_URL = window.location.origin;
     const WS_URL = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}`;
-    const RUNS = [
+    const SCENARIOS = [
       { label: "single-xhr", diagnosticUploadPlan: { mode: "single" }, transport: "xhr", concurrency: 1 },
-      { label: "single-fetch", diagnosticUploadPlan: { mode: "single" }, transport: "fetch", concurrency: 1 },
       { label: "multipart-8mb-xhr-3", diagnosticUploadPlan: { mode: "multipart", partSize: 8 * 1024 * 1024, maxConcurrency: 3 }, transport: "xhr", concurrency: 3 }
     ];
 
@@ -158,6 +157,11 @@
       } finally {
         if (timer) clearTimeout(timer);
       }
+    }
+
+    async function loadTargets() {
+      const payload = await jsonReq("/api/upload-bench/targets", { timeoutMs: 10000 });
+      return Array.isArray(payload?.targets) ? payload.targets : [];
     }
 
     function connectWs() {
@@ -301,7 +305,7 @@
       }
     }
 
-    async function runSingleUpload(file, authHeaders, intentId, runConfig) {
+    async function runSingleUpload(file, authHeaders, intentId, target, runConfig) {
       const initStart = performance.now();
       const initPayload = await jsonReq(`/api/intents/${encodeURIComponent(intentId)}/object-upload/init`, {
         method: "POST",
@@ -309,7 +313,8 @@
         body: {
           name: FILE_NAME,
           size: file.size,
-          diagnosticUploadPlan: runConfig.diagnosticUploadPlan
+          diagnosticUploadPlan: runConfig.diagnosticUploadPlan,
+          diagnosticStorageTarget: target.id
         },
         timeoutMs: 20000
       });
@@ -331,13 +336,14 @@
       return {
         initPayload,
         initMs,
+        storageTarget: initPayload?.storageTarget || null,
         uploadHost,
         firstProgressMs,
         uploadMs
       };
     }
 
-    async function runMultipartUpload(file, authHeaders, intentId, runConfig) {
+    async function runMultipartUpload(file, authHeaders, intentId, target, runConfig) {
       const initStart = performance.now();
       const initPayload = await jsonReq(`/api/intents/${encodeURIComponent(intentId)}/object-upload/init`, {
         method: "POST",
@@ -345,7 +351,8 @@
         body: {
           name: FILE_NAME,
           size: file.size,
-          diagnosticUploadPlan: runConfig.diagnosticUploadPlan
+          diagnosticUploadPlan: runConfig.diagnosticUploadPlan,
+          diagnosticStorageTarget: target.id
         },
         timeoutMs: 20000
       });
@@ -404,6 +411,7 @@
       return {
         initPayload,
         initMs,
+        storageTarget: initPayload?.storageTarget || null,
         uploadHost,
         firstProgressMs,
         planMs,
@@ -449,7 +457,7 @@
       return { completeMs, syncMs };
     }
 
-    async function runScenario(runConfig) {
+    async function runScenario(target, runConfig) {
       const file = makeBenchFile();
       const ws = await connectWs();
       const authStart = performance.now();
@@ -464,9 +472,15 @@
         const intentId = await createSelfIntent(ws, auth.username, file.size);
         const intentMs = performance.now() - intentStart;
         let result = {
-          label: runConfig.label,
+          label: `${target.id}:${runConfig.label}`,
+          targetId: String(target?.id || "").trim(),
+          targetLabel: String(target?.label || "").trim(),
+          targetProvider: String(target?.providerName || "").trim(),
+          targetRegion: String(target?.region || "").trim(),
+          targetEndpointHost: String(target?.endpointHost || "").trim(),
           requestedMode: String(runConfig?.diagnosticUploadPlan?.mode || ""),
           transport: runConfig.transport,
+          fileSizeBytes: file.size,
           authMs,
           intentMs,
           planMs: 0,
@@ -474,10 +488,11 @@
         };
         let finalizeBody = { size: file.size };
         if (runConfig.diagnosticUploadPlan.mode === "multipart") {
-          const multipart = await runMultipartUpload(file, authHeaders, intentId, runConfig);
+          const multipart = await runMultipartUpload(file, authHeaders, intentId, target, runConfig);
           result = {
             ...result,
             resolvedMode: String(multipart?.initPayload?.upload?.mode || ""),
+            storageTarget: multipart?.storageTarget || null,
             uploadHost: multipart.uploadHost,
             partSize: multipart.partSize,
             totalParts: multipart.totalParts,
@@ -493,10 +508,11 @@
             parts: multipart.completedParts
           };
         } else {
-          const single = await runSingleUpload(file, authHeaders, intentId, runConfig);
+          const single = await runSingleUpload(file, authHeaders, intentId, target, runConfig);
           result = {
             ...result,
             resolvedMode: String(single?.initPayload?.upload?.mode || ""),
+            storageTarget: single?.storageTarget || null,
             uploadHost: single.uploadHost,
             partSize: file.size,
             totalParts: 1,
@@ -512,6 +528,10 @@
         result.totalMs = result.authMs + result.intentMs + result.initMs + result.planMs + result.uploadMs + result.completeMs;
         result.throughputMbps = fmtMbps(file.size, result.uploadMs);
         result.endToEndMbps = fmtMbps(file.size, result.totalMs);
+        result.storageLabel = String(result?.storageTarget?.label || result.targetLabel || "");
+        result.storageProvider = String(result?.storageTarget?.providerName || result.targetProvider || "");
+        result.storageRegion = String(result?.storageTarget?.region || result.targetRegion || "");
+        result.storageEndpointHost = String(result?.storageTarget?.endpointHost || result.targetEndpointHost || "");
         return result;
       } finally {
         try { ws.close(); } catch {}
@@ -519,10 +539,27 @@
     }
 
     function renderResult(run) {
-      appendLine(`[${run.label}] requested=${run.requestedMode} resolved=${run.resolvedMode} transport=${run.transport}`);
+      appendLine(`[${run.label}] target=${run.storageLabel || run.targetLabel || run.targetId} provider=${run.storageProvider || "unknown"} region=${run.storageRegion || "unknown"} endpoint_host=${run.storageEndpointHost || "unknown"}`);
+      appendLine(`[${run.label}] requested=${run.requestedMode} resolved=${run.resolvedMode} transport=${run.transport} file_bytes=${run.fileSizeBytes}`);
       appendLine(`[${run.label}] upload_host=${run.uploadHost || "unknown"} parts=${run.totalParts} partSize=${run.partSize} serverHint=${run.serverConcurrency}`);
       appendLine(`[${run.label}] timings_s auth=${fmtSeconds(run.authMs)} intent=${fmtSeconds(run.intentMs)} init=${fmtSeconds(run.initMs)} first_progress=${fmtSeconds(run.firstProgressMs)} plan=${fmtSeconds(run.planMs)} upload=${fmtSeconds(run.uploadMs)} complete=${fmtSeconds(run.completeMs)} sync=${fmtSeconds(run.syncMs)} total=${fmtSeconds(run.totalMs)}`);
       appendLine(`[${run.label}] throughput_mbps upload=${run.throughputMbps} end_to_end=${run.endToEndMbps}`);
+      appendLine("");
+    }
+
+    function renderSummary(results) {
+      if (!Array.isArray(results) || !results.length) return;
+      const fastestByScenario = new Map();
+      for (const run of results) {
+        const existing = fastestByScenario.get(run.requestedMode);
+        if (!existing || Number(run.uploadMs || 0) < Number(existing.uploadMs || 0)) {
+          fastestByScenario.set(run.requestedMode, run);
+        }
+      }
+      appendLine("Fastest by mode:");
+      for (const [mode, run] of fastestByScenario.entries()) {
+        appendLine(`- ${mode}: ${run.storageLabel || run.targetLabel || run.targetId} upload=${fmtSeconds(run.uploadMs)}s total=${fmtSeconds(run.totalMs)}s upload_mbps=${run.throughputMbps}`);
+      }
       appendLine("");
     }
 
@@ -534,15 +571,33 @@
       appendLine(`File size bytes: ${FILE_SIZE_BYTES}`);
       appendLine("");
       const startedAt = performance.now();
-      for (const runConfig of RUNS) {
-        try {
-          setStatus(`Running ${runConfig.label}…`);
-          const run = await runScenario(runConfig);
-          renderResult(run);
-        } catch (err) {
-          appendLine(`[${runConfig.label}] ERROR: ${String(err?.stack || err?.message || err)}`);
-          appendLine("");
+      const allTargets = await loadTargets();
+      const enabledTargets = allTargets.filter((target) => target && target.enabled);
+      const altTargets = enabledTargets.filter((target) => !target.isDefault);
+      appendLine(`Configured targets: ${enabledTargets.map((target) => `${target.id}:${target.label}`).join(", ") || "none"}`);
+      if (!altTargets.length) {
+        appendLine("No alternative benchmark storage target is configured yet. Control target is ready; add staging-only benchmark target env vars to compare another provider or region.");
+        appendLine("");
+      }
+
+      const results = [];
+      for (const target of enabledTargets) {
+        for (const runConfig of SCENARIOS) {
+          try {
+            setStatus(`Running ${target.label} ${runConfig.label}…`);
+            const run = await runScenario(target, runConfig);
+            results.push(run);
+            renderResult(run);
+          } catch (err) {
+            appendLine(`[${target.id}:${runConfig.label}] ERROR: ${String(err?.stack || err?.message || err)}`);
+            appendLine("");
+          }
         }
+      }
+      renderSummary(results);
+      if (!results.length) {
+        appendLine("No benchmark runs completed.");
+        appendLine("");
       }
       setStatus(`Finished in ${fmtSeconds(performance.now() - startedAt)}s`);
       runBtn.disabled = false;

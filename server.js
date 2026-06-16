@@ -209,6 +209,15 @@ function normalizeDiagnosticUploadPlan(raw = null) {
   }
   return normalized;
 }
+
+function normalizeDiagnosticStorageTarget(raw = "") {
+  if (!IS_STAGING_DEPLOY) return null;
+  const requestedId = String(raw || "").trim();
+  if (!requestedId) return objectStorage.describeProfile(objectStorage.DEFAULT_PROFILE_ID);
+  const profile = objectStorage.describeProfile(requestedId);
+  if (!profile || !profile.enabled) return null;
+  return profile;
+}
 const OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS = Math.max(
   1000,
   Number(process.env.OBJECT_MULTIPART_COMPLETE_SETTLE_TIMEOUT_MS || 30 * 1000)
@@ -2819,6 +2828,16 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (IS_STAGING_DEPLOY && req.method === "GET" && url.pathname === "/api/upload-bench/targets") {
+      setCors(res);
+      res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+      res.end(JSON.stringify({
+        ok: true,
+        targets: objectStorage.listUploadBenchmarkTargets()
+      }));
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/api/account/badge") {
       setCors(res);
       const username = extractUsernameFromRequest(req, url);
@@ -3373,6 +3392,7 @@ const server = http.createServer(async (req, res) => {
           enabled: true,
           intentId,
           alreadyStored: true,
+          storageTarget: objectStorage.describeObjectKeyTarget(intent.storedObjectKey || ""),
           bytesExpected: expectedBytes,
           plainBytesExpected: Number(intent.fileSize || 0)
         }));
@@ -3382,9 +3402,18 @@ const server = http.createServer(async (req, res) => {
       const safeName = safeBasename(String(body?.name || intent.fileName || "file"));
       const mime = contentTypeForName(safeName);
       const storedFileName = String(intent.storedFile || "").trim() || `${intentId}__${safeName}`;
-      const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName);
       const hintedUploadId = String(body?.uploadId || "").trim();
       const diagnosticUploadPlan = normalizeDiagnosticUploadPlan(body?.diagnosticUploadPlan);
+      const requestedDiagnosticStorageTarget = String(body?.diagnosticStorageTarget || "").trim();
+      const diagnosticStorageTarget = normalizeDiagnosticStorageTarget(requestedDiagnosticStorageTarget);
+      if (requestedDiagnosticStorageTarget && !diagnosticStorageTarget) {
+        res.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+        res.end(JSON.stringify({ ok: false, message: "Requested benchmark storage target is not configured in staging" }));
+        return;
+      }
+      const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName, {
+        profileId: diagnosticStorageTarget?.id || objectStorage.DEFAULT_PROFILE_ID
+      });
       const shouldUseMultipart = diagnosticUploadPlan?.mode
         ? diagnosticUploadPlan.mode === "multipart"
         : expectedBytes >= objectMultipartThresholdForMime(mime);
@@ -3396,6 +3425,10 @@ const server = http.createServer(async (req, res) => {
       );
 
       if (canReuseExisting && existingSession?.mode === "multipart" && !shouldUseMultipart) {
+        canReuseExisting = false;
+      }
+
+      if (canReuseExisting && existingSession?.objectKey !== objectKey) {
         canReuseExisting = false;
       }
 
@@ -3481,6 +3514,7 @@ const server = http.createServer(async (req, res) => {
           intentId,
           resumed: true,
           mode: String(existingSession.mode || "").trim() || "single",
+          storageTargetId: String(existingSession.storageProfileId || objectStorage.DEFAULT_PROFILE_ID),
           elapsedMs: Math.max(0, Date.now() - uploadInitStartedAt),
           bytesExpected: expectedBytes,
           bytesUploadedConfirmed: confirmedBytes
@@ -3493,6 +3527,7 @@ const server = http.createServer(async (req, res) => {
           intentId,
           upload: uploadPlan,
           status: statusPayload,
+          storageTarget: objectStorage.describeObjectKeyTarget(existingSession.objectKey || ""),
           bytesExpected: expectedBytes,
           plainBytesExpected: Number(intent.fileSize || 0),
           storedFile: storedFileName
@@ -3539,6 +3574,7 @@ const server = http.createServer(async (req, res) => {
         objectUploadSession = {
           mode: "multipart",
           objectKey,
+          storageProfileId: objectStorage.resolveProfileIdFromObjectKey(objectKey),
           uploadId: multipart.uploadId,
           contentType: mime,
           partSize,
@@ -3567,6 +3603,7 @@ const server = http.createServer(async (req, res) => {
         objectUploadSession = {
           mode: "single",
           objectKey,
+          storageProfileId: objectStorage.resolveProfileIdFromObjectKey(objectKey),
           contentType: mime,
           uploadedBytesConfirmed: 0,
           finalizing: false,
@@ -3602,6 +3639,7 @@ const server = http.createServer(async (req, res) => {
         intentId,
         resumed: false,
         mode: String(objectUploadSession?.mode || "").trim() || "single",
+        storageTargetId: String(objectUploadSession?.storageProfileId || objectStorage.DEFAULT_PROFILE_ID),
         elapsedMs: Math.max(0, Date.now() - uploadInitStartedAt),
         bytesExpected: expectedBytes,
         multipartThresholdBytes: objectMultipartThresholdForMime(mime),
@@ -3611,17 +3649,18 @@ const server = http.createServer(async (req, res) => {
         diagnosticUploadPlan: diagnosticUploadPlan || null
       });
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-      res.end(JSON.stringify({
-        ok: true,
-        enabled: true,
-        resumed: false,
-        intentId,
-        upload: uploadPlan,
-        status: statusPayload,
-        bytesExpected: expectedBytes,
-        plainBytesExpected: Number(intent.fileSize || 0),
-        storedFile: storedFileName
-      }));
+        res.end(JSON.stringify({
+          ok: true,
+          enabled: true,
+          resumed: false,
+          intentId,
+          upload: uploadPlan,
+          status: statusPayload,
+          storageTarget: objectStorage.describeObjectKeyTarget(objectKey),
+          bytesExpected: expectedBytes,
+          plainBytesExpected: Number(intent.fileSize || 0),
+          storedFile: storedFileName
+        }));
       return;
     }
 
@@ -3904,6 +3943,7 @@ const server = http.createServer(async (req, res) => {
           intentId: intent.id,
           finalized: true,
           alreadyStored: true,
+          storageTarget: objectStorage.describeObjectKeyTarget(intent.storedObjectKey || ""),
           bytesExpected: Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0),
           bytesUploadedConfirmed: Number(intent.storedBytes || 0),
           plainBytesExpected: Number(intent.fileSize || 0),
@@ -4040,6 +4080,7 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           intentId: intent.id,
           storedFile: intent.storedFile || null,
+          storageTarget: objectStorage.describeObjectKeyTarget(intent.storedObjectKey || ""),
           bytesStored: Number(intent.storedBytes || 0),
           deliveryHeld: isIntentDeliveryHeld(intent),
           alreadyStored: true
@@ -4206,6 +4247,7 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           intentId: intent.id,
           storedFile: intent.storedFile || null,
+          storageTarget: objectStorage.describeObjectKeyTarget(intent.storedObjectKey || ""),
           bytesStored: actualBytes,
           deliveryHeld: isIntentDeliveryHeld(intent)
         }));
@@ -5073,12 +5115,14 @@ function normalizeObjectUploadSession(raw = null) {
   const mode = String(raw.mode || "").trim().toLowerCase();
   const objectKey = String(raw.objectKey || "").trim();
   if (!mode || !objectKey) return null;
+  const storageProfileId = objectStorage.resolveProfileIdFromObjectKey(objectKey);
   if (mode === "multipart") {
     const uploadId = String(raw.uploadId || "").trim();
     if (!uploadId) return null;
     return {
       mode,
       objectKey,
+      storageProfileId,
       uploadId,
       contentType: String(raw.contentType || "application/octet-stream").trim() || "application/octet-stream",
       partSize: Math.max(5 * 1024 * 1024, Number(raw.partSize || OBJECT_MULTIPART_PART_SIZE_BYTES)),
@@ -5098,6 +5142,7 @@ function normalizeObjectUploadSession(raw = null) {
     return {
       mode,
       objectKey,
+      storageProfileId,
       contentType: String(raw.contentType || "application/octet-stream").trim() || "application/octet-stream",
       uploadedBytesConfirmed: Math.max(0, Number(raw.uploadedBytesConfirmed || 0)),
       finalizing: Boolean(raw.finalizing),
@@ -5142,6 +5187,7 @@ function buildIntentObjectUploadStatusPayload(intent = null, uploadSession = nul
   if (!session) return null;
   const expectedBytes = Math.max(0, Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0));
   const completedParts = normalizeObjectMultipartPartRows(options?.completedParts || session.completedPartsByNumber || []);
+  const storageTarget = objectStorage.describeObjectKeyTarget(session.objectKey || intent.storedObjectKey || "");
   const bytesUploadedConfirmedRaw = Number(
     options?.bytesUploadedConfirmed != null
       ? options.bytesUploadedConfirmed
@@ -5157,6 +5203,7 @@ function buildIntentObjectUploadStatusPayload(intent = null, uploadSession = nul
     partSize: session.mode === "multipart" ? session.partSize : 0,
     totalParts: session.mode === "multipart" ? Math.max(1, Number(session.totalParts || 1)) : 1,
     maxConcurrency: session.mode === "multipart" ? Math.max(1, Number(session.maxConcurrency || 1)) : 1,
+    storageTarget,
     bytesExpected: expectedBytes,
     bytesUploadedConfirmed,
     plainBytesExpected: Number(intent.fileSize || 0),

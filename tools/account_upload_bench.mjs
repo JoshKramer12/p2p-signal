@@ -19,6 +19,7 @@ function parseArgs(argv = []) {
     forceMode: "",
     partSize: 0,
     maxConcurrency: 0,
+    storageTarget: "",
     hostOverrides: {}
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -35,6 +36,7 @@ function parseArgs(argv = []) {
     if (arg === "--force-mode" && next) { out.forceMode = String(next).trim().toLowerCase(); i += 1; continue; }
     if (arg === "--part-size" && next) { out.partSize = Math.max(0, Number(next) || 0); i += 1; continue; }
     if (arg === "--max-concurrency" && next) { out.maxConcurrency = Math.max(0, Number(next) || 0); i += 1; continue; }
+    if (arg === "--storage-target" && next) { out.storageTarget = String(next).trim(); i += 1; continue; }
     if (arg === "--resolve-host" && next) {
       const [host, ip] = String(next).split("=");
       if (host && ip) out.hostOverrides[String(host).trim().toLowerCase()] = String(ip).trim();
@@ -287,7 +289,8 @@ async function runOnce(opts) {
       body: {
         name: fileName,
         size: fileSize,
-        diagnosticUploadPlan: buildDiagnosticUploadPlan(opts)
+        diagnosticUploadPlan: buildDiagnosticUploadPlan(opts),
+        diagnosticStorageTarget: String(opts.storageTarget || "").trim() || undefined
       },
       timeoutMs: opts.timeoutMs
     });
@@ -335,6 +338,7 @@ async function runOnce(opts) {
       return {
         mode,
         fileSize,
+        storageTarget: initPayload?.storageTarget || null,
         totalParts: 1,
         partSize: fileSize,
         serverMaxConcurrency: 1,
@@ -507,6 +511,7 @@ async function runOnce(opts) {
     return {
       mode,
       fileSize,
+      storageTarget: initPayload?.storageTarget || null,
       totalParts,
       partSize,
       serverMaxConcurrency,
@@ -536,6 +541,7 @@ function printResult(index, run, label = "") {
   const prefix = label ? `[${label}] ` : "";
   console.log(`${prefix}run=${index + 1}`);
   console.log(`${prefix}mode=${run.mode} size=${run.fileSize} parts=${run.totalParts} partSize=${run.partSize} serverHint=${run.serverMaxConcurrency} usedConcurrency=${run.usedConcurrency}`);
+  console.log(`${prefix}storage_target=${String(run?.storageTarget?.label || "").trim() || "unknown"} provider=${String(run?.storageTarget?.providerName || "").trim() || "unknown"} region=${String(run?.storageTarget?.region || "").trim() || "unknown"} endpoint_host=${String(run?.storageTarget?.endpointHost || "").trim() || "unknown"}`);
   console.log(`${prefix}upload_host=${run.uploadHost || "unknown"}`);
   console.log(`${prefix}timings_s auth=${fmtSeconds(run.authMs)} intent=${fmtSeconds(run.intentMs)} init=${fmtSeconds(run.initMs)} plan=${fmtSeconds(run.planMs)} upload=${fmtSeconds(run.uploadMs)} complete=${fmtSeconds(run.completeMs)} sync=${fmtSeconds(run.syncMs)} total=${fmtSeconds(run.totalMs)}`);
   console.log(`${prefix}throughput_mbps upload=${fmtMbps(run.uploadedBytes, run.uploadMs)} end_to_end=${fmtMbps(run.uploadedBytes, run.totalMs)}`);
