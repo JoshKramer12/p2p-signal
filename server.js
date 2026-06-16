@@ -157,7 +157,7 @@ const OBJECT_MULTIPART_THRESHOLD_BYTES = Math.max(
 );
 const OBJECT_MULTIPART_PART_SIZE_BYTES = Math.max(
   5 * 1024 * 1024,
-  Number(process.env.OBJECT_MULTIPART_PART_SIZE_BYTES || 6 * 1024 * 1024)
+  Number(process.env.OBJECT_MULTIPART_PART_SIZE_BYTES || 8 * 1024 * 1024)
 );
 const OBJECT_MULTIPART_MAX_PARTS = 10000;
 const OBJECT_MULTIPART_CLIENT_CONCURRENCY_MAX = Math.max(
@@ -170,33 +170,24 @@ const OBJECT_MULTIPART_CLIENT_CONCURRENCY = Math.max(
 );
 
 function objectMultipartThresholdForMime(mime = "") {
-  const normalizedMime = String(mime || "").trim().toLowerCase();
-  if (normalizedMime.startsWith("video/")) {
-    return Math.min(OBJECT_MULTIPART_THRESHOLD_BYTES, 8 * 1024 * 1024);
-  }
   return OBJECT_MULTIPART_THRESHOLD_BYTES;
 }
 
 function chooseObjectMultipartPartSize(expectedBytes = 0, mime = "") {
   const bytes = Math.max(0, Number(expectedBytes || 0));
-  const normalizedMime = String(mime || "").trim().toLowerCase();
-  const keepSmallVideoParts = normalizedMime.startsWith("video/") && bytes > 0 && bytes <= 128 * 1024 * 1024;
   const maxPartSizeByCount = Math.max(
     5 * 1024 * 1024,
     Math.ceil(bytes / OBJECT_MULTIPART_MAX_PARTS)
   );
   let tunedPartSize = OBJECT_MULTIPART_PART_SIZE_BYTES;
-  if (keepSmallVideoParts) {
-    tunedPartSize = 5 * 1024 * 1024;
-  }
   if (bytes >= 2 * 1024 * 1024 * 1024) {
     tunedPartSize = Math.max(tunedPartSize, 24 * 1024 * 1024);
   } else if (bytes >= 1024 * 1024 * 1024) {
     tunedPartSize = Math.max(tunedPartSize, 20 * 1024 * 1024);
   } else if (bytes >= 512 * 1024 * 1024) {
     tunedPartSize = Math.max(tunedPartSize, 16 * 1024 * 1024);
-  } else if (bytes >= 32 * 1024 * 1024 && !keepSmallVideoParts) {
-    tunedPartSize = Math.max(tunedPartSize, 6 * 1024 * 1024);
+  } else if (bytes >= 32 * 1024 * 1024) {
+    tunedPartSize = Math.max(tunedPartSize, 8 * 1024 * 1024);
   }
   return Math.max(tunedPartSize, maxPartSizeByCount);
 }
@@ -3564,7 +3555,11 @@ const server = http.createServer(async (req, res) => {
         resumed: false,
         mode: String(objectUploadSession?.mode || "").trim() || "single",
         elapsedMs: Math.max(0, Date.now() - uploadInitStartedAt),
-        bytesExpected: expectedBytes
+        bytesExpected: expectedBytes,
+        multipartThresholdBytes: objectMultipartThresholdForMime(mime),
+        partSize: Number(objectUploadSession?.partSize || 0),
+        totalParts: Number(objectUploadSession?.totalParts || 1),
+        maxConcurrency: Number(objectUploadSession?.maxConcurrency || 1)
       });
       res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       res.end(JSON.stringify({
