@@ -168,10 +168,46 @@ function loadBenchmarkProfiles(defaultProfile) {
   });
 }
 
+function parseTargetIds() {
+  return Array.from(new Set(
+    String(process.env.OBJECT_STORAGE_TARGETS || "")
+      .split(",")
+      .map((value) => normalizeProfileId(value))
+      .filter((value) => value && value !== DEFAULT_PROFILE_ID)
+  ));
+}
+
+function targetEnvPrefix(profileId = "") {
+  return `OBJECT_STORAGE_TARGET_${String(profileId || "").trim().toUpperCase()}_`;
+}
+
+function loadRoutingProfiles(defaultProfile) {
+  return parseTargetIds().map((profileId) => {
+    const prefix = targetEnvPrefix(profileId);
+    return buildProfile(profileId, {
+      label: trimEnv(`${prefix}LABEL`),
+      providerName: trimEnv(`${prefix}PROVIDER_NAME`),
+      bucket: trimEnv(`${prefix}BUCKET`),
+      region: trimEnv(`${prefix}REGION`, defaultProfile.region || "auto"),
+      endpoint: trimEnv(`${prefix}ENDPOINT`),
+      accessKeyId: trimEnv(`${prefix}ACCESS_KEY_ID`),
+      secretAccessKey: trimEnv(`${prefix}SECRET_ACCESS_KEY`),
+      forcePathStyle: envFlag(`${prefix}FORCE_PATH_STYLE`, defaultProfile.forcePathStyle),
+      uploadUrlTtlSec: Number(process.env[`${prefix}UPLOAD_URL_TTL_SEC`] || defaultProfile.uploadUrlTtlSec),
+      downloadUrlTtlSec: Number(process.env[`${prefix}DOWNLOAD_URL_TTL_SEC`] || defaultProfile.downloadUrlTtlSec),
+      prefix: trimEnv(`${prefix}PREFIX`, defaultProfile.prefix),
+      intentPrefix: trimEnv(`${prefix}INTENT_PREFIX`, defaultProfile.intentPrefix),
+      fileHolderPrefix: trimEnv(`${prefix}FILE_HOLDER_PREFIX`, defaultProfile.fileHolderPrefix)
+    });
+  });
+}
+
 const defaultProfile = loadDefaultProfile();
+const routingProfiles = loadRoutingProfiles(defaultProfile);
 const benchmarkProfiles = loadBenchmarkProfiles(defaultProfile);
 const profilesById = new Map([
   [defaultProfile.id, defaultProfile],
+  ...routingProfiles.map((profile) => [profile.id, profile]),
   ...benchmarkProfiles.map((profile) => [profile.id, profile])
 ]);
 const cachedClients = new Map();
@@ -181,8 +217,7 @@ function getProfile(profileId = DEFAULT_PROFILE_ID) {
   return profilesById.get(id) || null;
 }
 
-function isEnabled(profileId = DEFAULT_PROFILE_ID) {
-  const profile = getProfile(profileId);
+function profileIsEnabled(profile = null) {
   return Boolean(
     profile &&
     profile.bucket &&
@@ -190,6 +225,15 @@ function isEnabled(profileId = DEFAULT_PROFILE_ID) {
     profile.accessKeyId &&
     profile.secretAccessKey
   );
+}
+
+function isEnabled(profileId = "") {
+  const requestedId = String(profileId || "").trim();
+  if (!requestedId) {
+    return Array.from(profilesById.values()).some((profile) => profileIsEnabled(profile));
+  }
+  const profile = getProfile(requestedId);
+  return profileIsEnabled(profile);
 }
 
 function describeProfile(profileId = DEFAULT_PROFILE_ID) {
@@ -201,14 +245,27 @@ function describeProfile(profileId = DEFAULT_PROFILE_ID) {
     providerName: profile.providerName,
     region: profile.region,
     endpointHost: profile.endpointHost,
+    bucket: profile.bucket,
     forcePathStyle: Boolean(profile.forcePathStyle),
     enabled: isEnabled(profile.id),
     isDefault: profile.id === DEFAULT_PROFILE_ID
   };
 }
 
+function listRoutingTargets() {
+  return [defaultProfile, ...routingProfiles].map((profile) => describeProfile(profile.id));
+}
+
 function listUploadBenchmarkTargets() {
-  return [defaultProfile, ...benchmarkProfiles].map((profile) => describeProfile(profile.id));
+  const seen = new Set();
+  return [defaultProfile, ...routingProfiles, ...benchmarkProfiles]
+    .map((profile) => describeProfile(profile.id))
+    .filter((profile) => {
+      const id = String(profile?.id || "").trim();
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
 }
 
 function resolveProfileIdFromObjectKey(objectKey = "") {
@@ -230,8 +287,73 @@ function describeObjectKeyTarget(objectKey = "") {
 function embedProfileIdInObjectKey(objectKey = "", profileId = DEFAULT_PROFILE_ID) {
   const key = String(objectKey || "").trim().replace(/^\/+/, "");
   const id = normalizeProfileId(profileId);
-  if (!key || id === DEFAULT_PROFILE_ID) return key;
+  if (!key) return key;
+  if (key.startsWith(`${STORAGE_TARGET_KEY_PREFIX}/`)) return key;
+  if (id === DEFAULT_PROFILE_ID) return key;
   return `${STORAGE_TARGET_KEY_PREFIX}/${id}/${key}`;
+}
+
+function resolveProfileIdFromStorageMetadata(source = null) {
+  const input = source && typeof source === "object" ? source : {};
+  const explicitId = normalizeProfileId(
+    input.storageTargetId ||
+    input.targetId ||
+    input.profileId ||
+    ""
+  );
+  if (explicitId && getProfile(explicitId)) return explicitId;
+  return resolveProfileIdFromObjectKey(input.objectKey || input.storedObjectKey || "");
+}
+
+function resolveObjectKey(source = null, fallbackObjectKey = "") {
+  const input = source && typeof source === "object" ? source : {};
+  const rawKey = String(
+    input.objectKey ||
+    input.storedObjectKey ||
+    fallbackObjectKey ||
+    ""
+  ).trim();
+  if (!rawKey) return "";
+  if (rawKey.startsWith(`${STORAGE_TARGET_KEY_PREFIX}/`)) return rawKey.replace(/^\/+/, "");
+  const profileId = resolveProfileIdFromStorageMetadata(input);
+  return embedProfileIdInObjectKey(rawKey, profileId);
+}
+
+function buildCanonicalStorageMetadata(source = null, options = {}) {
+  const input = source && typeof source === "object" ? source : {};
+  const objectKey = resolveObjectKey({
+    ...input,
+    storageTargetId: options.storageTargetId || input.storageTargetId,
+    profileId: options.profileId || input.profileId
+  }, options.fallbackObjectKey || "");
+  if (!objectKey) return null;
+  const profileId = resolveProfileIdFromStorageMetadata({
+    ...input,
+    objectKey,
+    storageTargetId: options.storageTargetId || input.storageTargetId,
+    profileId: options.profileId || input.profileId
+  });
+  const profile = getProfile(profileId) || defaultProfile;
+  return {
+    storageProvider: String(profile?.providerName || "").trim(),
+    storageRegion: String(profile?.region || "").trim(),
+    storageTargetId: String(profile?.id || DEFAULT_PROFILE_ID).trim() || DEFAULT_PROFILE_ID,
+    storageEndpointHost: String(profile?.endpointHost || "").trim(),
+    bucket: String(profile?.bucket || "").trim(),
+    objectKey
+  };
+}
+
+function redactStorageMetadataForDiagnostics(source = null, options = {}) {
+  const metadata = buildCanonicalStorageMetadata(source, options);
+  if (!metadata) return null;
+  return {
+    storageProvider: metadata.storageProvider,
+    storageRegion: metadata.storageRegion,
+    storageTargetId: metadata.storageTargetId,
+    storageEndpointHost: metadata.storageEndpointHost,
+    bucket: metadata.bucket
+  };
 }
 
 function client(profileId = DEFAULT_PROFILE_ID) {
@@ -605,9 +727,14 @@ module.exports = {
   config: defaultProfile,
   isEnabled,
   describeProfile,
+  listRoutingTargets,
   listUploadBenchmarkTargets,
   resolveProfileIdFromObjectKey,
+  resolveProfileIdFromStorageMetadata,
   describeObjectKeyTarget,
+  resolveObjectKey,
+  buildCanonicalStorageMetadata,
+  redactStorageMetadataForDiagnostics,
   buildIntentObjectKey,
   buildFileHolderObjectKey,
   createUploadUrl,

@@ -46,6 +46,20 @@ function assertSafeStagingConfig() {
     throw new Error(`Refusing to boot staging without required env: ${missing.join(", ")}`);
   }
 
+  const optionalTargetValues = String(process.env.OBJECT_STORAGE_TARGETS || "")
+    .split(",")
+    .map((value) => normalizeStorageTargetId(value))
+    .filter(Boolean)
+    .flatMap((targetId) => {
+      const prefix = `OBJECT_STORAGE_TARGET_${targetId.toUpperCase()}_`;
+      return [
+        String(process.env[`${prefix}BUCKET`] || "").trim(),
+        String(process.env[`${prefix}PREFIX`] || "").trim(),
+        String(process.env[`${prefix}INTENT_PREFIX`] || "").trim(),
+        String(process.env[`${prefix}FILE_HOLDER_PREFIX`] || "").trim()
+      ];
+    });
+
   const stagingValues = [
     envAny(["MERM_SIGNAL_WS_URL"]),
     envAny(["MERM_SIGNAL_HTTP_BASE_URL"]),
@@ -54,8 +68,9 @@ function assertSafeStagingConfig() {
     envAny(["OBJECT_STORAGE_BUCKET", "BUCKET_NAME"]),
     envAny(["OBJECT_STORAGE_PREFIX"]),
     envAny(["OBJECT_STORAGE_INTENT_PREFIX"]),
-    envAny(["OBJECT_STORAGE_FILE_HOLDER_PREFIX"])
-  ].map((value) => String(value || "").toLowerCase());
+    envAny(["OBJECT_STORAGE_FILE_HOLDER_PREFIX"]),
+    ...optionalTargetValues
+  ].map((value) => String(value || "").toLowerCase()).filter(Boolean);
 
   const unsafe = stagingValues.some((value) => (
     value.includes("merm.fly.dev") ||
@@ -85,6 +100,178 @@ function runtimeConfigPayload() {
 }
 
 assertSafeStagingConfig();
+
+const STORAGE_ROUTE_REGION_EU = new Set([
+  "ad", "al", "at", "ax", "ba", "be", "bg", "by", "ch", "cy", "cz", "de", "dk", "ee", "es", "fi",
+  "fo", "fr", "gb", "gg", "gi", "gr", "hr", "hu", "ie", "im", "is", "it", "je", "li", "lt", "lu",
+  "lv", "mc", "md", "me", "mk", "mt", "nl", "no", "pl", "pt", "ro", "rs", "se", "si", "sj", "sk",
+  "sm", "ua", "va", "xk"
+]);
+const STORAGE_ROUTE_REGION_APAC = new Set([
+  "ae", "af", "au", "bd", "bh", "bn", "bt", "cc", "cn", "cx", "fj", "fm", "gu", "hk", "id", "il",
+  "in", "io", "ir", "jp", "jo", "kh", "ki", "kp", "kr", "kw", "kz", "la", "lb", "lk", "mh", "mm",
+  "mn", "mo", "mp", "mv", "my", "nc", "nf", "np", "nr", "nz", "om", "pg", "ph", "pk", "pn", "ps",
+  "pw", "qa", "sa", "sb", "sg", "sy", "th", "tj", "tk", "tl", "tm", "to", "tr", "tv", "tw", "uz",
+  "vn", "vu", "ws", "ye"
+]);
+const STORAGE_ROUTE_FLY_REGION_TO_CATEGORY = new Map([
+  ["ams", "eu"],
+  ["arn", "eu"],
+  ["cdg", "eu"],
+  ["fra", "eu"],
+  ["lhr", "eu"],
+  ["mad", "eu"],
+  ["ewr", "na"],
+  ["iad", "na"],
+  ["ord", "na"],
+  ["dfw", "na"],
+  ["den", "na"],
+  ["sea", "na"],
+  ["sjc", "na"],
+  ["lax", "na"],
+  ["mia", "na"],
+  ["yyz", "na"],
+  ["bog", "na"],
+  ["gru", "na"],
+  ["hkg", "apac"],
+  ["nrt", "apac"],
+  ["sin", "apac"],
+  ["syd", "apac"],
+  ["bom", "apac"],
+  ["maa", "apac"]
+]);
+
+function normalizeStorageTargetId(raw = "") {
+  const normalized = String(raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return normalized || objectStorage.DEFAULT_PROFILE_ID;
+}
+
+function enabledStorageTargets() {
+  return objectStorage
+    .listRoutingTargets()
+    .filter((target) => target && target.enabled);
+}
+
+function enabledStorageTargetIds() {
+  return enabledStorageTargets().map((target) => normalizeStorageTargetId(target.id));
+}
+
+function readHeaderValue(headers = {}, names = []) {
+  if (!headers || typeof headers !== "object") return "";
+  for (const name of names) {
+    const raw = headers[name];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    const normalized = String(value || "").split(",")[0].trim();
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+function inferStorageRegionCategoryFromCountry(countryCode = "") {
+  const code = String(countryCode || "").trim().toLowerCase();
+  if (!code || code === "xx" || code === "t1") return "";
+  if (STORAGE_ROUTE_REGION_EU.has(code)) return "eu";
+  if (STORAGE_ROUTE_REGION_APAC.has(code)) return "apac";
+  return "na";
+}
+
+function inferStorageRegionCategoryFromHeaders(headers = {}) {
+  const countryCode = readHeaderValue(headers, [
+    "cf-ipcountry",
+    "fly-client-country",
+    "x-vercel-ip-country",
+    "x-country-code"
+  ]);
+  const byCountry = inferStorageRegionCategoryFromCountry(countryCode);
+  if (byCountry) return byCountry;
+
+  const flyRegion = readHeaderValue(headers, [
+    "fly-region",
+    "x-fly-region",
+    "x-region"
+  ]).toLowerCase();
+  if (flyRegion && STORAGE_ROUTE_FLY_REGION_TO_CATEGORY.has(flyRegion)) {
+    return STORAGE_ROUTE_FLY_REGION_TO_CATEGORY.get(flyRegion) || "";
+  }
+  return "";
+}
+
+function chooseAutoStorageTargetIdFromHeaders(headers = {}) {
+  const availableIds = enabledStorageTargetIds();
+  if (!availableIds.length) return objectStorage.DEFAULT_PROFILE_ID;
+  const regionCategory = inferStorageRegionCategoryFromHeaders(headers);
+  const preferredByCategory = {
+    eu: "eu_primary",
+    na: "na_primary",
+    apac: "apac_primary"
+  };
+  const preferredId = normalizeStorageTargetId(preferredByCategory[regionCategory] || "");
+  if (preferredId && availableIds.includes(preferredId)) return preferredId;
+  if (availableIds.includes("r2_global")) return "r2_global";
+  if (availableIds.includes(objectStorage.DEFAULT_PROFILE_ID)) return objectStorage.DEFAULT_PROFILE_ID;
+  return availableIds[0] || objectStorage.DEFAULT_PROFILE_ID;
+}
+
+function resolveStorageTargetIdFromContext(options = {}) {
+  const existingId = normalizeStorageTargetId(
+    options.existingTargetId ||
+    options.intent?.storageTargetId ||
+    options.intent?.objectUploadSession?.storageTargetId ||
+    options.item?.storageTargetId ||
+    ""
+  );
+  if (existingId && objectStorage.describeProfile(existingId)?.enabled) return existingId;
+
+  const diagnosticTargetId = normalizeStorageTargetId(options.diagnosticTargetId || "");
+  if (options.allowDiagnosticTarget && diagnosticTargetId && objectStorage.describeProfile(diagnosticTargetId)?.enabled) {
+    return diagnosticTargetId;
+  }
+
+  const headers = options.headers
+    || options.req?.headers
+    || options.ws?.requestHeaders
+    || {};
+  return chooseAutoStorageTargetIdFromHeaders(headers);
+}
+
+function resolveStoredObjectKey(record = null, fallbackObjectKey = "") {
+  if (!record || typeof record !== "object") {
+    return objectStorage.resolveObjectKey({}, fallbackObjectKey);
+  }
+  return objectStorage.resolveObjectKey(record, fallbackObjectKey);
+}
+
+function applyCanonicalStorageMetadata(record = null, source = null, options = {}) {
+  if (!record || typeof record !== "object") return null;
+  const metadata = objectStorage.buildCanonicalStorageMetadata(source || record, options);
+  if (!metadata) {
+    record.storageProvider = "";
+    record.storageRegion = "";
+    record.storageTargetId = "";
+    record.storageEndpointHost = "";
+    record.bucket = "";
+    record.objectKey = "";
+    return null;
+  }
+  record.storageProvider = metadata.storageProvider;
+  record.storageRegion = metadata.storageRegion;
+  record.storageTargetId = metadata.storageTargetId;
+  record.storageEndpointHost = metadata.storageEndpointHost;
+  record.bucket = metadata.bucket;
+  record.objectKey = metadata.objectKey;
+  if (options.syncStoredObjectKey !== false) {
+    record.storedObjectKey = metadata.objectKey;
+  }
+  return metadata;
+}
+
+function redactStorageMetadataForDiagnostics(record = null, options = {}) {
+  return objectStorage.redactStorageMetadataForDiagnostics(record, options);
+}
 
 const RETENTION_DAYS = Math.max(0, Number(process.env.RETENTION_DAYS || 0));
 const RETENTION_MS = RETENTION_DAYS > 0 ? (RETENTION_DAYS * 24 * 60 * 60 * 1000) : 0;
@@ -1233,7 +1420,7 @@ function openObjectStorageZipFile(objectKey = "", totalSize = 0, options = {}) {
 
 async function buildIntentArchiveSource(intent = null) {
   if (!intent || typeof intent !== "object") return null;
-  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(intent);
   if (storedObjectKey && objectStorage.isEnabled()) {
     let size = buildIntentStoredSizeHint(intent);
     let mtimeMs = Math.max(0, Number(intent.updatedAt || intent.createdAt || 0));
@@ -1639,6 +1826,12 @@ async function finalizeAccountRelayUploadedIntent(intentId = "", session = null,
   const safeName = safeBasename(String(intent.fileName || storedFileName || "file"));
   intent.storedFile = storedFileName;
   intent.storedObjectKey = null;
+  intent.objectKey = "";
+  intent.storageProvider = "";
+  intent.storageRegion = "";
+  intent.storageEndpointHost = "";
+  intent.bucket = "";
+  intent.storageTargetId = String(activeSession?.storageTargetId || intent.storageTargetId || "").trim();
   intent.objectUploadSession = null;
   let finalizedStoredBytes = Math.max(
     0,
@@ -2335,7 +2528,7 @@ async function serveFileFromObjectStorage(req, res, objectKey, safeName, disposi
 
 async function ensureIntentStoredFilePath(intent = null) {
   if (!intent || typeof intent !== "object") return "";
-  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(intent);
   if (storedObjectKey && objectStorage.isEnabled()) {
     const outputPath = resolveIntentObjectCachePath(intent);
     if (!outputPath) return "";
@@ -2410,7 +2603,7 @@ async function ensureIntentStoredFilePath(intent = null) {
 
 async function loadIntentStoredFileBuffer(intent = null) {
   if (!intent || typeof intent !== "object") return null;
-  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(intent);
   if (storedObjectKey && objectStorage.isEnabled()) {
     try {
       return await objectStorage.readObjectBuffer(storedObjectKey);
@@ -2443,7 +2636,7 @@ async function resolveIntentStoredAssetBytes(intent = null, fallbackBytes = 0) {
   );
   if (size > 0) return size;
 
-  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(intent);
   if (storedObjectKey && objectStorage.isEnabled()) {
     try {
       const head = await objectStorage.headObject(storedObjectKey);
@@ -2574,7 +2767,7 @@ async function maybeSanitizeIntentStoredFolderBundle(intent = null, options = {}
     return { sanitized: false, bytes: Math.max(0, Number(stripped.buffer.length || 0)) };
   }
 
-  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(intent);
   const storedFile = String(intent.storedFile || "").trim();
   const safeName = safeBasename(String(intent.fileName || storedFile || "file"));
   const contentType = String(intent.mime || "").trim() || contentTypeForName(safeName);
@@ -2631,7 +2824,7 @@ async function serveStoredIntentDownload(req, res, intent = null, dispositionTyp
   const safeName = safeBasename(String(intent?.fileName || "file"));
   const rawMime = String(intent?.mime || "").trim() || contentTypeForName(safeName);
   const presentation = buildDownloadPresentation(safeName, rawMime);
-  const storedObjectKey = String(intent?.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(intent);
   if (
     dispositionType === "attachment" &&
     storedObjectKey &&
@@ -3013,6 +3206,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const clientUploadId = String(body?.clientUploadId || "").trim().slice(0, 160);
+      const storageTargetId = resolveStorageTargetIdFromContext({ req, intent });
       let uploadSession = findAccountRelayUploadSessionByClientUploadId(intentId, username, clientUploadId);
       if (!uploadSession) {
         uploadSession = findLatestAccountRelayUploadSessionForIntent(intentId, username);
@@ -3055,6 +3249,7 @@ const server = http.createServer(async (req, res) => {
           username,
           originalName,
           mime: uploadMime,
+          storageTargetId,
           size: expectedBytes,
           partSize,
           totalParts,
@@ -3392,7 +3587,9 @@ const server = http.createServer(async (req, res) => {
           enabled: true,
           intentId,
           alreadyStored: true,
-          storageTarget: objectStorage.describeObjectKeyTarget(intent.storedObjectKey || ""),
+          storageTarget: redactStorageMetadataForDiagnostics(intent, {
+            fallbackObjectKey: intent.storedObjectKey || ""
+          }),
           bytesExpected: expectedBytes,
           plainBytesExpected: Number(intent.fileSize || 0)
         }));
@@ -3411,8 +3608,14 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, message: "Requested benchmark storage target is not configured in staging" }));
         return;
       }
+      const storageTargetId = resolveStorageTargetIdFromContext({
+        req,
+        intent,
+        allowDiagnosticTarget: true,
+        diagnosticTargetId: diagnosticStorageTarget?.id || ""
+      });
       const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName, {
-        profileId: diagnosticStorageTarget?.id || objectStorage.DEFAULT_PROFILE_ID
+        profileId: storageTargetId
       });
       const shouldUseMultipart = diagnosticUploadPlan?.mode
         ? diagnosticUploadPlan.mode === "multipart"
@@ -3502,6 +3705,11 @@ const server = http.createServer(async (req, res) => {
         intent.status = "uploading";
         intent.transferState = "uploading";
         intent.updatedAt = Date.now();
+        applyCanonicalStorageMetadata(intent, {
+          storageTargetId: existingSession.storageProfileId || storageTargetId,
+          objectKey: existingSession.objectKey,
+          storedObjectKey: existingSession.objectKey
+        });
         saveIntent(intent);
         emitTransferState(intent, "uploading", {
           sentBytes: confirmedBytes,
@@ -3527,7 +3735,9 @@ const server = http.createServer(async (req, res) => {
           intentId,
           upload: uploadPlan,
           status: statusPayload,
-          storageTarget: objectStorage.describeObjectKeyTarget(existingSession.objectKey || ""),
+          storageTarget: redactStorageMetadataForDiagnostics(existingSession, {
+            fallbackObjectKey: existingSession.objectKey || ""
+          }),
           bytesExpected: expectedBytes,
           plainBytesExpected: Number(intent.fileSize || 0),
           storedFile: storedFileName
@@ -3536,8 +3746,9 @@ const server = http.createServer(async (req, res) => {
       }
 
       await clearIntentObjectUploadSession(intent, { abortRemote: true });
-      if (intent.storedObjectKey) {
-        try { await objectStorage.deleteObject(intent.storedObjectKey); } catch {}
+      const existingObjectKey = resolveStoredObjectKey(intent);
+      if (existingObjectKey) {
+        try { await objectStorage.deleteObject(existingObjectKey); } catch {}
       }
       removeIntentCachedObjectFile(intent.id);
 
@@ -3625,6 +3836,11 @@ const server = http.createServer(async (req, res) => {
       intent.status = "uploading";
       intent.transferState = "uploading";
       intent.updatedAt = Date.now();
+      applyCanonicalStorageMetadata(intent, {
+        storageTargetId,
+        objectKey,
+        storedObjectKey: objectKey
+      });
       saveIntent(intent);
       emitTransferState(intent, "uploading", {
         sentBytes: 0,
@@ -3656,7 +3872,10 @@ const server = http.createServer(async (req, res) => {
           intentId,
           upload: uploadPlan,
           status: statusPayload,
-          storageTarget: objectStorage.describeObjectKeyTarget(objectKey),
+          storageTarget: redactStorageMetadataForDiagnostics({
+            storageTargetId,
+            objectKey
+          }),
           bytesExpected: expectedBytes,
           plainBytesExpected: Number(intent.fileSize || 0),
           storedFile: storedFileName
@@ -3943,7 +4162,9 @@ const server = http.createServer(async (req, res) => {
           intentId: intent.id,
           finalized: true,
           alreadyStored: true,
-          storageTarget: objectStorage.describeObjectKeyTarget(intent.storedObjectKey || ""),
+          storageTarget: redactStorageMetadataForDiagnostics(intent, {
+            fallbackObjectKey: intent.storedObjectKey || ""
+          }),
           bytesExpected: Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0),
           bytesUploadedConfirmed: Number(intent.storedBytes || 0),
           plainBytesExpected: Number(intent.fileSize || 0),
@@ -4069,7 +4290,8 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, message: "Not authorized" }));
         return;
       }
-      if (!intent.storedObjectKey) {
+      const intentObjectKey = resolveStoredObjectKey(intent);
+      if (!intentObjectKey) {
         res.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
         res.end(JSON.stringify({ ok: false, message: "Upload has not been initialized" }));
         return;
@@ -4080,7 +4302,9 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           intentId: intent.id,
           storedFile: intent.storedFile || null,
-          storageTarget: objectStorage.describeObjectKeyTarget(intent.storedObjectKey || ""),
+          storageTarget: redactStorageMetadataForDiagnostics(intent, {
+            fallbackObjectKey: intentObjectKey
+          }),
           bytesStored: Number(intent.storedBytes || 0),
           deliveryHeld: isIntentDeliveryHeld(intent),
           alreadyStored: true
@@ -4212,7 +4436,10 @@ const server = http.createServer(async (req, res) => {
         const reportedBytes = Math.max(0, Number(body?.size || 0));
         let actualBytes = reportedBytes;
         if (actualBytes <= 0) {
-          const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
+          const finalizedObjectKey = resolveStoredObjectKey(intent, session.objectKey);
+          const head = finalizedObjectKey
+            ? await objectStorage.headObject(finalizedObjectKey).catch(() => null)
+            : null;
           if (!head) {
             clearFinalizing();
             res.writeHead(404, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
@@ -4247,7 +4474,9 @@ const server = http.createServer(async (req, res) => {
           ok: true,
           intentId: intent.id,
           storedFile: intent.storedFile || null,
-          storageTarget: objectStorage.describeObjectKeyTarget(intent.storedObjectKey || ""),
+          storageTarget: redactStorageMetadataForDiagnostics(intent, {
+            fallbackObjectKey: intent.storedObjectKey || ""
+          }),
           bytesStored: actualBytes,
           deliveryHeld: isIntentDeliveryHeld(intent)
         }));
@@ -4407,6 +4636,7 @@ const server = http.createServer(async (req, res) => {
       const mime = normalizeFileHolderMime(String(mimeHeader || "").trim(), safeName);
       const now = Date.now();
       const itemId = randomUUID();
+      const storageTargetId = resolveStorageTargetIdFromContext({ req });
       const ext = String(path.extname(safeName || "") || "").toLowerCase().replace(/[^a-z0-9.]/g, "").slice(0, 12);
       const storedFile = `${now}-${itemId}${ext || ""}`;
       const outputPath = path.join(FILE_HOLDER_DIR, storedFile);
@@ -4418,7 +4648,9 @@ const server = http.createServer(async (req, res) => {
         const streamed = await streamRequestBodyToFile(req, tempPath, FILE_HOLDER_MAX_FILE_BYTES);
         let storedObjectKey = null;
         if (objectStorage.isEnabled()) {
-          storedObjectKey = objectStorage.buildFileHolderObjectKey(username, itemId, safeName);
+          storedObjectKey = objectStorage.buildFileHolderObjectKey(username, itemId, safeName, {
+            profileId: storageTargetId
+          });
           await objectStorage.putFile(storedObjectKey, tempPath, mime);
           try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
         }
@@ -4426,12 +4658,23 @@ const server = http.createServer(async (req, res) => {
           id: itemId,
           storedFile,
           storedObjectKey,
+          storageTargetId,
+          storageProvider: "",
+          storageRegion: "",
+          storageEndpointHost: "",
+          bucket: "",
+          objectKey: storedObjectKey || "",
           name: safeName,
           size: Math.max(0, Number(streamed?.bytes || 0)),
           mime,
           createdAt: now,
           updatedAt: now
         };
+        applyCanonicalStorageMetadata(nextEntry, {
+          storageTargetId,
+          objectKey: storedObjectKey,
+          storedObjectKey
+        }, { syncStoredObjectKey: false });
         const result = updateUserFileHolderState(username, (draft) => {
           draft.unshift(nextEntry);
           if (draft.length > FILE_HOLDER_MAX_ITEMS) {
@@ -4453,7 +4696,9 @@ const server = http.createServer(async (req, res) => {
         try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
         if (objectStorage.isEnabled()) {
           try {
-            const objectKey = objectStorage.buildFileHolderObjectKey(username, itemId, safeName);
+            const objectKey = objectStorage.buildFileHolderObjectKey(username, itemId, safeName, {
+              profileId: storageTargetId
+            });
             await objectStorage.deleteObject(objectKey);
           } catch {}
         }
@@ -4493,7 +4738,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const storedFile = safeBasename(String(item?.storedFile || "").trim());
-      const storedObjectKey = String(item?.storedObjectKey || "").trim();
+      const storedObjectKey = resolveStoredObjectKey(item);
       const filePath = storedFile ? path.join(FILE_HOLDER_DIR, storedFile) : "";
       let missing = false;
       if (storedObjectKey && objectStorage.isEnabled()) {
@@ -4850,7 +5095,7 @@ const GUEST_TRANSFER_REQUESTS_FILE = path.join(STORAGE_DIR, "guest-transfer-requ
 
 function storedAssetIdFromIntent(intent = null) {
   if (!intent || typeof intent !== "object") return "";
-  const objectKey = String(intent.storedObjectKey || "").trim();
+  const objectKey = resolveStoredObjectKey(intent);
   if (objectKey) return `object:${objectKey}`;
   const storedFile = String(intent.storedFile || "").trim();
   if (storedFile) return `file:${storedFile}`;
@@ -5115,7 +5360,11 @@ function normalizeObjectUploadSession(raw = null) {
   const mode = String(raw.mode || "").trim().toLowerCase();
   const objectKey = String(raw.objectKey || "").trim();
   if (!mode || !objectKey) return null;
-  const storageProfileId = objectStorage.resolveProfileIdFromObjectKey(objectKey);
+  const storageProfileId = normalizeStorageTargetId(
+    raw.storageProfileId ||
+    raw.storageTargetId ||
+    objectStorage.resolveProfileIdFromStorageMetadata(raw)
+  );
   if (mode === "multipart") {
     const uploadId = String(raw.uploadId || "").trim();
     if (!uploadId) return null;
@@ -5187,7 +5436,10 @@ function buildIntentObjectUploadStatusPayload(intent = null, uploadSession = nul
   if (!session) return null;
   const expectedBytes = Math.max(0, Number(resolveUploadExpectedBytes(intent) || intent.fileSize || 0));
   const completedParts = normalizeObjectMultipartPartRows(options?.completedParts || session.completedPartsByNumber || []);
-  const storageTarget = objectStorage.describeObjectKeyTarget(session.objectKey || intent.storedObjectKey || "");
+  const storageTarget = redactStorageMetadataForDiagnostics(session, {
+    storageTargetId: session.storageProfileId,
+    fallbackObjectKey: session.objectKey || intent.storedObjectKey || ""
+  });
   const bytesUploadedConfirmedRaw = Number(
     options?.bytesUploadedConfirmed != null
       ? options.bytesUploadedConfirmed
@@ -5233,7 +5485,7 @@ function deleteStoredAssetForIntent(intent = null) {
   if (!intent || typeof intent !== "object") return;
   abortAccountRelayUploadSessionsForIntent(intent.id);
   clearIntentObjectUploadSession(intent, { abortRemote: true }).catch(() => {});
-  const objectKey = String(intent.storedObjectKey || "").trim();
+  const objectKey = resolveStoredObjectKey(intent);
   if (objectKey && objectStorage.isEnabled()) {
     objectStorage.deleteObject(objectKey).catch((err) => {
       try { console.error("❌ Failed to delete object storage asset:", err); } catch {}
@@ -5268,7 +5520,13 @@ function collectStoredIntentAssets(limit = Infinity) {
       rows.push({
         assetId,
         storedFile: String(intent?.storedFile || "").trim() || null,
-        storedObjectKey: String(intent?.storedObjectKey || "").trim() || null,
+        storedObjectKey: resolveStoredObjectKey(intent) || null,
+        storageProvider: String(intent?.storageProvider || "").trim() || null,
+        storageRegion: String(intent?.storageRegion || "").trim() || null,
+        storageTargetId: String(intent?.storageTargetId || "").trim() || null,
+        storageEndpointHost: String(intent?.storageEndpointHost || "").trim() || null,
+        bucket: String(intent?.bucket || "").trim() || null,
+        objectKey: String(intent?.objectKey || resolveStoredObjectKey(intent) || "").trim() || null,
         name: String(intent?.fileName || intent?.storedFile || "file"),
         size: resolveStoredAssetSize(intent),
         intentId: String(intent?.id || "").trim() || null,
@@ -5406,7 +5664,7 @@ function collectIntentDeletionFamily(intent = null) {
 
 function intentDeletionAssetKey(intent = null) {
   if (!intent || typeof intent !== "object") return "";
-  const objectKey = String(intent.storedObjectKey || intent.objectUploadSession?.objectKey || "").trim();
+  const objectKey = resolveStoredObjectKey(intent, intent.objectUploadSession?.objectKey || "");
   if (objectKey) return `object:${objectKey}`;
   const storedFile = String(intent.storedFile || "").trim();
   if (storedFile) return `file:${storedFile}`;
@@ -5558,15 +5816,18 @@ function storageBytesUsed() {
 
 function largestStoredFiles(limit = 50) {
   try {
-    const files = collectStoredIntentAssets().map((entry) => ({
-      storedFile: entry.storedFile || (entry.storedObjectKey ? `obj:${entry.storedObjectKey}` : null),
-      name: entry.name,
-      size: Math.max(0, Number(entry.size || 0)),
-      intentId: entry.intentId || null,
-      from: entry.from || null,
-      to: entry.to || null,
-      createdAt: entry.createdAt || null
-    }));
+      const files = collectStoredIntentAssets().map((entry) => {
+        const storedObjectKey = resolveStoredObjectKey(entry);
+        return {
+          storedFile: entry.storedFile || (storedObjectKey ? `obj:${storedObjectKey}` : null),
+          name: entry.name,
+          size: Math.max(0, Number(entry.size || 0)),
+          intentId: entry.intentId || null,
+          from: entry.from || null,
+          to: entry.to || null,
+          createdAt: entry.createdAt || null
+        };
+      });
     files.sort((a, b) => b.size - a.size);
     return files.slice(0, limit);
   } catch {
@@ -5635,7 +5896,7 @@ function buildUserStoragePayload(username) {
       }
       sentFiles.push({
         storedFile: intent.storedFile,
-        storedObjectKey: String(intent.storedObjectKey || "").trim() || null,
+        storedObjectKey: resolveStoredObjectKey(intent) || null,
         name: intent.fileName || intent.storedFile,
         size: fileSizeOnDisk,
         intentId: intent.id || null,
@@ -6039,6 +6300,12 @@ function intentForClient(rawIntent) {
   if (!rawIntent || typeof rawIntent !== "object") return null;
   const intent = { ...rawIntent };
   delete intent.accessControl;
+  delete intent.storageProvider;
+  delete intent.storageRegion;
+  delete intent.storageTargetId;
+  delete intent.storageEndpointHost;
+  delete intent.bucket;
+  delete intent.objectKey;
   intent.passwordProtected = isIntentPasswordProtected(rawIntent);
   if (intent.passwordProtected) {
     intent.passwordMode = getIntentPasswordMode(rawIntent);
@@ -6372,6 +6639,9 @@ function finalizeObjectUploadIntent(intent, actualBytes, expectedBytes = 0) {
   intent.plainStoredBytes = uploadBytesToPlainBytes(intent, bytesStored);
   intent.uploadedAt = Date.now();
   intent.updatedAt = intent.uploadedAt;
+  applyCanonicalStorageMetadata(intent, intent, {
+    fallbackObjectKey: intent.storedObjectKey
+  });
   saveIntent(intent);
   emitTransferState(intent, "delivered", {
     sentBytes: bytesStored,
@@ -6480,9 +6750,17 @@ function queueInlineStoredIntentOffload(intentId = "", payloadBuffer = null, opt
     try {
       const latest = loadIntent(id);
       if (!latest) return;
-      const objectKey = String(latest.storedObjectKey || "").trim() || objectStorage.buildIntentObjectKey(id, safeName);
+      const objectKey = resolveStoredObjectKey(latest)
+        || objectStorage.buildIntentObjectKey(id, safeName, {
+          profileId: resolveStorageTargetIdFromContext({ intent: latest })
+        });
       await objectStorage.putBuffer(objectKey, payload, contentTypeForName(safeName));
       latest.storedObjectKey = objectKey;
+      applyCanonicalStorageMetadata(latest, {
+        storageTargetId: latest.storageTargetId || objectStorage.resolveProfileIdFromObjectKey(objectKey),
+        objectKey,
+        storedObjectKey: objectKey
+      });
       saveIntent(latest);
 
       if (latest.groupId) {
@@ -6491,6 +6769,11 @@ function queueInlineStoredIntentOffload(intentId = "", payloadBuffer = null, opt
           const mirror = loadIntent(String(mirrorId || "").trim());
           if (!mirror) return;
           mirror.storedObjectKey = objectKey;
+          applyCanonicalStorageMetadata(mirror, {
+            storageTargetId: latest.storageTargetId || objectStorage.resolveProfileIdFromObjectKey(objectKey),
+            objectKey,
+            storedObjectKey: objectKey
+          });
           saveIntent(mirror);
         });
       }
@@ -6516,12 +6799,19 @@ function queueStoredFileIntentOffload(intentId = "", localFilePath = "", options
       if (!fs.existsSync(filePath)) return;
       const latest = loadIntent(id);
       if (!latest || !latest.stored) return;
-      const objectKey = String(latest.storedObjectKey || "").trim()
-        || objectStorage.buildIntentObjectKey(id, String(latest.storedFile || safeName || "file"));
+      const objectKey = resolveStoredObjectKey(latest)
+        || objectStorage.buildIntentObjectKey(id, String(latest.storedFile || safeName || "file"), {
+          profileId: resolveStorageTargetIdFromContext({ intent: latest })
+        });
       await objectStorage.putFile(objectKey, filePath, contentTypeForName(safeName));
       const refreshed = loadIntent(id) || latest;
       refreshed.storedObjectKey = objectKey;
       refreshed.updatedAt = Date.now();
+      applyCanonicalStorageMetadata(refreshed, {
+        storageTargetId: refreshed.storageTargetId || objectStorage.resolveProfileIdFromObjectKey(objectKey),
+        objectKey,
+        storedObjectKey: objectKey
+      });
       saveIntent(refreshed);
 
       if (refreshed.groupId) {
@@ -6531,6 +6821,11 @@ function queueStoredFileIntentOffload(intentId = "", localFilePath = "", options
           if (!mirror) return;
           mirror.storedObjectKey = objectKey;
           mirror.updatedAt = Date.now();
+          applyCanonicalStorageMetadata(mirror, {
+            storageTargetId: refreshed.storageTargetId || objectStorage.resolveProfileIdFromObjectKey(objectKey),
+            objectKey,
+            storedObjectKey: objectKey
+          });
           saveIntent(mirror);
         });
       }
@@ -6857,6 +7152,11 @@ function finalizeGroupRecipientCopies(primaryIntent, options = {}) {
     mirror.stored = true;
     mirror.storedFile = primary.storedFile || mirror.storedFile || null;
     mirror.storedObjectKey = primary.storedObjectKey || mirror.storedObjectKey || null;
+    applyCanonicalStorageMetadata(mirror, {
+      storageTargetId: primary.storageTargetId || mirror.storageTargetId,
+      objectKey: primary.objectKey || primary.storedObjectKey || mirror.storedObjectKey || "",
+      storedObjectKey: primary.storedObjectKey || mirror.storedObjectKey || ""
+    });
     mirror.storedBytes = storedBytes;
     mirror.plainStoredBytes = uploadBytesToPlainBytes(mirror, storedBytes);
     mirror.uploadBytesExpected = Number(mirror.uploadBytesExpected || primary.uploadBytesExpected || totalBytes || 0);
@@ -7668,8 +7968,11 @@ function normalizeFileHolderEntry(entry = null) {
   const id = String(entry.id || entry.itemId || "").trim().slice(0, 128);
   if (!id) return null;
   const storedFile = safeBasename(String(entry.storedFile || "").trim());
-  const storedObjectKey = String(entry.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(entry);
   if (!storedFile && !storedObjectKey) return null;
+  const canonicalStorage = objectStorage.buildCanonicalStorageMetadata(entry, {
+    fallbackObjectKey: storedObjectKey
+  });
   const name = safeBasename(String(entry.name || entry.fileName || "file").trim() || "file");
   const sizeRaw = Number(entry.size || entry.bytes || 0);
   const size = Number.isFinite(sizeRaw) && sizeRaw > 0 ? Math.floor(sizeRaw) : 0;
@@ -7681,6 +7984,12 @@ function normalizeFileHolderEntry(entry = null) {
     id,
     storedFile: storedFile || null,
     storedObjectKey: storedObjectKey || null,
+    storageProvider: String(canonicalStorage?.storageProvider || entry.storageProvider || "").trim(),
+    storageRegion: String(canonicalStorage?.storageRegion || entry.storageRegion || "").trim(),
+    storageTargetId: normalizeStorageTargetId(canonicalStorage?.storageTargetId || entry.storageTargetId || ""),
+    storageEndpointHost: String(canonicalStorage?.storageEndpointHost || entry.storageEndpointHost || "").trim(),
+    bucket: String(canonicalStorage?.bucket || entry.bucket || "").trim(),
+    objectKey: String(canonicalStorage?.objectKey || entry.objectKey || storedObjectKey || "").trim() || null,
     name,
     size,
     mime: normalizeFileHolderMime(entry.mime || entry.contentType || "", name),
@@ -7727,6 +8036,12 @@ function sameFileHolderEntries(a = [], b = []) {
     if (String(left.id || "") !== String(right.id || "")) return false;
     if (String(left.storedFile || "") !== String(right.storedFile || "")) return false;
     if (String(left.storedObjectKey || "") !== String(right.storedObjectKey || "")) return false;
+    if (String(left.storageProvider || "") !== String(right.storageProvider || "")) return false;
+    if (String(left.storageRegion || "") !== String(right.storageRegion || "")) return false;
+    if (String(left.storageTargetId || "") !== String(right.storageTargetId || "")) return false;
+    if (String(left.storageEndpointHost || "") !== String(right.storageEndpointHost || "")) return false;
+    if (String(left.bucket || "") !== String(right.bucket || "")) return false;
+    if (String(left.objectKey || "") !== String(right.objectKey || "")) return false;
     if (String(left.name || "") !== String(right.name || "")) return false;
     if (Number(left.size || 0) !== Number(right.size || 0)) return false;
     if (String(left.mime || "") !== String(right.mime || "")) return false;
@@ -7756,7 +8071,7 @@ function fileHolderStateForClient(userRecord = null) {
 }
 
 function removeFileHolderStoredEntry(entry = null) {
-  const storedObjectKey = String(entry?.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(entry);
   if (storedObjectKey && objectStorage.isEnabled()) {
     objectStorage.deleteObject(storedObjectKey).catch(() => {});
   }
@@ -7799,8 +8114,8 @@ function updateUserFileHolderState(username = "", mutator = null, options = {}) 
   const retainedStored = new Set(nextItems.map((entry) => String(entry?.storedFile || "").trim()).filter(Boolean));
   prevItems.forEach((entry) => {
     const stored = String(entry?.storedFile || "").trim();
-    const objectKey = String(entry?.storedObjectKey || "").trim();
-    const retainedObject = nextItems.some((row) => String(row?.storedObjectKey || "").trim() === objectKey && objectKey);
+    const objectKey = resolveStoredObjectKey(entry);
+    const retainedObject = nextItems.some((row) => resolveStoredObjectKey(row) === objectKey && objectKey);
     if ((!stored || retainedStored.has(stored)) && (!objectKey || retainedObject)) return;
     removeFileHolderStoredEntry(entry);
   });
@@ -8315,6 +8630,7 @@ wss.on("connection", (ws, req) => {
   try { ws?._socket?.setKeepAlive(true, 15_000); } catch {}
 
   const endpoint = getPublicEndpoint(req);
+  ws.requestHeaders = req?.headers || {};
 ws.publicIp = endpoint.ip;
 ws.publicPort = endpoint.port;
 
@@ -8842,7 +9158,7 @@ if (data.type === "download_ws_request") {
     size: intent.fileSize,
   });
 
-  const storedObjectKey = String(intent.storedObjectKey || "").trim();
+  const storedObjectKey = resolveStoredObjectKey(intent);
   const rs = storedObjectKey && objectStorage.isEnabled()
     ? ((await objectStorage.getObjectStream(storedObjectKey))?.body || null)
     : (() => {
@@ -10165,7 +10481,8 @@ if (data.type === "upload_progress") {
   const intent = loadIntent(intentId);
   if (!intent) return;
   if (intent.from !== ws.username) return;
-  if (!intent.storedObjectKey || !objectStorage.isEnabled()) return;
+  const progressObjectKey = resolveStoredObjectKey(intent);
+  if (!progressObjectKey || !objectStorage.isEnabled()) return;
   const transferState = String(intent.transferState || "").trim().toLowerCase();
   if (
     intent.stored ||
@@ -10230,7 +10547,7 @@ if (data.type === "upload_progress") {
       sentBytes,
       expectedBytes
     });
-    const head = await objectStorage.headObject(intent.storedObjectKey).catch(() => null);
+    const head = await objectStorage.headObject(progressObjectKey).catch(() => null);
     const headSize = Math.max(0, Number(head?.size || 0));
     if (head && headSize === expectedBytes) {
       finalizeObjectUploadIntent(intent, headSize, expectedBytes);
@@ -10337,8 +10654,9 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
   if (!receiverWs) {
     const safeName = safeBasename(name);
     await clearIntentObjectUploadSession(intent, { abortRemote: true });
-    if (intent.storedObjectKey && objectStorage.isEnabled()) {
-      try { await objectStorage.deleteObject(intent.storedObjectKey); } catch {}
+    const previousObjectKey = resolveStoredObjectKey(intent);
+    if (previousObjectKey && objectStorage.isEnabled()) {
+      try { await objectStorage.deleteObject(previousObjectKey); } catch {}
       intent.storedObjectKey = null;
     }
     removeIntentCachedObjectFile(intent.id);
@@ -10397,6 +10715,11 @@ if (ws.client !== "ios" || !receiverWs || receiverWs.client !== "ios") {
 intent.stored = false;
 intent.storedFile = storedFileName;
 intent.storedObjectKey = null;
+intent.objectKey = "";
+intent.storageProvider = "";
+intent.storageRegion = "";
+intent.storageEndpointHost = "";
+intent.bucket = "";
 intent.objectUploadSession = null;
 intent.storedBytes = resumeFrom;
 intent.plainStoredBytes = uploadBytesToPlainBytes(intent, resumeFrom);
@@ -10814,6 +11137,10 @@ if (data.type === "send_intent") {
     }
   }
 
+  const storageTargetId = isTextOnly
+    ? ""
+    : resolveStorageTargetIdFromContext({ ws });
+
   const baseIntent = {
     from: ws.username,
     fileName: isTextOnly ? "" : fileName,
@@ -10837,6 +11164,12 @@ if (data.type === "send_intent") {
     customExpiry: Boolean(!isTextOnly && hasCustomExpiry && expiresAt > 0),
     status: isTextOnly ? "completed" : "pending",
     transferState: isTextOnly ? "delivered" : "queued",
+    storageTargetId,
+    storageProvider: "",
+    storageRegion: "",
+    storageEndpointHost: "",
+    bucket: "",
+    objectKey: "",
     readByRecipientAt: null,
     groupId: isGroupSend ? targetGroup.id : "",
     groupName: isGroupSend ? normalizeGroupName(targetGroup.name || "") : "",
