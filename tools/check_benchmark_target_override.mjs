@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import WebSocket from "ws";
 
-const httpBaseUrl = process.env.MERM_SIGNAL_HTTP_BASE_URL || "https://p2p-signal-staging.fly.dev";
-const wsUrl = process.env.MERM_SIGNAL_WS_URL || "wss://p2p-signal-staging.fly.dev";
+const httpBaseUrl = String(process.env.MERM_SIGNAL_HTTP_BASE_URL || "").trim();
+const wsUrl = String(process.env.MERM_SIGNAL_WS_URL || "").trim();
 const fileSize = 23 * 1024 * 1024;
 const fileName = "bench-23mb.mp4";
 
@@ -145,6 +145,9 @@ async function initUpload(username, sessionToken, intentId, diagnosticStorageTar
 }
 
 async function main() {
+  if (!httpBaseUrl || !wsUrl) {
+    throw new Error("Set MERM_SIGNAL_HTTP_BASE_URL and MERM_SIGNAL_WS_URL before running this diagnostic.");
+  }
   const auth = await createBenchAuth();
   try {
     const defaultIntentId = await createIntent(auth.ws, auth.username, "benchmark default target check");
