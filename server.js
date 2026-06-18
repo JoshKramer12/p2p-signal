@@ -218,6 +218,16 @@ function chooseAutoStorageTargetIdFromHeaders(headers = {}) {
 }
 
 function resolveStorageTargetIdFromContext(options = {}) {
+  const diagnosticTargetId = normalizeStorageTargetId(options.diagnosticTargetId || "");
+  if (
+    options.allowDiagnosticTarget &&
+    options.preferDiagnosticTarget &&
+    diagnosticTargetId &&
+    objectStorage.describeProfile(diagnosticTargetId)?.enabled
+  ) {
+    return diagnosticTargetId;
+  }
+
   const existingId = normalizeStorageTargetId(
     options.existingTargetId ||
     options.intent?.storageTargetId ||
@@ -227,7 +237,6 @@ function resolveStorageTargetIdFromContext(options = {}) {
   );
   if (existingId && objectStorage.describeProfile(existingId)?.enabled) return existingId;
 
-  const diagnosticTargetId = normalizeStorageTargetId(options.diagnosticTargetId || "");
   if (options.allowDiagnosticTarget && diagnosticTargetId && objectStorage.describeProfile(diagnosticTargetId)?.enabled) {
     return diagnosticTargetId;
   }
@@ -3613,6 +3622,7 @@ const server = http.createServer(async (req, res) => {
         req,
         intent,
         allowDiagnosticTarget: true,
+        preferDiagnosticTarget: true,
         diagnosticTargetId: diagnosticStorageTarget?.id || ""
       });
       const objectKey = objectStorage.buildIntentObjectKey(intentId, storedFileName, {
